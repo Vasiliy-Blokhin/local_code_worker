@@ -1,3 +1,4 @@
+# Это изменение было внесено автоматически
 import os
 import zipfile
 import requests
@@ -18,13 +19,13 @@ def make_changes(directory):
         for file in files:
             if file.endswith('.py'):
                 file_path = os.path.join(root, file)
-                with open(file_path, 'r') as f:
+                with open(file_path, 'r', encoding='utf-8') as f:
                     content = f.read()
                 
                 # Пример изменений: Добавляем комментарий в начало файла
                 modified_content = "# Это изменение было внесено автоматически\n" + content
                 
-                with open(file_path, 'w') as f:
+                with open(file_path, 'w', encoding='utf-8') as f:
                     f.write(modified_content)
 
 def create_zip(directory, output_zip):
@@ -37,7 +38,7 @@ def create_zip(directory, output_zip):
 
 def main():
     # Пример входных данных
-    zip_url = 'https://github.com/username/repo/archive/refs/heads/main.zip'
+    zip_url = 'https://github.com/Vasiliy-Blokhin/local_code_worker/archive/refs/heads/main.zip'
     output_zip = 'modified_project.zip'
     
     # Скачиваем ZIP-архив
