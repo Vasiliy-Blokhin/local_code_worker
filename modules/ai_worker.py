@@ -2,7 +2,6 @@ import requests
 
 from params.settings import API_URL
 
-
 class AIRequestHandler:
     def __init__(
             self, system_prompt=None, content=None
@@ -16,12 +15,11 @@ class AIRequestHandler:
             response = requests.post(
                 self.api_url,
                 json= {
-                    "system_prompt": self.system_prompt,
-                    "content": self.content
+                    "system_prompt": system_prompt,
+                    "content": content
                 }
             )
             response.raise_for_status()
             return response.json()
         except requests.exceptions.RequestException as e:
             return {"error": str(e)}
-
