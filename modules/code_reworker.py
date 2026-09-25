@@ -12,37 +12,29 @@ from params.settings import ARCHIVE_URL
 class CodeReworker:
     def __init__(self):
         self.github_url = ARCHIVE_URL()
-        self.output_zip = f'{self._generate_random_text()}.zip'
+        self.output_zip = f'results/{self._generate_random_text()}.zip'
         self.temp_dir = self._generate_random_text()
 
-    def __call__(self, *args, **kwds):    
-        print(self.github_url)    
-        # Скачиваем ZIP-архив
-        zip_content = self.download_zip()
-        
-        # Создаем временную директорию для извлечения
-        os.makedirs(self.temp_dir, exist_ok=True)
-        
+    def __call__(self, *args, **kwds):          
         # Извлекаем ZIP-архив
-        self.extract_zip(zip_content)
+        self.get_zip(self._download_zip())
         
         # Вносим изменения
         self.make_changes()
         
         # Создаем обновленный ZIP-архив
         self.create_zip()
-        
-        # Очищаем временную директорию
-        shutil.rmtree(self.temp_dir)
-        
+
         print(f'Обновленный ZIP-архив сохранен в {self.output_zip}')
 
-    def download_zip(self):
+    def _download_zip(self):
         response = requests.get(self.github_url)
         response.raise_for_status()
         return BytesIO(response.content)
 
-    def extract_zip(self, zip_path):
+    def get_zip(self, zip_path):
+        os.makedirs(self.temp_dir, exist_ok=True)
+        
         with zipfile.ZipFile(zip_path, 'r') as zip_ref:
             zip_ref.extractall(self.temp_dir)
 
@@ -68,6 +60,8 @@ class CodeReworker:
                     file_path = os.path.join(root, file)
                     arcname = os.path.relpath(file_path, self.temp_dir)
                     zipf.write(file_path, arcname)
+
+        shutil.rmtree(self.temp_dir)
 
     # ------------------------------------------------------------------------------------------------   
     @staticmethod
