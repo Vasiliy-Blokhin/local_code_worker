@@ -31,7 +31,7 @@ class CodeReworker:
             except Exception:
                 raise Exception('ИИ агент не работает')
             
-            self.ai_worker.system_prompt = PROMPT_CODE_REWORK(prompt="добавь ко всем методам докстринги.")
+            self.ai_worker.system_prompt = PROMPT_CODE_REWORK(prompt="убери все комментарии, добавив только докстринги")
             self.ai_worker.content = str(self._generate_content_context(self.temp_dir))  # Ensure content is a list
             changes = self.ai_worker.send_request()
             # Вносим изменения
@@ -83,6 +83,9 @@ class CodeReworker:
         :return: List of dictionaries with file details.
         """
         try:
+            if ' (char ' in self.ai_worker.system_prompt:
+                logger.error('Восстановление структуры не удалось')
+                return []
             response_str = response_str.replace('```json', '').replace('```', '')
             response_data = json.loads(response_str)
             return response_data

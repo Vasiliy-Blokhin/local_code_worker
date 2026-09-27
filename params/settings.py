@@ -21,54 +21,49 @@ API_URL = f'http://{host}:8000/'
 
 BASE_PROMPT = lambda role=None, task=None, instruction=None, \
     restriction=None, output=None, prompt=None: f'''
-###Роль:
+###ROLE:
 {role}
 
-###Задача:
+###TASK:
 {task}
 
-###Инструкция:
+###INSTRUCTION:
 {instruction}
 
-###Строгие ограничения:
+###RESTRICTION:
 {restriction}
 
-###Запрос пользователя:
+###PROMPT:
 {prompt}
 
-###Формат вывода:
+###OUTPUT:
 {output}
 '''
+
 PROMPT_CODE_REWORK = lambda prompt=None: BASE_PROMPT(
-    role='Ты (python)/(Type java script) senior разработчик.',
-    task='Твоя задача получить репозиторий с кодом, изучить ' \
-    'его. После чего получить задачу от запроса и понять какие ' \
-    'изменения нужно внести в код. Изменить код и сформировать ' \
-    'ответ в соответствии с **Формат вывода** в виде json словаря.',
-    instruction='1. Получить репозиторий с кодом;\n2. Изучить полученный код.\n' \
-    '3. Получить **Запрос пользователя**.\n4. Изучить **Запрос пользователя** ' \
-    'и понять что нужно сделать.\n5. Внести изменения в полученный код ' \
-    'в соответствии с полученным заданием.\n6. Сформировать ответ в виде ' \
-    'json словаря как в **Формат вывода**.\n7. Передать ответ пользователю.',
-    restriction='1. Исключить любой вывод кроме результата json ' \
-    'словаря как в **Формат вывода**',
+    role='You are a senior developer (Python/TypeScript).',
+    task='Your task is to get a code repository, study it. Then get a task from the request and understand what changes need to be made to the code. Make the changes and form a response in accordance with the **Output Format** as a JSON dictionary.',
+    instruction='1. Get the code repository;\n2. Study the received code.\n' \
+                '3. Get the **User Request**.\n4. Study the **User Request** and understand what needs to be done.\n' \
+                '5. Make changes to the received code in accordance with the received task.\n' \
+                '6. Formulate the response as a JSON dictionary as in **Output Format**.\n' \
+                '7. Check the JSON dictionary for errors.\n' \
+                '8. If there are errors, correct them.\n' \
+                '9. Send the response to the user.',
+    restriction='1. Exclude any output except the result as a JSON dictionary as in **Output Format**',
     prompt=prompt,
     output='[{"file": <file path>, "content": <file content>}]'
 )
 
 PROMPT_RECOVERY_JSON = lambda prompt=None: BASE_PROMPT(
-    role='Ты json декодер.',
-    task='Твоя задача получить json словарь, изучить ' \
-    'его. После чего получить задачу от запроса и понять какие ' \
-    'изменения нужно внести в json словарь. Изменить json словарь и сформировать ' \
-    'ответ в соответствии с **Формат вывода** в виде json словаря.',
-    instruction='1. Получить json словарь;\n2. Изучить полученный json словарь.\n' \
-    '3. Получить **Запрос пользователя**.\n4. Изучить **Запрос пользователя** ' \
-    'и понять что нужно сделать.\n5. Внести изменения в полученный json словарь ' \
-    'в соответствии с полученным заданием.\n6. Сформировать ответ в виде ' \
-    'json словаря как в **Формат вывода**.\n7. Передать ответ пользователю.',
-    restriction='1. Исключить любой вывод кроме результата json ' \
-    'словаря как в **Формат вывода**',
-    prompt=f'Получена ошибка декодирования - "{prompt}". Исправь её.',
+    role='You are a JSON decoder.',
+    task='Your task is to get a JSON dictionary, study it. Then get a task from the request and understand what changes need to be made to the JSON dictionary. Make the changes to the JSON dictionary and form a response in accordance with the **Output Format** as a JSON dictionary.',
+    instruction='1. Get the JSON dictionary;\n2. Study the received JSON dictionary.\n' \
+                '3. Get the **User Request**.\n4. Study the **User Request** and understand what needs to be done.\n' \
+                '5. Make changes to the received JSON dictionary in accordance with the received task.\n' \
+                '6. Formulate the response as a JSON dictionary as in **Output Format**.\n' \
+                '7. Send the response to the user.',
+    restriction='1. Exclude any output except the result as a JSON dictionary as in **Output Format**',
+    prompt=f'An error occurred during decoding - "{prompt}". Fix it.',
     output='[{"file": <file path>, "content": <file content>}]'
 )

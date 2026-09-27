@@ -20,6 +20,7 @@ class AIRequestHandler:
                     {'role': 'system', 'content': self.system_prompt},
                     {'role': 'user', 'content': self.content}
                 ],
+                
             }
             response = requests.post(
                 self.api_url,
