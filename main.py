@@ -6,8 +6,9 @@ import shutil
 import random
 import string
 import json
+import json_repair
 
-from params.settings import ARCHIVE_URL, logger, PROMPT_CODE_REWORK, PROMPT_RECOVERY_JSON
+from params.settings import ARCHIVE_URL, logger, PROMPT_CODE_REWORK
 from modules.ai_worker import AIRequestHandler
 
 class CodeReworker:
@@ -25,13 +26,13 @@ class CodeReworker:
 
             try:
                 self.ai_worker.start_model()
-                self.ai_worker.system_prompt = "Выполняется проверка связи. Передай толлько одно слово: Работает"
-                self.ai_worker.content = 'Проверка передачи контента.'
+                self.ai_worker.system_prompt = "check connection. Answer one word: Workly"
+                self.ai_worker.content = 'Content'
                 logger.debug(f'Проверка работы ИИ агента - {self.ai_worker.send_request()['choices'][0]['message']['content']}')
             except Exception:
                 raise Exception('ИИ агент не работает')
             
-            self.ai_worker.system_prompt = PROMPT_CODE_REWORK(prompt="убери все комментарии, добавив только докстринги")
+            self.ai_worker.system_prompt = PROMPT_CODE_REWORK(prompt="delete commentary, and add docstrings")
             self.ai_worker.content = str(self._generate_content_context(self.temp_dir))  # Ensure content is a list
             changes = self.ai_worker.send_request()
             # Вносим изменения
@@ -83,20 +84,12 @@ class CodeReworker:
         :return: List of dictionaries with file details.
         """
         try:
-            if ' (char ' in self.ai_worker.system_prompt:
-                logger.error('Восстановление структуры не удалось')
-                return []
             response_str = response_str.replace('```json', '').replace('```', '')
             response_data = json.loads(response_str)
             return response_data
         except json.JSONDecodeError as e:
             logger.error(f"Ошибка декодирования JSON: {e}\nВосстановление структуры")
-            self.ai_worker.content = response_str
-            self.ai_worker.system_prompt = PROMPT_RECOVERY_JSON(prompt=e)
-            recovery = self._parse_response_to_dict_list(
-                self.ai_worker.send_request()['choices'][0]['message']['content']
-            )
-            return recovery if len(recovery) else []
+            return json.loads(json_repair.repair_json(response_data))
 
     
     def create_zip(self):
