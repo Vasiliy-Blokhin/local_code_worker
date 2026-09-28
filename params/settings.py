@@ -1,3 +1,5 @@
+"""Настройки проекта: логгер, промпты и значения по умолчанию."""
+
 import logging
 import sys
 
@@ -13,59 +15,65 @@ logger.setLevel(logging.DEBUG)
 logger.addHandler(handler)
 
 
+# ---------------------------------------------------------------------------
+# Значения по умолчанию для веб-формы (могут быть переопределены в интерфейсе)
+# ---------------------------------------------------------------------------
 project_url = 'https://github.com/Vasiliy-Blokhin/local_code_worker'
-ARCHIVE_URL = lambda project_url=project_url, branch='dev': f'{project_url}/archive/refs/heads/{branch}.zip'
+DEFAULT_ARCHIVE_URL = f'{project_url}/archive/refs/heads/dev.zip'
+DEFAULT_API_URL = 'http://192.168.0.18:8000/'
+DEFAULT_MODEL = 'qwen25-coder-14b-unc'
 
-host = '192.168.0.18'
-API_URL = f'http://{host}:8000/'
 
 BASE_PROMPT = lambda role=None, task=None, instruction=None, \
     restriction=None, output=None, prompt=None: f'''
-###ROLE:
+###Роль:
 {role}
 
-###TASK:
+###Задача:
 {task}
 
-###INSTRUCTION:
+###Инструкция:
 {instruction}
 
-###RESTRICTION:
+###Строгие ограничения:
 {restriction}
 
-###PROMPT:
+###Запрос пользователя:
 {prompt}
 
-###OUTPUT:
+###Формат вывода:
 {output}
 '''
-
 PROMPT_CODE_REWORK = lambda prompt=None: BASE_PROMPT(
-    role='You are a senior Python developer.',
-    task='Get a code repository, study it. Then get a task from the request, '
-         'understand what changes need to be made, implement them, '
-         'and return the result as a valid JSON dictionary.',
-    instruction=(
-        '1. Study the received code.\n'
-        '2. Understand the User Request.\n'
-        '3. Make the required changes.\n'
-        '4. Output a JSON dictionary in the format: '
-        '[{"file": "<file path>", "content": "<file content>"}]\n'
-        '5. Strict JSON requirements:\n'
-        '   - Double quotes for all keys and string values.\n'
-        '   - Correct commas between fields; NO trailing commas.\n'
-        '   - ALL backslashes in strings MUST be doubled: \\\\ not \\.\n'
-        '   - Use only valid escapes: \\", \\\\, \\/, \\n, \\r, \\t, \\b, \\f, \\uXXXX.\n'
-        '   - Raw JSON only: no markdown code fences, no explanatory text.\n'
-        '6. Validate the JSON yourself before outputting: check quoting, '
-        'escaping, commas, and balanced brackets.\n'
-        '7. If content contains LaTeX or Windows paths, escape every backslash explicitly.'
-    ),
-    restriction=(
-        '1. Output ONLY the raw JSON. NO markdown, NO text outside JSON.\n'
-        '2. The result must be parseable by json.loads() without modifications.\n'
-        '3. If valid JSON cannot be produced, return {"error": "unable to produce valid JSON"}'
-    ),
+    role='Ты (python)/(Type java script) senior разработчик.',
+    task='Твоя задача получить репозиторий с кодом, изучить ' \
+    'его. После чего получить задачу от запроса и понять какие ' \
+    'изменения нужно внести в код. Изменить код и сформировать ' \
+    'ответ в соответствии с **Формат вывода** в виде json словаря.',
+    instruction='1. Получить репозиторий с кодом;\n2. Изучить полученный код.\n' \
+    '3. Получить **Запрос пользователя**.\n4. Изучить **Запрос пользователя** ' \
+    'и понять что нужно сделать.\n5. Внести изменения в полученный код ' \
+    'в соответствии с полученным заданием.\n6. Сформировать ответ в виде ' \
+    'json словаря как в **Формат вывода**.\n7. Передать ответ пользователю.',
+    restriction='1. Исключить любой вывод кроме результата json ' \
+    'словаря как в **Формат вывода**',
     prompt=prompt,
-    output='[{"file": "<file path>", "content": "<file content>"}]'
+    output='[{"file": <file path>, "content": <file content>}]'
+)
+
+PROMPT_RECOVERY_JSON = lambda prompt=None: BASE_PROMPT(
+    role='Ты json декодер.',
+    task='Твоя задача получить json словарь, изучить ' \
+    'его. После чего получить задачу от запроса и понять какие ' \
+    'изменения нужно внести в json словарь. Изменить json словарь и сформировать ' \
+    'ответ в соответствии с **Формат вывода** в виде json словаря.',
+    instruction='1. Получить json словарь;\n2. Изучить полученный json словарь.\n' \
+    '3. Получить **Запрос пользователя**.\n4. Изучить **Запрос пользователя** ' \
+    'и понять что нужно сделать.\n5. Внести изменения в полученный json словарь ' \
+    'в соответствии с полученным заданием.\n6. Сформировать ответ в виде ' \
+    'json словаря как в **Формат вывода**.\n7. Передать ответ пользователю.',
+    restriction='1. Исключить любой вывод кроме результата json ' \
+    'словаря как в **Формат вывода**',
+    prompt=f'Получена ошибка декодирования - "{prompt}". Исправь её.',
+    output='[{"file": <file path>, "content": <file content>}]'
 )
