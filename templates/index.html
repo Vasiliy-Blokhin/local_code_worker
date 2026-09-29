@@ -1,75 +1,48 @@
 <!DOCTYPE html>
-<html lang="ru">
+<html>
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Local Code Worker — веб-интерфейс</title>
+    <title>Code Processor</title>
     <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
 </head>
 <body>
-    <main class="card">
-        <header>
-            <h1>Local Code Worker</h1>
-            <p class="subtitle">Переработка кода репозитория локальной ИИ-моделью прямо в браузере</p>
-        </header>
-
-        <form id="worker-form" novalidate>
-            <div class="grid">
-                <label class="field">
-                    <span>URL ИИ API</span>
-                    <input type="text" name="api_url" id="api_url" value="{{ default_api_url }}" placeholder="http://192.168.0.18:8000/">
-                    <small class="err" id="err-api_url"></small>
-                </label>
-
-                <label class="field">
-                    <span>URL архива репозитория (.zip)</span>
-                    <input type="text" name="archive_url" id="archive_url" value="{{ default_archive_url }}" placeholder="https://github.com/user/repo/archive/refs/heads/main.zip">
-                    <small class="err" id="err-archive_url"></small>
-                </label>
-
-                <label class="field">
-                    <span>Модель</span>
-                    <input type="text" name="model" id="model" value="{{ default_model }}">
-                </label>
-
-                <label class="field">
-                    <span>Пароль API <em>*</em></span>
-                    <input type="password" name="password" id="password" placeholder="X-API-Password" autocomplete="off">
-                    <small class="err" id="err-password"></small>
-                </label>
+    <div class="container">
+        <h1>Code Processor</h1>
+        
+        <form id="processForm" method="post" action="/process">
+            <div class="form-group">
+                <label for="api_url">API URL:</label>
+                <input type="url" id="api_url" name="api_url" value="http://192.168.0.18:8000/" required>
             </div>
-
-            <label class="field">
-                <span>Промпт — задача для ИИ <em>*</em></span>
-                <textarea name="prompt" id="prompt" rows="4" placeholder="Например: добавь ко всем методам докстринги"></textarea>
-                <small class="err" id="err-prompt"></small>
-            </label>
-
-            <button type="submit" id="run-btn">
-                <span class="btn-label">Запустить переработку</span>
-                <span class="spinner hidden"></span>
-            </button>
+            
+            <div class="form-group">
+                <label for="porject_url">Archive URL:</label>
+                <input type="url" id="porject_url" name="porject_url" value="https://github.com/Vasiliy-Blokhin/local_code_worker" required>
+            </div>
+            
+            <div class="form-group">
+                <label for="model">Model:</label>
+                <select id="model" name="model">
+                    <option value="qwen3-coder-30b-a3b-instruct" selected>qwen3-coder-30b-a3b-instruct</option>
+                    <option value="other-model">Other Model</option>
+                </select>
+            </div>
+            
+            <div class="form-group">
+                <label for="password">Password:</label>
+                <input type="password" id="password" name="password" required>
+            </div>
+            
+            <div class="form-group">
+                <label for="prompt">Prompt:</label>
+                <textarea id="prompt" name="prompt" required></textarea>
+            </div>
+            
+            <button type="submit">Process Code</button>
         </form>
-
-        <section id="status" class="hidden"></section>
-
-        <section id="result" class="hidden">
-            <h2>Архив сформирован</h2>
-            <p id="result-info"></p>
-            <a id="download-btn" class="download" href="#">Скачать архив</a>
-        </section>
-
-        <section id="logs-wrap" class="hidden">
-            <h2>Журнал работы</h2>
-            <pre id="logs"></pre>
-        </section>
-
-        <section id="history-wrap" class="hidden">
-            <h2>Готовые архивы</h2>
-            <ul id="history"></ul>
-        </section>
-    </main>
-
+        
+        <div id="result"></div>
+    </div>
+    
     <script src="{{ url_for('static', filename='app.js') }}"></script>
 </body>
 </html>
