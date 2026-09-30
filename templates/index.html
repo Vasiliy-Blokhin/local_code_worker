@@ -1,3 +1,4 @@
+<!-- templates/index.html - Updated form with repository URL and branch fields -->
 <!DOCTYPE html>
 <html>
 <head>
@@ -11,12 +12,17 @@
         <form id="processForm" method="post" action="/process">
             <div class="form-group">
                 <label for="api_url">API URL:</label>
-                <input type="url" id="api_url" name="api_url" value="http://192.168.0.18:8000/" required>
+                <input type="url" id="api_url" name="api_url" value="http://192.168.0.23:8000/" required>
             </div>
             
             <div class="form-group">
-                <label for="porject_url">Archive URL:</label>
-                <input type="url" id="porject_url" name="porject_url" value="https://github.com/Vasiliy-Blokhin/local_code_worker" required>
+                <label for="project_url">Repository URL:</label>
+                <input type="url" id="project_url" name="project_url" value="https://github.com/Vasiliy-Blokhin/local_code_worker" required>
+            </div>
+            
+            <div class="form-group">
+                <label for="branch">Branch:</label>
+                <input type="text" id="branch" name="branch" value="dev" required>
             </div>
             
             <div class="form-group">
@@ -40,6 +46,7 @@
             <button type="submit">Process Code</button>
         </form>
         
+        <div id="logs"></div>
         <div id="result"></div>
     </div>
     

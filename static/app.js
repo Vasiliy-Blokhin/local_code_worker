@@ -1,3 +1,4 @@
+// static/app.js - Updated to show logs and handle form properly
 document.getElementById('processForm').addEventListener('submit', async function(e) {
     e.preventDefault();
     
@@ -6,6 +7,10 @@ document.getElementById('processForm').addEventListener('submit', async function
     
     const resultDiv = document.getElementById('result');
     resultDiv.innerHTML = '<p>Processing...</p>';
+    
+    // Clear previous logs
+    const logsDiv = document.getElementById('logs');
+    logsDiv.innerHTML = '<p>Processing logs:</p>';
     
     try {
         const response = await fetch('/process', {

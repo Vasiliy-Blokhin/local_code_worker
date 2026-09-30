@@ -1,3 +1,4 @@
+# app.py - Updated to handle branch parameter
 import os
 import zipfile
 import tempfile
@@ -59,21 +60,25 @@ def process_request():
     try:
         # Get parameters from request
         api_url = request.form.get('api_url', DEFAULT_API_URL)
-        project_url_value = request.form.get('project_url', project_url) + '/archive/refs/heads/dev.zip'
-        model = request.form.get('model', 'qwen25-coder-14b-unc')
+        project_url_value = request.form.get('project_url', project_url)
+        branch = request.form.get('branch', 'dev')
+        model = request.form.get('model', 'qwen3-coder-30b-a3b-instruct')
         password = request.form.get('password', '')
         prompt = request.form.get('prompt', '')
         
         # Validate required parameters
-        if not all([api_url, project_url_value, prompt]):
+        if not all([api_url, project_url_value, prompt, branch]):
             return jsonify({"status": "error", "message": "Missing required parameters"}), 400
+        
+        # Create archive URL with branch
+        archive_url = f'{project_url_value}/archive/refs/heads/{branch}.zip'
         
         # Download archive
         archive_filename = secure_filename(f"archive_{os.getpid()}.zip")
         archive_path = os.path.join(app.config['UPLOAD_FOLDER'], archive_filename)
         
         # Download archive from URL
-        if not download_archive(project_url_value, archive_path):
+        if not download_archive(archive_url, archive_path):
             return jsonify({"status": "error", "message": "Failed to download archive"}), 500
         
         # Create temporary directory for extraction
@@ -91,7 +96,7 @@ def process_request():
         # Process code through AI
         try:
             reworker = CodeReworker(
-                archive_url=project_url_value,
+                archive_url=archive_url,
                 api_url=api_url,
                 password=password,
                 prompt=prompt,

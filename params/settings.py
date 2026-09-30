@@ -20,7 +20,7 @@ logger.addHandler(handler)
 # ---------------------------------------------------------------------------
 project_url = 'https://github.com/Vasiliy-Blokhin/local_code_worker'
 DEFAULT_ARCHIVE_URL = f'{project_url}/archive/refs/heads/dev.zip'
-DEFAULT_API_URL = 'http://192.168.0.18:8000/'
+DEFAULT_API_URL = 'http://192.168.0.23:8000/'
 DEFAULT_MODEL = 'qwen25-coder-14b-unc'
 
 
