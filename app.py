@@ -33,6 +33,21 @@ def extract_archive(archive_path, extract_to):
         print(f"Error extracting archive: {e}")
         return False
 
+def download_archive(url, save_path):
+    """Download archive from URL"""
+    try:
+        response = requests.get(url, stream=True)
+        response.raise_for_status()
+        
+        with open(save_path, 'wb') as f:
+            for chunk in response.iter_content(chunk_size=8192):
+                if chunk:
+                    f.write(chunk)
+        return True
+    except Exception as e:
+        print(f"Error downloading archive: {e}")
+        return False
+
 @app.route('/')
 def index():
     """Main page with form for submitting requests"""
@@ -44,7 +59,7 @@ def process_request():
     try:
         # Get parameters from request
         api_url = request.form.get('api_url', DEFAULT_API_URL)
-        project_url_value = request.form.get('porject_url', project_url) + '/archive/refs/heads/dev.zip'
+        project_url_value = request.form.get('project_url', project_url) + '/archive/refs/heads/dev.zip'
         model = request.form.get('model', 'qwen25-coder-14b-unc')
         password = request.form.get('password', '')
         prompt = request.form.get('prompt', '')
@@ -57,21 +72,20 @@ def process_request():
         archive_filename = secure_filename(f"archive_{os.getpid()}.zip")
         archive_path = os.path.join(app.config['UPLOAD_FOLDER'], archive_filename)
         
-        # Сделаем это через локальный файл вместо fetch
-        try:
-            # Используем локальный путь, если архив уже есть локально
-            # Просто предположим, что архив уже загружен
-            # В реальности здесь может быть другая логика, но мы убираем fetch
-            if not os.path.exists(archive_path):
-                # Если файла нет, то просто продолжаем
-                pass
-        except Exception as e:
-            return jsonify({"status": "error", "message": f"Failed to download archive: {str(e)}"}), 500
+        # Download archive from URL
+        if not download_archive(project_url_value, archive_path):
+            return jsonify({"status": "error", "message": "Failed to download archive"}), 500
         
         # Create temporary directory for extraction
         extract_dir = tempfile.mkdtemp(prefix='code_process_')
         
         if not extract_archive(archive_path, extract_dir):
+            # Clean up
+            try:
+                shutil.rmtree(extract_dir)
+                os.remove(archive_path)
+            except Exception:
+                pass
             return jsonify({"status": "error", "message": "Failed to extract archive"}), 500
         
         # Process code through AI
