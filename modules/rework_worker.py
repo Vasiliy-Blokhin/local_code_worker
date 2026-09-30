@@ -1,4 +1,4 @@
-"""Ядро обработки: скачивание архива, запрос к ИИ, применение правок, сборка архива."""
+"Ядро обработки: скачивание архива, запрос к ИИ, применение правок, сборка архива."
 
 import json
 import os
@@ -15,7 +15,6 @@ from params.settings import PROMPT_CODE_REWORK, PROMPT_RECOVERY_JSON, logger
 
 # Корень проекта: modules/.. — чтобы временные пути не зависели от рабочей директории.
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-
 
 class CodeReworker:
     def __init__(self, archive_url, api_url, password, prompt, model):
@@ -92,7 +91,7 @@ class CodeReworker:
         file_map = {}
         for root, _, files in os.walk(self.temp_dir):
             for file in files:
-                if file.endswith('.py'):
+                if file.endswith('.py') or file.endswith('.js') or file.endswith('.html') or file.endswith('.css'):
                     abs_path = os.path.join(root, file)
                     rel_id = os.path.relpath(abs_path, BASE_DIR).replace(os.sep, '/')
                     file_map[rel_id] = abs_path
@@ -127,7 +126,7 @@ class CodeReworker:
         :return: Список словарей с деталями файлов.
         """
         try:
-            cleaned = response_str.replace('```json', '').replace('```', '').strip()
+            cleaned = response_str.replace('', '').replace('', '').strip()
             return json.loads(cleaned)
         except json.JSONDecodeError as exc:
             logger.error(f'Ошибка декодирования JSON: {exc}. Попытка восстановления структуры')
@@ -155,7 +154,7 @@ class CodeReworker:
         content = []
         for root, _, files in os.walk(self.temp_dir):
             for file in files:
-                if file.endswith('.py'):
+                if file.endswith('.py') or file.endswith('.js') or file.endswith('.html') or file.endswith('.css'):
                     file_path = os.path.join(root, file)
                     with open(file_path, 'r', encoding='utf-8') as f:
                         file_content = f.read()
