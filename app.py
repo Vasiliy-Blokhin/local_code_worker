@@ -2,11 +2,11 @@ import os
 import zipfile
 import tempfile
 import requests
-import subprocess
 import shutil
 from flask import Flask, request, render_template, jsonify, send_file
 from werkzeug.utils import secure_filename
 
+from modules.rework_worker import CodeReworker
 from params.settings import DEFAULT_API_URL, project_url
 
 
@@ -33,24 +33,6 @@ def extract_archive(archive_path, extract_to):
         print(f"Error extracting archive: {e}")
         return False
 
-def process_code_files(directory):
-    """Process all Python files in directory to add docstrings"""
-    try:
-        # This would be implemented based on the actual AI processing logic
-        # For now, we'll just return a placeholder response
-        return {"status": "success", "message": "Docstrings added to Python files"}
-    except Exception as e:
-        return {"status": "error", "message": str(e)}
-
-def run_ai_processing(api_url, model, prompt, code_directory):
-    """Run AI processing on code files"""
-    try:
-        # This would make API calls to the AI service
-        # For now, we'll simulate processing
-        return {"status": "success", "message": f"Processed with model {model} using prompt: {prompt}"}
-    except Exception as e:
-        return {"status": "error", "message": str(e)}
-
 @app.route('/')
 def index():
     """Main page with form for submitting requests"""
@@ -62,13 +44,13 @@ def process_request():
     try:
         # Get parameters from request
         api_url = request.form.get('api_url', DEFAULT_API_URL)
-        porject_url = request.form.get('porject_url', project_url) + '/archive/refs/heads/dev.zip'
-        model = request.form.get('model', 'qwen3-coder-30b-a3b-instruct')
+        project_url_value = request.form.get('porject_url', project_url) + '/archive/refs/heads/dev.zip'
+        model = request.form.get('model', 'qwen25-coder-14b-unc')
         password = request.form.get('password', '')
         prompt = request.form.get('prompt', '')
         
         # Validate required parameters
-        if not all([api_url, porject_url, prompt]):
+        if not all([api_url, project_url_value, prompt]):
             return jsonify({"status": "error", "message": "Missing required parameters"}), 400
         
         # Download archive
@@ -76,7 +58,7 @@ def process_request():
         archive_path = os.path.join(app.config['UPLOAD_FOLDER'], archive_filename)
         
         try:
-            response = requests.get(porject_url, stream=True)
+            response = requests.get(project_url_value, stream=True)
             response.raise_for_status()
             
             with open(archive_path, 'wb') as f:
@@ -86,44 +68,48 @@ def process_request():
         except Exception as e:
             return jsonify({"status": "error", "message": f"Failed to download archive: {str(e)}"}), 500
         
-        # Extract archive
+        # Create temporary directory for extraction
         extract_dir = tempfile.mkdtemp(prefix='code_process_')
         
         if not extract_archive(archive_path, extract_dir):
             return jsonify({"status": "error", "message": "Failed to extract archive"}), 500
         
-        # Process code files
-        result = process_code_files(extract_dir)
-        
-        # Run AI processing if needed
-        if api_url and model:
-            ai_result = run_ai_processing(api_url, model, prompt, extract_dir)
-            result.update(ai_result)
-        
-        # Create result archive
-        result_filename = f"processed_{os.getpid()}.zip"
-        result_path = os.path.join(app.config['UPLOAD_FOLDER'], result_filename)
-        
-        with zipfile.ZipFile(result_path, 'w') as zipf:
-            for root, dirs, files in os.walk(extract_dir):
-                for file in files:
-                    file_path = os.path.join(root, file)
-                    arc_path = os.path.relpath(file_path, extract_dir)
-                    zipf.write(file_path, arc_path)
-        
-        # Clean up temporary directories
+        # Process code through AI
         try:
-            shutil.rmtree(extract_dir)
-            os.remove(archive_path)
-        except Exception:
-            pass
-        
-        # Return download link
-        return jsonify({
-            "status": "success",
-            "message": "Processing completed",
-            "download_url": f"/download/{result_filename}"
-        })
+            reworker = CodeReworker(
+                archive_url=project_url_value,
+                api_url=api_url,
+                password=password,
+                prompt=prompt,
+                model=model
+            )
+            
+            # Process using the rework worker
+            result_zip_path = reworker.run(app.config['UPLOAD_FOLDER'])
+            
+            # Clean up temporary directories
+            try:
+                shutil.rmtree(extract_dir)
+                os.remove(archive_path)
+            except Exception:
+                pass
+            
+            # Return download link
+            filename = os.path.basename(result_zip_path)
+            return jsonify({
+                "status": "success",
+                "message": "Processing completed",
+                "download_url": f"/download/{filename}"
+            })
+            
+        except Exception as e:
+            # Clean up temporary directories
+            try:
+                shutil.rmtree(extract_dir)
+                os.remove(archive_path)
+            except Exception:
+                pass
+            return jsonify({"status": "error", "message": f"AI processing failed: {str(e)}"}), 500
         
     except Exception as e:
         return jsonify({"status": "error", "message": f"Processing failed: {str(e)}"}), 500

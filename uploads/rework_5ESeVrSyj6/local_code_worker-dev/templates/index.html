@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Code Processor</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+    <div class="container">
+        <h1>Code Processor</h1>
+        
+        <form id="processForm" method="post" action="/process">
+            <div class="form-group">
+                <label for="api_url">API URL:</label>
+                <input type="url" id="api_url" name="api_url" value="http://192.168.0.18:8000/" required>
+            </div>
+            
+            <div class="form-group">
+                <label for="porject_url">Archive URL:</label>
+                <input type="url" id="porject_url" name="porject_url" value="https://github.com/Vasiliy-Blokhin/local_code_worker" required>
+            </div>
+            
+            <div class="form-group">
+                <label for="model">Model:</label>
+                <select id="model" name="model">
+                    <option value="qwen3-coder-30b-a3b-instruct" selected>qwen3-coder-30b-a3b-instruct</option>
+                    <option value="other-model">Other Model</option>
+                </select>
+            </div>
+            
+            <div class="form-group">
+                <label for="password">Password:</label>
+                <input type="password" id="password" name="password" required>
+            </div>
+            
+            <div class="form-group">
+                <label for="prompt">Prompt:</label>
+                <textarea id="prompt" name="prompt" required></textarea>
+            </div>
+            
+            <button type="submit">Process Code</button>
+        </form>
+        
+        <div id="result"></div>
+    </div>
+    
+    <script src="{{ url_for('static', filename='app.js') }}"></script>
+</body>
+</html>

@@ -6,7 +6,7 @@ from params.settings import logger
 
 
 class AIRequestError(Exception):
-    """Ошибка при обращении к ИИ API (соединение, статус, пароль и т.п.)."""
+    """Ошибка при обращении к ИИ API (соединение, статус, пароль и т.п)."""
 
 
 class AIRequestHandler:
