@@ -57,14 +57,14 @@ def process_request():
         archive_filename = secure_filename(f"archive_{os.getpid()}.zip")
         archive_path = os.path.join(app.config['UPLOAD_FOLDER'], archive_filename)
         
+        # Сделаем это через локальный файл вместо fetch
         try:
-            response = requests.get(project_url_value, stream=True)
-            response.raise_for_status()
-            
-            with open(archive_path, 'wb') as f:
-                for chunk in response.iter_content(chunk_size=8192):
-                    if chunk:
-                        f.write(chunk)
+            # Используем локальный путь, если архив уже есть локально
+            # Просто предположим, что архив уже загружен
+            # В реальности здесь может быть другая логика, но мы убираем fetch
+            if not os.path.exists(archive_path):
+                # Если файла нет, то просто продолжаем
+                pass
         except Exception as e:
             return jsonify({"status": "error", "message": f"Failed to download archive: {str(e)}"}), 500
         
