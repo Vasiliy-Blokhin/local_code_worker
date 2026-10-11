@@ -1,0 +1,110 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Code Worker</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='13' font-size='13'>⌘</text></svg>">
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header class="top">
+  <button class="icon-btn" id="toggleSide" title="Панель">☰</button>
+  <span class="brand">Code Worker</span>
+  <select id="projectSel" title="Проект"></select>
+  <button class="icon-btn" id="addProject" title="Добавить проект">＋</button>
+  <span class="spacer"></span>
+  <span id="ctxMeter" class="meter" title="Заполнение контекста"><span class="bar"><i></i></span><b>—</b></span>
+  <span id="speed" class="muted small"></span>
+  <span id="modelPill" class="pill">…</span>
+  <button class="icon-btn" id="togglePanel" title="Изменения и файлы">◧</button>
+</header>
+
+<div class="layout">
+  <aside id="side">
+    <div class="side-head">
+      <span>Сессии</span>
+      <button class="btn small" id="newSession">Новая</button>
+    </div>
+    <ul id="sessions" class="list"></ul>
+    <div class="side-head">
+      <span>Файлы</span>
+      <button class="icon-btn small" id="refreshFiles" title="Обновить">⟳</button>
+    </div>
+    <input id="fileFilter" class="filter" placeholder="Фильтр файлов…">
+    <div id="tree" class="tree"></div>
+  </aside>
+
+  <main>
+    <div id="transcript" class="transcript">
+      <div class="empty" id="emptyState">
+        <h2>Локальный агент для кода</h2>
+        <p>Выберите проект и опишите задачу. Агент сам найдёт нужные файлы, внесёт правки и проверит их.</p>
+        <ul>
+          <li><code>@путь/к/файлу</code> — приложить файл к сообщению</li>
+          <li><code>/init</code> — создать AGENTS.md с описанием проекта</li>
+          <li><code>/compact</code> — сжать историю, <code>/clear</code> — новая сессия</li>
+          <li><kbd>Enter</kbd> — отправить, <kbd>Shift+Enter</kbd> — новая строка, <kbd>Esc</kbd> — стоп</li>
+        </ul>
+      </div>
+    </div>
+    <div class="composer">
+      <div id="mentionBox" class="mention hidden"></div>
+      <textarea id="input" rows="3" placeholder="Задача для агента…  (@файл, /init, /compact)"></textarea>
+      <div class="composer-bar">
+        <select id="modeSel" title="Подтверждения">
+          <option value="ask">Спрашивать всё</option>
+          <option value="edits">Правки — авто, команды — спрашивать</option>
+          <option value="auto">Полный автомат</option>
+        </select>
+        <select id="effortSel" title="Глубина рассуждений">
+          <option value="low">Рассуждения: быстро</option>
+          <option value="medium">Рассуждения: средне</option>
+          <option value="high">Рассуждения: глубоко</option>
+        </select>
+        <span class="spacer"></span>
+        <span id="runState" class="muted small"></span>
+        <button class="btn primary" id="sendBtn">Отправить</button>
+      </div>
+    </div>
+  </main>
+
+  <section id="panel" class="panel hidden">
+    <div class="tabs">
+      <button data-tab="changes" class="active">Изменения</button>
+      <button data-tab="file">Файл</button>
+      <span class="spacer"></span>
+      <button class="icon-btn small" id="panelRefresh" title="Обновить">⟳</button>
+    </div>
+    <div id="tab-changes" class="tab-body"></div>
+    <div id="tab-file" class="tab-body hidden"></div>
+  </section>
+</div>
+
+<dialog id="projectDlg">
+  <form method="dialog" id="projectForm">
+    <h3>Добавить проект</h3>
+    <label>Локальная папка<input name="path" placeholder="D:\projects\my_app"></label>
+    <div class="or">или клонировать git-репозиторий</div>
+    <label>URL репозитория<input name="git_url" placeholder="https://github.com/user/repo"></label>
+    <label>Ветка (необязательно)<input name="branch" placeholder="main"></label>
+    <div class="dlg-err" id="projectErr"></div>
+    <div class="dlg-bar">
+      <button value="cancel" class="btn" formnovalidate>Отмена</button>
+      <button value="ok" class="btn primary" id="projectOk">Добавить</button>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="loginDlg">
+  <form method="dialog" id="loginForm">
+    <h3>Вход</h3>
+    <label>Пароль<input name="password" type="password" autocomplete="current-password"></label>
+    <div class="dlg-err" id="loginErr"></div>
+    <div class="dlg-bar"><button class="btn primary">Войти</button></div>
+  </form>
+</dialog>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
