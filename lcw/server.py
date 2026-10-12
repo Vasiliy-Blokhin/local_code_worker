@@ -14,7 +14,7 @@ from fastapi.staticfiles import StaticFiles
 
 from . import config, prompts, workspace
 from .agent import Agent, rewind, session_changes
-from .llm import LLM, LLMError
+from .llm import LLM, LLMBusy, LLMError
 from .sessions import store
 from .workspace import WorkspaceError
 
@@ -81,6 +81,8 @@ async def status():
 async def model_start():
     try:
         return await llm.start_model()
+    except LLMBusy as e:
+        raise HTTPException(409, str(e))
     except (LLMError, Exception) as e:
         raise HTTPException(502, str(e))
 

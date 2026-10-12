@@ -26,6 +26,8 @@ PASSWORD = os.getenv("LCW_PASSWORD", "")
 AIM_URL = os.getenv("AIM_URL", "http://127.0.0.1:8000").rstrip("/")
 AIM_PASSWORD = os.getenv("AIM_PASSWORD", "")
 MODEL = os.getenv("LCW_MODEL", "gpt-oss-20b")
+# Имя проекта в очереди задач AI Manager (заголовок X-Project: история /api/jobs, статистика)
+AIM_PROJECT = os.getenv("LCW_AIM_PROJECT", "local_code_worker")
 # Размер контекста модели (должен совпадать с "context" в реестре AI Manager)
 CONTEXT = _int("LCW_CONTEXT", 32768)
 REASONING = os.getenv("LCW_REASONING", "low")  # low | medium | high
