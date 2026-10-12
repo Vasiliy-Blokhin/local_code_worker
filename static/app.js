@@ -444,6 +444,13 @@ async function pollModel() {
     pill.classList.remove("clickable");
     if (!st.ok) { pill.className = "pill off"; pill.textContent = "AI Manager недоступен"; pill.title = st.error; }
     else if (st.ready) { pill.className = "pill ok"; pill.textContent = st.model; pill.title = "Модель запущена"; }
+    else if (st.busy) {
+      // По другой модели есть задачи — AI Manager не переключит GPU, наш запрос подождёт в очереди
+      pill.className = "pill wait";
+      pill.textContent = `${st.model}: GPU занята (${st.active})`;
+      pill.title = `Выполняется задач: ${st.queue_running}, ждут: ${st.queue_waiting}. ` +
+                   "Запрос встанет в очередь, модель запустится после них.";
+    }
     else {
       pill.className = "pill wait clickable";
       pill.textContent = `${st.model}: не запущена`;

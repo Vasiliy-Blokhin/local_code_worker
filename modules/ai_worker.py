@@ -23,6 +23,7 @@ class AIRequestHandler:
     def _headers(self):
         return {
             'X-API-Password': self.password,
+            'X-Project': 'local_code_worker',
             'Content-Type': 'application/json',
         }
 
@@ -64,6 +65,11 @@ class AIRequestHandler:
         except requests.exceptions.RequestException as exc:
             raise AIRequestError(f'Не удалось запустить модель: {exc}') from exc
 
+        if response.status_code == 409 and '"model_busy"' in response.text:
+            # GPU занята задачами другого проекта: запрос с полем model встанет в очередь
+            # AI Manager и выполнится после них — это не ошибка.
+            logger.info('GPU занята другим проектом — запрос подождёт в очереди AI Manager')
+            return {'name': self.model, 'running': False, 'queued': True}
         if response.status_code != 200:
             raise AIRequestError(
                 f'Ошибка запуска модели {response.status_code}: {response.text[:300]}'

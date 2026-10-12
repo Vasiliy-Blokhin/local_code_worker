@@ -1,4 +1,9 @@
-"""Асинхронный клиент AI Manager: стриминг chat/completions с инструментами + управление моделью."""
+"""Асинхронный клиент AI Manager: стриминг chat/completions с инструментами + управление моделью.
+
+Запросы проходят через очередь задач AI Manager: модель из поля "model" запускается сама,
+когда до запроса дойдёт очередь; пока у других проектов есть задачи к другой модели,
+переключение запрещено (ручной start → 409 model_busy), а наш запрос ждёт.
+"""
 from __future__ import annotations
 
 import asyncio
@@ -13,6 +18,15 @@ from . import config
 
 class LLMError(Exception):
     pass
+
+
+class LLMBusy(LLMError):
+    """GPU занята задачами других проектов — модель нельзя переключить прямо сейчас."""
+
+
+# Ошибки очереди AI Manager, которые не имеет смысла повторять сразу:
+# 503 — не дождались очереди (expired), 504 — превышено время выполнения (timeout)
+_RETRYABLE = ("HTTP 502",)
 
 
 @dataclass
@@ -31,9 +45,12 @@ class LLM:
                  model: str = config.MODEL, transport: httpx.AsyncBaseTransport | None = None):
         self.base_url = base_url
         self.model = model
+        headers = {"X-Project": config.AIM_PROJECT}
+        if password:
+            headers["X-API-Password"] = password
         self._client = httpx.AsyncClient(
             timeout=httpx.Timeout(None, connect=10.0),
-            headers={"X-API-Password": password} if password else {},
+            headers=headers,
             transport=transport,
         )
 
@@ -48,15 +65,23 @@ class LLM:
                 return {"ok": False, "error": "AI Manager: неверный AIM_PASSWORD"}
             r.raise_for_status()
             st = r.json()
-            return {"ok": True, "active": st.get("active"), "model": self.model,
-                    "ready": st.get("active") == self.model}
+            ready = st.get("active") == self.model
+            return {"ok": True, "active": st.get("active"), "model": self.model, "ready": ready,
+                    # По активной (другой) модели есть задачи: переключение запрещено,
+                    # наш запрос встанет в очередь и выполнится после них
+                    "busy": bool(st.get("switch_locked")) and not ready,
+                    "queue_running": st.get("queue_running", 0),
+                    "queue_waiting": st.get("queue_waiting", 0)}
         except Exception as e:
             return {"ok": False, "error": f"AI Manager недоступен ({self.base_url}): {e}"}
 
     async def start_model(self) -> dict:
         r = await self._client.post(f"{self.base_url}/api/models/{self.model}/start", timeout=None)
+        if r.status_code == 409 and '"model_busy"' in r.text:
+            raise LLMBusy("GPU занята задачами другого проекта. Запрос к модели встанет в очередь "
+                          "и выполнится после них — запускать вручную не нужно.")
         if r.status_code != 200:
-            raise LLMError(f"Не удалось запустить модель: HTTP {r.status_code} {r.text[:300]}")
+            raise LLMError(f"Не удалось запустить модель: HTTP {r.status_code} {_error_text(r.text)}")
         return r.json()
 
     # ---------- чат ----------
@@ -65,7 +90,8 @@ class LLM:
         """
         Стрим ответа. Выдаёт события ("reasoning", str), ("text", str), ("tool", name)
         и последним — ("done", Completion). Ошибки соединения до первого токена
-        повторяются (до 3 раз) — AI Manager мог перезапускать модель.
+        повторяются (до 3 раз) — AI Manager мог перезапускать модель. Ошибки очереди
+        (503 — не дождались, 504 — превышено время выполнения) и 4xx не повторяются.
         """
         payload = {"model": self.model, "messages": messages, "stream": True,
                    "stream_options": {"include_usage": True}, "cache_prompt": True, **params}
@@ -79,7 +105,7 @@ class LLM:
                     yield ev
                 return
             except (httpx.TransportError, LLMError) as e:
-                retryable = isinstance(e, httpx.TransportError) or str(e).startswith(("HTTP 5", "HTTP 409"))
+                retryable = isinstance(e, httpx.TransportError) or str(e).startswith(_RETRYABLE)
                 if got_data or attempt == 2 or not retryable:
                     raise LLMError(str(e) or type(e).__name__) from e
                 await asyncio.sleep(2 + attempt * 3)

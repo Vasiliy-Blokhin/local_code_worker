@@ -75,6 +75,7 @@ scripts\run.bat     :: запуск с авто-перезапуском при 
 | `AIM_URL` / `AIM_PASSWORD` | `http://127.0.0.1:8000` | AI Manager |
 | `LCW_MODEL` | `gpt-oss-20b` | Имя модели в реестре AI Manager |
 | `LCW_CONTEXT` | `32768` | Должен совпадать с `context` модели в реестре |
+| `LCW_AIM_PROJECT` | `local_code_worker` | Имя проекта в очереди задач AI Manager (заголовок `X-Project`) |
 | `LCW_REASONING` | `low` | Глубина рассуждений по умолчанию |
 | `LCW_MAX_STEPS` / `LCW_COMMAND_TIMEOUT` | `50` / `180` | Лимиты агента |
 | `LCW_COMPACT_AT` | `0.75` | Порог авто-сжатия истории |
