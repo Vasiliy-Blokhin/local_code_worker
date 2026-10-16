@@ -141,10 +141,10 @@ function renderItem(i) {
     case "tool": {
       const open = openTools.has(i) || it.status === "approve";
       const detail = [];
-      if (it.name === "edit" && it.status === "approve") {
+      if (it.name === "edit" && it.status === "approve" && !it.diff) {
         detail.push(diffHtml(`--- ${it.args.path}\n${(it.args.old || "").split("\n").map(l => "-" + l).join("\n")}\n${(it.args.new || "").split("\n").map(l => "+" + l).join("\n")}`));
       }
-      if (it.name === "write" && it.status === "approve") detail.push(`<pre>${esc(it.args.path)}: ${esc(it.args.content)}</pre>`);
+      if (it.name === "write" && it.status === "approve" && !it.diff) detail.push(`<pre>${esc(it.args.path)}: ${esc(it.args.content)}</pre>`);
       if (it.diff) detail.push(diffHtml(it.diff));
       else if (it.output) detail.push(`<pre>${esc(it.output)}</pre>`);
       el.innerHTML = `<div class="head"><span class="name">${esc(it.name)}</span><span class="arg">${esc(toolSummary(it))}</span><span class="st ${it.status}">${ST[it.status] || it.status}</span></div>`
@@ -152,6 +152,22 @@ function renderItem(i) {
         + (it.status === "approve" ? `<div class="approve-bar"><button class="btn primary" data-d="allow">Разрешить</button><button class="btn" data-d="always">Всегда для «${esc(it.name)}»</button><input placeholder="Комментарий при отказе…"><button class="btn danger" data-d="deny">Отклонить</button></div>` : "");
       $(".head", el).onclick = () => { openTools.has(i) ? openTools.delete(i) : openTools.add(i); renderItem(i); };
       el.querySelectorAll("[data-d]").forEach(b => b.onclick = () => approve(it.id, b.dataset.d, $("input", el).value));
+      break;
+    }
+    case "plan": {
+      el.className = "item plan";
+      const total = it.steps.length;
+      const done = it.steps.filter(s => s.status === "done").length;
+      el.innerHTML = `<div class="ph">План (${done}/${total})</div>`;
+      const ol = document.createElement("ol");
+      it.steps.forEach(step => {
+        const icon = {todo: "○", doing: "◐", done: "●", failed: "✕"}[step.status];
+        const li = document.createElement("li");
+        li.className = `st-${step.status}`;
+        li.innerHTML = `<span class="ic">${icon}</span> ${esc(step.text)}`;
+        ol.appendChild(li);
+      });
+      el.appendChild(ol);
       break;
     }
     case "notice":
@@ -443,6 +459,11 @@ async function pollModel() {
     pill.onclick = null;
     pill.classList.remove("clickable");
     if (!st.ok) { pill.className = "pill off"; pill.textContent = "AI Manager недоступен"; pill.title = st.error; }
+    else if (st.switching) {
+      pill.className = "pill wait";
+      pill.textContent = "AI Manager: загрузка модели…";
+      pill.title = "AI Manager отвечает медленно — обычно идёт запуск или переключение модели (30–60 с).";
+    }
     else if (st.ready) { pill.className = "pill ok"; pill.textContent = st.model; pill.title = "Модель запущена"; }
     else if (st.busy) {
       // По другой модели есть задачи — AI Manager не переключит GPU, наш запрос подождёт в очереди

@@ -47,7 +47,14 @@ def _fn(name: str, desc: str, props: dict, required: list[str]) -> dict:
 S = {"type": "string"}
 I = {"type": "integer"}
 
+PLAN_STATUSES = ("todo", "doing", "done", "failed")
+
 TOOLS = [
+    _fn("plan", "Set the task plan: the FULL list of small steps with statuses (replaces the previous "
+                "list). Call it before any change, and again after each step to mark progress.",
+        {"steps": {"type": "array", "items": {"type": "object", "properties": {
+            "text": S, "status": {"type": "string", "enum": list(PLAN_STATUSES)}},
+            "required": ["text", "status"]}}}, ["steps"]),
     _fn("read", "Read a text file. Returns numbered lines. Use offset/limit for big files.",
         {"path": S, "offset": {**I, "description": "1-based start line"},
          "limit": {**I, "description": f"lines, default {READ_LIMIT}"}}, ["path"]),
@@ -59,7 +66,8 @@ TOOLS = [
          "ignore_case": {"type": "boolean"}}, ["pattern"]),
     _fn("edit", "Replace an exact unique snippet in a file. `old` must match the file "
                 "exactly (copy from read output without line numbers, keep trailing \\ etc.); "
-                "include enough lines to be unique. Empty `old` appends `new` to the end of file. "
+                "include enough lines to be unique. Plain text, NOT patch/diff format. "
+                "Empty `old` appends `new` to the end of file. "
                 "Prefer several small edits over rewriting.",
         {"path": S, "old": S, "new": S,
          "replace_all": {"type": "boolean", "description": "only for renames: replace every occurrence"}},
@@ -72,6 +80,36 @@ TOOLS = [
 ]
 TOOL_NAMES = {t["function"]["name"] for t in TOOLS}
 MUTATING = {"edit", "write"}
+ICONS = {"todo": "[ ]", "doing": "[>]", "done": "[x]", "failed": "[!]"}
+
+
+def normalize_plan(steps) -> list[dict]:
+    """Проверка и нормализация аргумента plan. Бросает ToolError с понятной причиной."""
+    if not isinstance(steps, list) or not steps:
+        raise ToolError("steps должен быть непустым списком шагов {text, status}.")
+    if len(steps) < 2:
+        raise ToolError("Слишком крупный план: разбей работу на мелкие шаги (по одному изменению "
+                        "на шаг) и добавь последним шагом общую проверку.")
+    if len(steps) > 40:
+        raise ToolError("Слишком много шагов (>40): объедини мелочи или вынеси часть в следующий план.")
+    out = []
+    for st in steps:
+        if isinstance(st, str):
+            st = {"text": st, "status": "todo"}
+        if not isinstance(st, dict) or not str(st.get("text", "")).strip():
+            raise ToolError("Каждый шаг — объект {text, status}.")
+        status = st.get("status", "todo")
+        status = {"pending": "todo", "in_progress": "doing", "completed": "done"}.get(status, status)
+        if status not in PLAN_STATUSES:
+            raise ToolError(f"status должен быть одним из: {', '.join(PLAN_STATUSES)}.")
+        out.append({"text": str(st["text"]).strip()[:300], "status": status})
+    if sum(s["status"] == "doing" for s in out) > 1:
+        raise ToolError("Одновременно в работе (doing) может быть только один шаг.")
+    return out
+
+
+def render_plan(steps: list[dict]) -> str:
+    return "\n".join(f"{ICONS[s['status']]} {n}. {s['text']}" for n, s in enumerate(steps, 1))
 
 
 class ToolError(Exception):
@@ -276,20 +314,63 @@ def _syntax_warning(rel: str, text: str) -> str:
     return ""
 
 
-def t_edit(ctx: ToolContext, path: str, old: str, new: str, replace_all: bool = False) -> ToolResult:
+_PATCH_MARK = ("*** ", "@@")
+_LINE_NO = re.compile(r"^ *\d+│", re.M)
+
+
+def _unpatch(old: str, new: str) -> tuple[str, str]:
+    """
+    gpt-oss обучена на формате apply_patch и иногда кладёт в `old` патч
+    (строки с -/+, «*** End Patch», «@@»), оставляя `new` пустым.
+    Раскладываем такой патч обратно на old/new; обычные аргументы не трогаем.
+    """
+    if new.strip():
+        return old, new
+    lines = [l for l in old.split("\n") if not l.startswith(_PATCH_MARK)]
+    while lines and not lines[-1].strip():
+        lines.pop()
+    marked = [l for l in lines if l[:1] in "+-"]
+    if len(marked) < 2 or not any(l.startswith("+") for l in marked):
+        return old, new
+    # строка контекста перед блоком «-», которая затем повторена первой «+»-строкой блока,
+    # на деле тоже заменяется (модель забыла поставить «-») — иначе получится дубль
+    for k, l in enumerate(lines):
+        if l[:1] in "+-" or k + 1 >= len(lines) or not lines[k + 1].startswith("-"):
+            continue
+        j = k + 1
+        while j < len(lines) and lines[j].startswith("-"):
+            j += 1
+        if j < len(lines) and lines[j].startswith("+") and lines[j][1:] == l:
+            lines[k] = "-" + l
+    o, n = [], []
+    for l in lines:
+        if l.startswith("-"):
+            o.append(l[1:])
+        elif l.startswith("+"):
+            n.append(l[1:])
+        else:  # контекст: «␠строка» в unified-формате или строка без префикса
+            ctx_line = l[1:] if l.startswith(" ") and not l.startswith("  ") else l
+            o.append(ctx_line)
+            n.append(ctx_line)
+    return "\n".join(o), "\n".join(n)
+
+
+def _plan_edit(ctx: ToolContext, path: str, old: str, new: str, replace_all: bool = False):
+    """Вычисляет правку без записи. Возвращает (p, rel, text, after, nl, start, new, summary)."""
     p = resolve(ctx.root, path)
     if not p.is_file():
         raise ToolError(f"Файл не найден: {path}. Для нового файла используйте write.")
     rel = relpath(ctx.root, p)
     text, nl = _read_text(p)
-    old = old.replace("\r\n", "\n")
-    new = new.replace("\r\n", "\n")
+    old, new = _unpatch(old.replace("\r\n", "\n"), new.replace("\r\n", "\n"))
+    # модель копирует номера строк из вывода read («129│код») — маркер «│» наш, срезаем его
+    old, new = _LINE_NO.sub("", old), _LINE_NO.sub("", new)
     if old == new:
         raise ToolError("old и new совпадают.")
     if not old:  # дописать в конец файла
         base = text if not text or text.endswith("\n") else text + "\n"
         new = new if new.endswith("\n") else new + "\n"
-        return _finish_edit(ctx, p, rel, text, base + new, nl, len(base), new)
+        return p, rel, text, base + new, nl, len(base), new, ""
     positions, i = [], text.find(old)
     while i != -1:
         positions.append(i)
@@ -305,15 +386,43 @@ def t_edit(ctx: ToolContext, path: str, old: str, new: str, replace_all: bool = 
     else:
         span = _find_block(text, old)
         if not span:
-            raise ToolError("old не найден в файле (нужно точное совпадение, с отступами). "
-                            "Перечитайте нужный фрагмент через read." + _closest(text, old))
+            raise ToolError("old не найден в файле (нужно точное совпадение, с отступами; не используй "
+                            "формат патча с -/+). Перечитай нужный фрагмент через read." + _closest(text, old))
         start = span[0]
         after = text[:span[0]] + new + text[span[1]:]
+    summary = ""
     if replace_all and len(positions) > 1:
         lines = ", ".join(str(_line_at(text, x)) for x in positions[:20])
-        return _finish_edit(ctx, p, rel, text, after, nl, start, new,
-                            f"заменено {len(positions)} вхождений (строки {lines})")
-    return _finish_edit(ctx, p, rel, text, after, nl, start, new)
+        summary = f"заменено {len(positions)} вхождений (строки {lines})"
+    return p, rel, text, after, nl, start, new, summary
+
+
+def t_edit(ctx: ToolContext, path: str, old: str, new: str, replace_all: bool = False) -> ToolResult:
+    p, rel, text, after, nl, start, new, summary = _plan_edit(ctx, path, old, new, replace_all)
+    return _finish_edit(ctx, p, rel, text, after, nl, start, new, summary)
+
+
+def preview(ctx: ToolContext, name: str, args: dict) -> ToolResult:
+    """
+    Сухой прогон перед запросом подтверждения: битая правка сразу уходит
+    модели с ошибкой (пользователя не спрашиваем), рабочая — даёт настоящий дифф для карточки.
+    """
+    try:
+        if name == "edit":
+            _, rel, text, after, *_ = _plan_edit(ctx, **args)
+            return ToolResult("", diff=_diff(rel, text, after), path=rel)
+        if name == "write":
+            p = resolve(ctx.root, args["path"])
+            if p.is_dir():
+                raise ToolError(f"{args['path']} — это папка.")
+            rel = relpath(ctx.root, p)
+            before = _read_text(p)[0] if p.is_file() else ""
+            return ToolResult("", diff=_diff(rel, before, str(args["content"]).replace("\r\n", "\n")), path=rel)
+    except (KeyError, TypeError) as e:
+        return ToolResult(f"Неверные аргументы {name}: {e}", ok=False)
+    except (ToolError, WorkspaceError) as e:
+        return ToolResult(f"Ошибка: {e}", ok=False)
+    return ToolResult("")
 
 
 def _finish_edit(ctx: ToolContext, p: Path, rel: str, text: str, after: str, nl: str,
@@ -424,6 +533,8 @@ SYNC = {"read": t_read, "glob": t_glob, "grep": t_grep, "edit": t_edit, "write":
 async def execute(ctx: ToolContext, name: str, args: dict) -> ToolResult:
     if name not in TOOL_NAMES:
         return ToolResult(f"Неизвестный инструмент {name}. Доступны: {', '.join(sorted(TOOL_NAMES))}.", ok=False)
+    if name == "plan":  # состояние плана живёт в сессии — обрабатывает агент
+        return ToolResult("plan обрабатывается агентом.", ok=False)
     try:
         if name == "run":
             return await t_run(ctx, **args)

@@ -72,8 +72,14 @@ class LLM:
                     "busy": bool(st.get("switch_locked")) and not ready,
                     "queue_running": st.get("queue_running", 0),
                     "queue_waiting": st.get("queue_waiting", 0)}
+        except httpx.TimeoutException:
+            # Сервис жив, но не отвечает вовремя: обычно идёт загрузка/переключение модели
+            # (менеджер держит блокировку 30-60 с). Это не «недоступен».
+            return {"ok": True, "switching": True, "active": None, "model": self.model,
+                    "ready": False, "busy": False, "queue_running": 0, "queue_waiting": 0}
         except Exception as e:
-            return {"ok": False, "error": f"AI Manager недоступен ({self.base_url}): {e}"}
+            return {"ok": False, "error": f"AI Manager недоступен ({self.base_url}): "
+                                          f"{type(e).__name__}: {e}"}
 
     async def start_model(self) -> dict:
         r = await self._client.post(f"{self.base_url}/api/models/{self.model}/start", timeout=None)
