@@ -20,7 +20,8 @@ from pathlib import Path
 from . import config, prompts
 from .llm import LLM, Completion, LLMError
 from .sessions import Session
-from .tools import MUTATING, TOOLS, ToolContext, ToolResult, execute, syntax_errors
+from .tools import (MUTATING, TOOLS, ToolContext, ToolError, ToolResult, execute, normalize_plan,
+                    preview, render_plan, syntax_errors)
 from .workspace import WorkspaceError, get_project, is_text_file, relpath, resolve
 
 UI_OUTPUT = 6000           # сколько вывода инструмента показывать в UI
@@ -145,6 +146,9 @@ class Agent:
         last_call = None
         nudged = False
         fixes = 0
+        plan_nudges = 0
+        # состояние хода: составлен ли план, было ли уже напоминание, элемент плана в UI
+        st = {"planned": False, "plan_rejects": 0, "plan_item": None, "since_plan": 0}
         for _ in range(config.MAX_STEPS):
             if _estimate_tokens(s) > config.COMPACT_AT * config.CONTEXT:
                 await self.compact(s)
@@ -170,6 +174,17 @@ class Agent:
                         "Автопроверка: в изменённых файлах синтаксические ошибки:\n" + "\n".join(errors)
                         + "\nПеречитай эти места через read и исправь, затем дай итоговый ответ.")})
                     continue
+                # не даём закончить, пока в плане есть незакрытые шаги
+                open_steps = [x for x in s.plan if x["status"] in ("todo", "doing")]
+                if st["planned"] and open_steps and plan_nudges < 2:
+                    plan_nudges += 1
+                    s.add({"type": "notice", "level": "warn",
+                           "text": f"В плане незакрыто шагов: {len(open_steps)} — агент продолжает."})
+                    s.messages.append({"role": "user", "content": (
+                        "В плане остались незакрытые шаги:\n" + render_plan(s.plan)
+                        + "\nВыполни их по одному с проверкой каждого (или отметь failed с причиной "
+                          "через plan), затем проверь всё вместе и дай итоговый ответ.")})
+                    continue
                 return
             for n, tc in enumerate(comp.tool_calls):
                 call_id = tc["id"] or f"call_{uuid.uuid4().hex[:8]}"
@@ -180,7 +195,7 @@ class Agent:
                     msg["reasoning_content"] = comp.reasoning
                 s.messages.append(msg)
                 sig = (tc["name"], tc["arguments"])
-                result = await self._tool(s, ctx, call_id, tc["name"], tc["arguments"])
+                result = await self._tool(s, ctx, call_id, tc["name"], tc["arguments"], st)
                 out = result.output
                 if sig == last_call:
                     out = "Ты уже делал ровно этот вызов, результат тот же. Смени подход.\n" + out
@@ -237,7 +252,9 @@ class Agent:
         return comp
 
     # ------------------------------------------------------------- инструмент
-    async def _tool(self, s: Session, ctx: ToolContext, call_id: str, name: str, raw: str) -> ToolResult:
+    async def _tool(self, s: Session, ctx: ToolContext, call_id: str, name: str, raw: str,
+                    st: dict | None = None) -> ToolResult:
+        st = st if st is not None else {"planned": True, "plan_rejects": 99, "plan_item": None}
         try:
             args = json.loads(raw or "{}")
             if not isinstance(args, dict):
@@ -246,9 +263,29 @@ class Agent:
             i = s.add({"type": "tool", "id": call_id, "name": name, "args": {"raw": raw[:500]},
                        "status": "error", "output": f"Неверный JSON аргументов: {e}"})
             return ToolResult(f"Ошибка: аргументы не являются корректным JSON ({e}). Повтори вызов.", ok=False)
+        if name == "plan":
+            return self._plan(s, args, st)
+        if not st["planned"] and st["plan_rejects"] < 3 and (
+                name in MUTATING or (name == "run" and not SAFE_CMD.match(args.get("command", "")))):
+            # правило работы маленькой модели: сначала план из мелких шагов, потом изменения
+            st["plan_rejects"] += 1
+            prev = f"\nПредыдущий план:\n{render_plan(s.plan)}" if s.plan else ""
+            s.add({"type": "tool", "id": call_id, "name": name, "args": _ui_args(name, args),
+                   "status": "error", "output": "Сначала нужен план (plan)."})
+            return ToolResult("Не выполнено: сначала составь план через plan — мелкие проверяемые шаги "
+                              "(одно изменение в одном месте на шаг), в конце — общая проверка. "
+                              "Затем выполняй по одному шагу." + prev, ok=False)
         i = s.add({"type": "tool", "id": call_id, "name": name, "args": _ui_args(name, args),
                    "status": "running"})
         if _approval_needed(s, name, args):
+            if name in MUTATING:
+                # сначала проверяем правку всухую: битую не показываем пользователю, а сразу
+                # возвращаем модели ошибку; рабочую — показываем настоящим диффом
+                pre = await asyncio.to_thread(preview, ctx, name, args)
+                if not pre.ok:
+                    s.set(i, status="error", output=pre.output)
+                    return pre
+                s.set(i, diff=pre.diff)
             fut = asyncio.get_running_loop().create_future()
             s.pending[call_id] = fut
             s.set(i, status="approve")
@@ -265,10 +302,33 @@ class Agent:
                 s.settings.setdefault("always", []).append(name)
             s.set(i, status="running")
         result = await execute(ctx, name, args)
+        if st["planned"] and (name in MUTATING or name == "run"):
+            st["since_plan"] = st.get("since_plan", 0) + 1
+            if st["since_plan"] >= 2:  # модель увлеклась и забыла про план — напоминаем
+                result.output += ("\n[Напоминание: обнови plan — отметь выполненный шаг done и "
+                                  "следующий doing; делай по одному шагу с проверкой.]")
         out = result.output
         ui_out = out if len(out) <= UI_OUTPUT else out[:UI_OUTPUT] + "\n…"
         s.set(i, status="ok" if result.ok else "error", output=ui_out, diff=result.diff, path=result.path)
         return result
+
+    def _plan(self, s: Session, args: dict, st: dict) -> ToolResult:
+        try:
+            steps = normalize_plan(args.get("steps"))
+        except ToolError as e:
+            s.add({"type": "notice", "level": "warn", "text": f"План отклонён: {e}"})
+            return ToolResult(f"Ошибка: {e}", ok=False)
+        s.plan = steps
+        st["planned"] = True
+        st["since_plan"] = 0
+        if st["plan_item"] is None:
+            st["plan_item"] = s.add({"type": "plan", "steps": steps})
+        else:  # тот же чек-лист обновляется на месте, а не дублируется
+            s.set(st["plan_item"], steps=steps)
+        cur = next((n for n, x in enumerate(steps, 1) if x["status"] in ("doing", "todo")), None)
+        hint = (f"Сейчас шаг {cur}: сделай только его, проверь результат, затем отметь в plan."
+                if cur else "Все шаги закрыты: проверь всё вместе (тесты/запуск) и дай итоговый ответ.")
+        return ToolResult(f"План:\n{render_plan(steps)}\n{hint}")
 
     # ----------------------------------------------------------------- сжатие
     async def compact(self, s: Session, manual: bool = False) -> None:
@@ -290,6 +350,8 @@ class Agent:
         if not summary:  # запасной вариант без модели: оставляем только последние сообщения
             summary = "(автосводка недоступна) Последний запрос пользователя:\n" + last_user[:4000]
         resume = f"[Сводка предыдущей части сессии]\n{summary}"
+        if s.plan:  # план переживает сжатие дословно — модель продолжит с нужного шага
+            resume += f"\n\n[Текущий план]\n{render_plan(s.plan)}"
         if not manual:
             resume += f"\n\n[Текущий запрос пользователя]\n{last_user[:6000]}\n\nПродолжай работу."
         s.messages = [{"role": "user", "content": resume}]

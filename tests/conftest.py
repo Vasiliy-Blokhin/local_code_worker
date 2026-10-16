@@ -66,3 +66,9 @@ def project(tmp_path):
     (tmp_path / "pkg" / "util.py").write_text("X = 1\r\nY = 2\r\n", encoding="utf-8", newline="")
     from lcw import workspace
     return workspace.add_project(str(tmp_path))
+
+
+def plan_chunks(*texts, status="todo", call_id="p1"):
+    """Вызов plan — агент требует план перед изменениями."""
+    steps = [{"text": t, "status": status} for t in (texts or ("шаг", "проверка"))]
+    return tool_call_chunks("plan", {"steps": steps}, call_id, reasoning="план")

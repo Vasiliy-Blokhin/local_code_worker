@@ -1,6 +1,6 @@
 import time
 
-from conftest import MockModel, text_chunks, tool_call_chunks
+from conftest import MockModel, plan_chunks, text_chunks, tool_call_chunks
 from fastapi.testclient import TestClient
 
 from lcw import server
@@ -9,6 +9,7 @@ from lcw.llm import LLM
 
 def test_api_flow(project, monkeypatch):
     model = MockModel([
+        plan_chunks(status="done"),
         tool_call_chunks("edit", {"path": "app.py", "old": "'hi'", "new": "'hey'"}, "c1"),
         text_chunks("Сделано"),
     ])
@@ -33,7 +34,7 @@ def test_api_flow(project, monkeypatch):
                 break
             time.sleep(0.05)
         snap = c.get(f"/api/sessions/{sid}").json()
-        assert [it["type"] for it in snap["items"]] == ["user", "reasoning", "tool", "text"]
+        assert [it["type"] for it in snap["items"]] == ["user", "reasoning", "plan", "reasoning", "tool", "text"]
         assert snap["items"][-1]["text"] == "Сделано"
 
         # буфер операций для SSE (сам SSE TestClient не умеет — он ждёт конца ответа)

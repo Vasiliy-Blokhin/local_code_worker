@@ -18,7 +18,7 @@ def _int(name: str, default: int) -> int:
 
 
 HOST = os.getenv("LCW_HOST", "127.0.0.1")
-PORT = _int("LCW_PORT", 5000)
+PORT = _int("LCW_PORT", 9009)
 # Пароль веб-интерфейса. Пустой — без входа (только для 127.0.0.1!).
 PASSWORD = os.getenv("LCW_PASSWORD", "")
 
@@ -29,7 +29,7 @@ MODEL = os.getenv("LCW_MODEL", "gpt-oss-20b")
 # Имя проекта в очереди задач AI Manager (заголовок X-Project: история /api/jobs, статистика)
 AIM_PROJECT = os.getenv("LCW_AIM_PROJECT", "local_code_worker")
 # Размер контекста модели (должен совпадать с "context" в реестре AI Manager)
-CONTEXT = _int("LCW_CONTEXT", 32768)
+CONTEXT = _int("LCW_CONTEXT", 100000)
 REASONING = os.getenv("LCW_REASONING", "low")  # low | medium | high
 MAX_TOKENS = _int("LCW_MAX_TOKENS", 8192)      # лимит одного ответа модели
 
