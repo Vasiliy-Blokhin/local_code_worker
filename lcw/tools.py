@@ -611,6 +611,91 @@ def new_stubs(root: Path, originals: dict) -> list[str]:
     return out
 
 
+def _defs(tree: ast.AST) -> dict[str, ast.AST]:
+    out = {}
+    for n in tree.body:
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            out[n.name] = n
+        elif isinstance(n, ast.ClassDef):
+            out.update({f"{n.name}.{m.name}": m for m in n.body
+                        if isinstance(m, (ast.FunctionDef, ast.AsyncFunctionDef))})
+    return out
+
+
+def _src(text: str, node: ast.AST, cap: int = 16) -> str:
+    """Исходник функции без докстринга (он съедает место и не влияет на поведение)."""
+    lines = (ast.get_source_segment(text, node) or "").splitlines()
+    body = node.body
+    if len(body) > 1 and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant):
+        lines = lines[:body[0].lineno - node.lineno] + text.splitlines()[body[1].lineno - 1:node.end_lineno]
+    return "\n".join(lines[:cap] + (["    …"] if len(lines) > cap else []))
+
+
+def _delegate(fn: ast.AST) -> str | None:
+    """Имя функции, которой теперь целиком делегировано тело (return f(...) / f(...)), иначе None."""
+    body = [b for b in fn.body if not (isinstance(b, ast.Expr) and isinstance(b.value, ast.Constant))]
+    if len(body) != 1:
+        return None
+    v = body[0].value if isinstance(body[0], (ast.Return, ast.Expr)) else None
+    if isinstance(v, ast.Call):
+        f = v.func
+        return f.id if isinstance(f, ast.Name) else (f.attr if isinstance(f, ast.Attribute) else None)
+    return None
+
+
+def merged_functions(root: Path, originals: dict) -> list[str]:
+    """
+    Функции, которые агент заменил общей реализацией (удалил и импортировал одноимённую из модуля
+    проекта или свёл тело к вызову другой функции). Возвращает «было / стало» для сверки поведения:
+    маленькая модель объединяет «похожие» функции, не замечая различий в формате, порядке, типах.
+    """
+    out = []
+    for rel, before in sorted(originals.items()):
+        p = root / rel
+        if not before or not rel.endswith(".py") or not p.is_file():
+            continue
+        text = p.read_text(encoding="utf-8", errors="replace")
+        try:
+            old_t, new_t = ast.parse(before), ast.parse(text)
+        except SyntaxError:
+            continue
+        old_d, new_d = _defs(old_t), _defs(new_t)
+        imports = {}
+        for n in ast.walk(new_t):
+            if isinstance(n, ast.ImportFrom) and n.module and n.level == 0:
+                for a in n.names:
+                    imports[a.asname or a.name] = (n.module, a.name)
+        for name, old_fn in old_d.items():
+            new_fn = new_d.get(name)
+            if new_fn is not None and ast.dump(old_fn) == ast.dump(new_fn):
+                continue
+            target = name if new_fn is None else _delegate(new_fn)
+            if not target or (new_fn is None and name not in imports):
+                continue
+            if target not in imports:  # делегирование функции из этого же файла
+                tgt = new_d.get(target)
+                where, tgt_text = rel, text
+            else:
+                mod, real = imports[target]
+                f = _module_file(root, mod)
+                if f is None or f.is_dir():
+                    continue
+                tgt_text = f.read_text(encoding="utf-8", errors="replace")
+                tgt = _defs(ast.parse(tgt_text)).get(real)
+                where = relpath(root, f)
+            if tgt is None or _body_key_eq(old_fn, tgt):
+                continue
+            out.append(f"{rel}: {name} заменена на {target} из {where}.\nБыло:\n{_src(before, old_fn)}\n"
+                       f"Стало ({target}):\n{_src(tgt_text, tgt)}"
+                       + (f"\nВызов в {rel}:\n{_src(text, new_fn)}" if new_fn is not None else ""))
+    return out[:6]
+
+
+def _body_key_eq(a: ast.AST, b: ast.AST) -> bool:
+    strip = lambda f: [x for x in f.body if not (isinstance(x, ast.Expr) and isinstance(x.value, ast.Constant))]
+    return [ast.dump(x) for x in strip(a)] == [ast.dump(x) for x in strip(b)]
+
+
 def project_tests(root: Path, timeout: int = 600) -> tuple[bool, str] | None:
     """
     Прогон тестов проекта (pytest через venv проекта) для автопроверки в конце хода.

@@ -102,6 +102,26 @@ def test_failing_project_tests_block_finish(project):
     assert s.messages[-1]["content"] == "вернул поведение"
 
 
+def test_merged_functions_show_before_after(tmp_path):
+    from lcw.tools import merged_functions
+    (tmp_path / "common").mkdir()
+    (tmp_path / "common" / "__init__.py").write_text("", encoding="utf-8")
+    (tmp_path / "common" / "fmt.py").write_text(
+        "def fmt(x):\n    \"\"\"Общий формат.\"\"\"\n    return f'{x:.1f}'\n", encoding="utf-8")
+    (tmp_path / "a.py").write_text("from common.fmt import fmt\n", encoding="utf-8")
+    (tmp_path / "b.py").write_text("from common.fmt import fmt as _f\n\n\ndef show(x):\n    return _f(x)\n",
+                                   encoding="utf-8")
+    (tmp_path / "c.py").write_text("from common.fmt import fmt\n", encoding="utf-8")
+    out = merged_functions(tmp_path, {
+        "a.py": "def fmt(x):\n    return f'{x:.2f}'\n",           # другая точность — сообщить
+        "b.py": "def show(x):\n    return f'X={x}'\n",            # тело сведено к вызову — сообщить
+        "c.py": "def fmt(x):\n    return f'{x:.1f}'\n",           # точная копия — молчать
+    })
+    assert len(out) == 2 and out[0].startswith("a.py: fmt заменена на fmt из common/fmt.py")
+    assert "x:.2f" in out[0] and "Общий формат" not in out[0]  # докстринг не показываем
+    assert out[1].startswith("b.py: show заменена на _f")
+
+
 def test_new_stubs_detected(tmp_path):
     from lcw.tools import new_stubs
     (tmp_path / "w.py").write_text(
