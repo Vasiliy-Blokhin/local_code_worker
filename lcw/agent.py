@@ -34,6 +34,11 @@ REFUSAL = re.compile(r"I'?m sorry|I can(no|')t|cannot (help|do|complete)|beyond 
                      r"not (feasible|possible) (to|in)|provide (a |more )?(clear )?spec|"
                      r"извин|не могу|не (получится|удастся)|слишком (сложн|больш|объ[её]мн)|"
                      r"выходит за рамки|предостав\w* (специфика|подробн|пример)", re.IGNORECASE)
+# сбой разбора вызова инструмента в llama.cpp и подсказка для повтора
+PARSE_ERROR = re.compile(r"does not match the expected|Failed to parse|unparsed", re.IGNORECASE)
+TOOL_FORMAT_HINT = ("[Система] Предыдущий вызов инструмента не распознан: неверный формат заголовка. Вызывай "
+                    "ровно один инструмент обычным способом (канал commentary, получатель functions.<имя>, "
+                    "аргументы — JSON-объект) — или ответь текстом. Продолжай с того же места.")
 # в ответе на сверку есть несделанные пункты
 UNDONE = re.compile(r"не\s+сделан|не\s+выполнен|частично|not\s+done|partial", re.IGNORECASE)
 # до плана разрешены проверки, которые ничего не меняют в коде: тесты, компиляция, импорт
@@ -378,14 +383,16 @@ class Agent:
                 return
             await asyncio.sleep(config.BUSY_POLL)
 
-    async def _call(self, s: Session, retry_overflow: bool = True, recover: int = 0) -> Completion:
+    async def _call(self, s: Session, retry_overflow: bool = True, recover: int = 0,
+                    hint: str = "") -> Completion:
         est = _estimate_tokens(s)
         max_tokens = max(512, min(config.MAX_TOKENS, config.CONTEXT - est - 256))
         r_i = t_i = None
         comp = Completion()
         try:
             async for kind, val in self.llm.stream(
-                    build_request(s), TOOLS, max_tokens=max_tokens,
+                    build_request(s) + ([{"role": "user", "content": hint}] if hint else []),
+                    TOOLS, max_tokens=max_tokens,
                     reasoning_effort=s.settings.get("effort", config.REASONING),
                     chat_template_kwargs={"reasoning_effort": s.settings.get("effort", config.REASONING)}):
                 if kind == "reasoning":
@@ -408,6 +415,13 @@ class Agent:
             if retry_overflow and ("context" in msg and ("exceed" in msg or "size" in msg)):
                 await self.compact(s)
                 return await self._call(s, retry_overflow=False)
+            if PARSE_ERROR.search(str(e)) and recover < config.RECOVER_TRIES:
+                # llama.cpp не разобрал вызов инструмента (gpt-oss путает заголовок harmony, чаще на
+                # длинном контексте). Тот же запрос даёт тот же сбой — повторяем сразу, с подсказкой
+                # о формате: она меняет контекст, но в историю сессии не пишется
+                s.add({"type": "notice", "level": "warn",
+                       "text": "Вызов инструмента в неверном формате — повторяю шаг с подсказкой."})
+                return await self._call(s, retry_overflow, recover + 1, hint=TOOL_FORMAT_HINT)
             if e.transient and recover < config.RECOVER_TRIES:
                 # модель занята/переключается/упала: ждём освобождения GPU и повторяем шаг
                 s.add({"type": "notice", "level": "warn",

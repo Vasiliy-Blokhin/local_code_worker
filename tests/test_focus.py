@@ -56,6 +56,17 @@ def test_stub_method_sent_back(project):
     assert "return [hello()]" in (Path(project["path"]) / "app.py").read_text()
 
 
+def test_tool_call_parse_error_retried_with_hint(project):
+    model, agent, s = make(project, [
+        [{"error": {"message": "The model produced output that does not match the expected peg-native format"}}],
+        text_chunks("со второй попытки"),
+    ])
+    asyncio.run(agent.run_turn(s, "привет"))
+    assert s.messages[-1]["content"] == "со второй попытки"
+    assert "не распознан" in model.requests[1]["messages"][-1]["content"]  # подсказка — только в запросе
+    assert not any("не распознан" in str(m.get("content")) for m in s.messages)
+
+
 def test_new_stubs_detected(tmp_path):
     from lcw.tools import new_stubs
     (tmp_path / "w.py").write_text(

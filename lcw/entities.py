@@ -282,20 +282,21 @@ def duplicates(root: str | Path, limit: int = 20) -> list[str]:
             tree = ast.parse((root / f).read_text(encoding="utf-8", errors="replace"))
         except (SyntaxError, OSError):
             continue
+        top = {id(n) for n in tree.body}
         for n in ast.walk(tree):
             if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name not in _COMMON:
                 where = f"{f}:{n.lineno}"
-                by_name.setdefault(n.name, []).append(where)
+                if id(n) in top:  # одноимённые методы — обычно переопределения в подклассах, не дубли
+                    by_name.setdefault(n.name, []).append(where)
                 if len(n.body) > 1 or not isinstance(n.body[0], (ast.Pass, ast.Return)):
                     by_body.setdefault(_body_key(n), []).append(f"{where} {n.name}")
     out = []
-    for name, places in sorted(by_name.items(), key=lambda x: -len(x[1])):
-        files = {p.rsplit(":", 1)[0] for p in places}
-        if len(files) >= 2:
-            out.append(f"одноимённые {name}(): " + ", ".join(places[:6]))
-    for places in by_body.values():
+    for places in by_body.values():  # точные копии — самые надёжные кандидаты, первыми
         if len({p.split(":", 1)[0] for p in places}) >= 2:
             out.append("одинаковое тело: " + ", ".join(places[:6]))
+    for name, places in sorted(by_name.items(), key=lambda x: -len(x[1])):
+        if len({p.rsplit(":", 1)[0] for p in places}) >= 2:
+            out.append(f"одноимённые функции {name}(): " + ", ".join(places[:6]))
     return out[:limit]
 
 

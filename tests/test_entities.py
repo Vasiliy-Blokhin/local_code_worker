@@ -140,6 +140,6 @@ def test_duplicates_across_modules(tmp_path):
     (tmp_path / "a.py").write_text(body, encoding="utf-8")
     (tmp_path / "b.py").write_text(body + "\n\ndef only_b():\n    return 1\n", encoding="utf-8")
     d = entities.duplicates(tmp_path)
-    assert any(x.startswith("одноимённые now(): a.py:1, b.py:1") for x in d)
+    assert any(x.startswith("одноимённые функции now(): a.py:1, b.py:1") for x in d)
     assert any(x.startswith("одинаковое тело:") for x in d)
     assert not any("only_b" in x for x in d)
