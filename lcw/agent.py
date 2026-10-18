@@ -17,21 +17,37 @@ import re
 import uuid
 from pathlib import Path
 
-from . import config, prompts
+from . import config, entities, prompts
 from .llm import LLM, Completion, LLMError
 from .sessions import Session
 from .tools import (MUTATING, TOOLS, ToolContext, ToolError, ToolResult, execute, normalize_plan,
-                    preview, render_plan, syntax_errors)
+                    GIT_WRITE, git_preview, preview, render_plan, syntax_errors, unused_modules, import_errors,
+                    unused_new_imports)
 from .workspace import WorkspaceError, get_project, is_text_file, relpath, resolve
 
 UI_OUTPUT = 6000           # сколько вывода инструмента показывать в UI
 CHARS_PER_TOKEN = 3.2      # грубая оценка для бюджета контекста
 SAFE_CMD = re.compile(r"^\s*(git (status|diff|log|show|branch|remote -v)|ls|dir|pwd|cat|head|tail|wc|"
                       r"tree|echo|python -V|python --version|node -v|which|where)\b[^;&|<>`$]*$")
+# отказ/«слишком сложно» вместо работы (en/ru)
+REFUSAL = re.compile(r"I'?m sorry|I can(no|')t|cannot (help|do|complete)|beyond what|too (complex|large|big)|"
+                     r"not (feasible|possible) (to|in)|provide (a |more )?(clear )?spec|"
+                     r"извин|не могу|не (получится|удастся)|слишком (сложн|больш|объ[её]мн)|"
+                     r"выходит за рамки|предостав\w* (специфика|подробн|пример)", re.IGNORECASE)
+# в ответе на сверку есть несделанные пункты
+UNDONE = re.compile(r"не\s+сделан|не\s+выполнен|частично|not\s+done|partial", re.IGNORECASE)
+# до плана разрешены проверки, которые ничего не меняют в коде: тесты, компиляция, импорт
+PRE_PLAN_CMD = re.compile(r"^\s*(\S*python(\.exe)?\s+-m\s+(pytest|py_compile|compileall)|\S*pytest(\.exe)?|"
+                          r"npm (test|run test)|go test|cargo test)\b")
+# просмотр файлов через shell — для этого есть read/symbols/grep
+FILE_VIEW = re.compile(r"^\s*(cat|head|tail|less|more|type|sed\s+-n|awk)\s+[^|;&]*\.(py|js|ts|tsx|jsx|json|"
+                       r"md|txt|toml|ya?ml|cfg|ini|html|css)\b[^|;&]*$")
 
 
 def _approval_needed(s: Session, name: str, args: dict) -> bool:
     mode = s.settings.get("mode", "edits")
+    if name == "git_commit":  # коммит/пуш — всегда с подтверждением, в любом режиме
+        return True
     if name in s.settings.get("always", []):
         return False
     if name == "run":
@@ -70,6 +86,25 @@ def _estimate_tokens(s: Session) -> int:
     if not base:
         chars += len(s.system) + len(json.dumps(TOOLS))
     return base + int(chars / CHARS_PER_TOKEN)
+
+
+_REQ = re.compile(r"^\s*(?:\d+[.)]|[-*•])\s+(.{8,})$", re.M)
+
+
+def requirements(text: str) -> list[str]:
+    """Нумерованные/маркированные пункты запроса пользователя (для сверки результата)."""
+    if not isinstance(text, str) or text.startswith("[Сводка"):
+        return []
+    return [m.group(1).strip()[:300] for m in _REQ.finditer(text.split("\n\n<file ")[0])][:12]
+
+
+def _session_originals(s: Session) -> dict:
+    """Файл → его содержимое до первой правки в сессии (None — файл создан агентом)."""
+    out: dict = {}
+    for cp in sorted(s.checkpoints, key=lambda c: c["turn"]):
+        for rel, text in cp["files"].items():
+            out.setdefault(rel, text)
+    return out
 
 
 def expand_mentions(root: Path, text: str, s: Session) -> str:
@@ -147,8 +182,17 @@ class Agent:
         nudged = False
         fixes = 0
         plan_nudges = 0
+        orphan_nudges = import_nudges = 0
+        refused = reviewed = pushed = False
+        reviewed_at = 0
+        # исходная задача хода («продолжай» — значит задача из предыдущих сообщений пользователя)
+        # (берём из элементов UI: там только реальные сообщения пользователя, без служебных)
+        task = next((it["text"] for it in reversed(s.items) if it.get("type") == "user"
+                     and len(requirements(it.get("text", ""))) >= 2), "")
         # состояние хода: составлен ли план, было ли уже напоминание, элемент плана в UI
-        st = {"planned": False, "plan_rejects": 0, "plan_item": None, "since_plan": 0}
+        # незакрытый план прошлого хода («продолжай») остаётся в силе — заново не требуем
+        carried = any(x["status"] in ("todo", "doing") for x in s.plan)
+        st = {"planned": carried, "plan_rejects": 0, "plan_item": None, "since_plan": 0, "tools_used": 0}
         for _ in range(config.MAX_STEPS):
             if _estimate_tokens(s) > config.COMPACT_AT * config.CONTEXT:
                 await self.compact(s)
@@ -163,16 +207,55 @@ class Agent:
                         s.messages.append({"role": "user",
                                            "content": "Продолжи: выполни задачу или дай итоговый ответ."})
                         continue
+                if not st["tools_used"] and not refused and REFUSAL.search(comp.content):
+                    # маленькая модель пугается большой задачи и отказывается, не открыв ни одного файла
+                    refused = True
+                    s.add({"type": "notice", "level": "warn",
+                           "text": "Агент отказался, не изучив код, — возвращаю к работе по частям."})
+                    s.messages.append({"role": "user", "content": (
+                        "Не отказывайся и не проси спецификацию: задача выполнима по частям, а ответы на "
+                        "вопросы — в коде. Изучи проект (symbols по модулям, read нужных сущностей, тесты), "
+                        "сам определи общий интерфейс по тому, что уже есть, составь plan первой законченной "
+                        "части (с именами файлов и функций) и выполни её. Остальное перечисли в итоговом ответе.")})
+                    continue
                 # автопроверка: не даём закончить ход со сломанным синтаксисом в изменённых файлах
-                changed = s.checkpoints[-1]["files"].keys() if s.checkpoints else ()
+                originals = _session_originals(s)  # все правки сессии, не только этого хода
+                changed = originals.keys()
                 errors = await asyncio.to_thread(syntax_errors, ctx.root, changed)
+                if not errors:  # синтаксис цел — проверяем, что изменённые модули реально импортируются
+                    errors = await asyncio.to_thread(import_errors, ctx.root, changed)
                 if errors and fixes < 3:
                     fixes += 1
                     s.add({"type": "notice", "level": "warn",
-                           "text": "Автопроверка: синтаксические ошибки — агент исправляет:\n" + "\n".join(errors)})
+                           "text": "Автопроверка: ошибки синтаксиса/импорта — агент исправляет:\n" + "\n".join(errors)})
                     s.messages.append({"role": "user", "content": (
-                        "Автопроверка: в изменённых файлах синтаксические ошибки:\n" + "\n".join(errors)
+                        "Автопроверка: изменённые модули не компилируются или не импортируются:\n"
+                        + "\n".join(errors)
                         + "\nПеречитай эти места через read и исправь, затем дай итоговый ответ.")})
+                    continue
+                # новый модуль, который нигде не импортируется, — признак «заглушки» вместо работы
+                created = [rel for rel, orig in originals.items() if orig is None]
+                unused = await asyncio.to_thread(unused_modules, ctx.root, created)
+                if unused and orphan_nudges < 2:
+                    orphan_nudges += 1
+                    s.add({"type": "notice", "level": "warn",
+                           "text": "Автопроверка: новые модули нигде не используются:\n" + "\n".join(unused)})
+                    s.messages.append({"role": "user", "content": (
+                        "Автопроверка: созданные модули не импортируются ни одним рабочим (не тестовым) "
+                        "модулем проекта:\n" + "\n".join(unused) + "\nНовый файл сам по себе задачу не решает. "
+                        "Встрой его: измени существующий код, чтобы он использовал новый модуль (добавь эти "
+                        "шаги в plan и выполни по одному с проверкой), или удали файл, если он не нужен.")})
+                    continue
+                # импорт добавлен, а код его не использует — «интеграция для галочки»
+                idle = await asyncio.to_thread(unused_new_imports, ctx.root, originals)
+                if idle and import_nudges < 2:
+                    import_nudges += 1
+                    s.add({"type": "notice", "level": "warn",
+                           "text": "Автопроверка: добавленные импорты не используются:\n" + "\n".join(idle)})
+                    s.messages.append({"role": "user", "content": (
+                        "Автопроверка: добавленные импорты нигде в файле не используются:\n" + "\n".join(idle)
+                        + "\nИмпорт сам по себе ничего не меняет. Доделай изменение кода, ради которого он "
+                          "добавлен (шаги — в plan), или убери импорт. Не пиши, что сделал то, чего нет в коде.")})
                     continue
                 # не даём закончить, пока в плане есть незакрытые шаги
                 open_steps = [x for x in s.plan if x["status"] in ("todo", "doing")]
@@ -185,6 +268,38 @@ class Agent:
                         + "\nВыполни их по одному с проверкой каждого (или отметь failed с причиной "
                           "через plan), затем проверь всё вместе и дай итоговый ответ.")})
                     continue
+                # сверка итога с пунктами запроса: маленькая модель отчитывается о части как о целом
+                reqs = requirements(task)
+                if (reviewed and not pushed and st["tools_used"] == reviewed_at
+                        and UNDONE.search(comp.content)):
+                    # сверка показала несделанное, а модель просто отчиталась — один раз отправляем доделывать
+                    pushed = True
+                    s.add({"type": "notice", "level": "warn",
+                           "text": "По сверке есть несделанные пункты — агент продолжает."})
+                    # карта «где смотреть» по каждому пункту — из индекса сущностей (имена + докстринги)
+                    hints = []
+                    for n, r in enumerate(reqs, 1):
+                        rel = await asyncio.to_thread(entities.related, ctx.root, r, 10)
+                        if rel:
+                            hints.append(f"Пункт {n} — связанный код:\n" + "\n".join(rel))
+                    s.messages.append({"role": "user", "content": (
+                        "Ты сам отметил несделанное. Начни с первого несделанного пункта: прочитай связанный "
+                        "код (read с symbol=), составь plan этой части с конкретными файлами и функциями и "
+                        "выполни его по шагам с проверкой. Если пункт правда невыполним без решения "
+                        "пользователя — объясни, какое решение нужно, и закончи."
+                        + ("\n\n" + "\n\n".join(hints) if hints else ""))})
+                    continue
+                if reqs and originals and not reviewed:
+                    reviewed, reviewed_at = True, st["tools_used"]
+                    s.add({"type": "notice", "level": "info", "text": "Сверка результата с пунктами запроса."})
+                    s.messages.append({"role": "user", "content": (
+                        "Перед завершением сверь сделанное с КАЖДЫМ пунктом запроса:\n"
+                        + "\n".join(f"{n}. {r}" for n, r in enumerate(reqs, 1))
+                        + "\nПо каждому пункту: «сделано — где именно (файл: функция/класс, что изменено)» или "
+                          "«не сделано». Опирайся только на реальные правки (смотри diff через run git diff "
+                          "при необходимости), не на намерения. Если что-то не сделано и выполнимо — составь "
+                          "plan и доделай; иначе честно перечисли несделанное в итоговом ответе.")})
+                    continue
                 return
             for n, tc in enumerate(comp.tool_calls):
                 call_id = tc["id"] or f"call_{uuid.uuid4().hex[:8]}"
@@ -194,10 +309,11 @@ class Agent:
                 if n == 0 and comp.reasoning:
                     msg["reasoning_content"] = comp.reasoning
                 s.messages.append(msg)
-                sig = (tc["name"], tc["arguments"])
+                st["tools_used"] += 1
                 result = await self._tool(s, ctx, call_id, tc["name"], tc["arguments"], st)
                 out = result.output
-                if sig == last_call:
+                sig = (tc["name"], tc["arguments"], out)
+                if sig == last_call:  # тот же вызов с тем же результатом — модель зациклилась
                     out = "Ты уже делал ровно этот вызов, результат тот же. Смени подход.\n" + out
                 last_call = sig
                 s.messages.append({"role": "tool", "tool_call_id": call_id, "content": out})
@@ -206,7 +322,18 @@ class Agent:
                "text": f"Достигнут лимит шагов ({config.MAX_STEPS}). Напишите «продолжай», чтобы продолжить."})
 
     # ------------------------------------------------------------ вызов модели
-    async def _call(self, s: Session, retry_overflow: bool = True) -> Completion:
+    async def _wait_model(self) -> None:
+        """Ожидание, пока AI Manager снова сможет принять запрос (не дольше BUSY_WAIT)."""
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + config.BUSY_WAIT
+        await asyncio.sleep(config.BUSY_POLL)
+        while loop.time() < deadline:
+            st = await self.llm.status()
+            if st.get("ok") and (st.get("ready") or not st.get("busy")):
+                return
+            await asyncio.sleep(config.BUSY_POLL)
+
+    async def _call(self, s: Session, retry_overflow: bool = True, recover: int = 0) -> Completion:
         est = _estimate_tokens(s)
         max_tokens = max(512, min(config.MAX_TOKENS, config.CONTEXT - est - 256))
         r_i = t_i = None
@@ -236,6 +363,12 @@ class Agent:
             if retry_overflow and ("context" in msg and ("exceed" in msg or "size" in msg)):
                 await self.compact(s)
                 return await self._call(s, retry_overflow=False)
+            if e.transient and recover < config.RECOVER_TRIES:
+                # модель занята/переключается/упала: ждём освобождения GPU и повторяем шаг
+                s.add({"type": "notice", "level": "warn",
+                       "text": f"Модель недоступна ({str(e)[:200]}) — жду и повторю шаг."})
+                await self._wait_model()
+                return await self._call(s, retry_overflow, recover + 1)
             raise
         if r_i is not None:
             s.set(r_i, done=True)
@@ -265,16 +398,43 @@ class Agent:
             return ToolResult(f"Ошибка: аргументы не являются корректным JSON ({e}). Повтори вызов.", ok=False)
         if name == "plan":
             return self._plan(s, args, st)
-        if not st["planned"] and st["plan_rejects"] < 3 and (
-                name in MUTATING or (name == "run" and not SAFE_CMD.match(args.get("command", "")))):
+        if name == "run" and GIT_WRITE.search(args.get("command", "")):
+            s.add({"type": "tool", "id": call_id, "name": name, "args": _ui_args(name, args),
+                   "status": "error", "output": "git add/commit/push — только через git_commit."})
+            return ToolResult("Не выполнено: изменять историю git через run нельзя. Для add/commit/push "
+                              "используй git_commit (с описанием изменений и проведённых тестов) — "
+                              "пользователь подтвердит его.", ok=False)
+        if name == "run" and FILE_VIEW.match(args.get("command", "")):
+            # чтение файлов через shell обходит read (номера строк, оглавление, дедупликацию)
+            s.add({"type": "tool", "id": call_id, "name": name, "args": _ui_args(name, args),
+                   "status": "error", "output": "Для чтения файлов — read/symbols/grep."})
+            return ToolResult("Не выполнено: файлы читай инструментами, а не через run: symbols (оглавление "
+                              "и поиск по сущностям), read (с symbol= или offset/limit), grep. Они доступны "
+                              "и до составления плана.", ok=False)
+        command = args.get("command", "")
+        needs_plan = not st["planned"] and (name in MUTATING or (
+            name == "run" and not SAFE_CMD.match(command) and not PRE_PLAN_CMD.match(command)))
+        if needs_plan and st["plan_rejects"] >= 2:
+            # модель упорно не вызывает plan (после закрытого плана прошлого хода — часто): заводим
+            # минимальный план сами и пропускаем действие — от заглушек защищают автопроверки хода
+            what = f"правка {args.get('path', '')}".strip() if name in MUTATING else f"команда: {command[:80]}"
+            self._plan(s, {"steps": [{"text": what, "status": "doing"},
+                                     {"text": "проверить изменения (тесты)", "status": "todo"}]}, st)
+            s.add({"type": "notice", "level": "warn", "text": "Агент не составил план — заведён автоматически."})
+            needs_plan = False
+        if needs_plan:
             # правило работы маленькой модели: сначала план из мелких шагов, потом изменения
             st["plan_rejects"] += 1
             prev = f"\nПредыдущий план:\n{render_plan(s.plan)}" if s.plan else ""
             s.add({"type": "tool", "id": call_id, "name": name, "args": _ui_args(name, args),
                    "status": "error", "output": "Сначала нужен план (plan)."})
             return ToolResult("Не выполнено: сначала составь план через plan — мелкие проверяемые шаги "
-                              "(одно изменение в одном месте на шаг), в конце — общая проверка. "
-                              "Затем выполняй по одному шагу." + prev, ok=False)
+                              "(одно изменение в одном месте на шаг, с именами файлов/функций), в конце — общая "
+                              "проверка. До плана можно и нужно изучать код: symbols, read, grep, glob, запуск "
+                              "тестов. Если код ещё не изучен — первые шаги плана сделай исследовательскими. "
+                              "Пример: plan({\"steps\": [{\"text\": \"изучить X через symbols\", \"status\": "
+                              "\"doing\"}, {\"text\": \"…\", \"status\": \"todo\"}, {\"text\": \"прогнать все "
+                              "тесты\", \"status\": \"todo\"}]})" + prev, ok=False)
         i = s.add({"type": "tool", "id": call_id, "name": name, "args": _ui_args(name, args),
                    "status": "running"})
         if _approval_needed(s, name, args):
@@ -286,6 +446,13 @@ class Agent:
                     s.set(i, status="error", output=pre.output)
                     return pre
                 s.set(i, diff=pre.diff)
+            if name == "git_commit":
+                # карточка: сообщение, описание изменений, тесты, файлы, куда push
+                try:
+                    s.set(i, git=await asyncio.to_thread(git_preview, ctx, **args))
+                except (ToolError, TypeError) as e:
+                    s.set(i, status="error", output=str(e))
+                    return ToolResult(f"Ошибка: {e}", ok=False)
             fut = asyncio.get_running_loop().create_future()
             s.pending[call_id] = fut
             s.set(i, status="approve")
@@ -298,7 +465,7 @@ class Agent:
                 return ToolResult("Пользователь отклонил это действие." +
                                   (f" Комментарий: {note}" if note else " Спроси, как поступить, или выбери другой путь."),
                                   ok=False)
-            if decision == "always":
+            if decision == "always" and name != "git_commit":  # git — только разовое разрешение
                 s.settings.setdefault("always", []).append(name)
             s.set(i, status="running")
         result = await execute(ctx, name, args)
@@ -313,8 +480,16 @@ class Agent:
         return result
 
     def _plan(self, s: Session, args: dict, st: dict) -> ToolResult:
+        raw = args.get("steps")
+        if isinstance(raw, list) and len(raw) == 1 and s.plan:
+            # модель часто шлёт только обновлённый шаг, а не весь список: обновляем его статус в плане
+            one = raw[0] if isinstance(raw[0], dict) else {"text": str(raw[0])}
+            key = str(one.get("text", "")).strip().casefold()
+            hit = next((x for x in s.plan if x["text"].casefold() == key), None)
+            if hit:
+                raw = [dict(x, status=one.get("status", x["status"])) if x is hit else x for x in s.plan]
         try:
-            steps = normalize_plan(args.get("steps"))
+            steps = normalize_plan(raw)
         except ToolError as e:
             s.add({"type": "notice", "level": "warn", "text": f"План отклонён: {e}"})
             return ToolResult(f"Ошибка: {e}", ok=False)
@@ -402,10 +577,7 @@ def session_changes(s: Session) -> list[dict]:
     import difflib
     proj = get_project(s.project_id)
     root = Path(proj["path"])
-    originals: dict[str, str | None] = {}
-    for cp in sorted(s.checkpoints, key=lambda c: c["turn"]):
-        for rel, text in cp["files"].items():
-            originals.setdefault(rel, text)
+    originals = _session_originals(s)
     out = []
     for rel, before in sorted(originals.items()):
         p = root / rel

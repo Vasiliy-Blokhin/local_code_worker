@@ -42,6 +42,10 @@ MAX_STEPS = _int("LCW_MAX_STEPS", 50)                # шагов (вызово�
 COMMAND_TIMEOUT = _int("LCW_COMMAND_TIMEOUT", 180)   # секунд на команду `run`
 TOOL_OUTPUT_CHARS = _int("LCW_TOOL_OUTPUT_CHARS", 12000)  # обрезка вывода инструментов для модели
 COMPACT_AT = float(os.getenv("LCW_COMPACT_AT", "0.75"))   # доля контекста для авто-сжатия
+# Модель занята/переключена/упала: сколько ждать освобождения GPU и повторять шаг (сек), пауза опроса
+BUSY_WAIT = _int("LCW_BUSY_WAIT", 1800)
+BUSY_POLL = _int("LCW_BUSY_POLL", 10)
+RECOVER_TRIES = _int("LCW_RECOVER_TRIES", 5)  # повторов одного шага после восстановления
 
 for d in (SESSIONS_DIR, WORKSPACES_DIR):
     d.mkdir(parents=True, exist_ok=True)

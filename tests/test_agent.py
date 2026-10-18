@@ -1,4 +1,6 @@
 import asyncio
+
+import httpx
 from pathlib import Path
 
 from conftest import MockModel, plan_chunks, text_chunks, tool_call_chunks
@@ -142,3 +144,32 @@ def test_cancel_marks_stopped(project):
     # история закрыта: у вызова инструмента есть результат, карточка не висит «выполняется»
     assert s.messages[-1]["role"] == "tool" and s.messages[-1]["content"] == "Прервано пользователем."
     assert not any(it.get("status") == "running" for it in s.items)
+
+
+def test_transient_error_waits_and_retries(project, monkeypatch):
+    """503 очереди AI Manager (не дождались GPU) — агент ждёт и повторяет шаг, а не обрывает ход."""
+    monkeypatch.setattr(config, "BUSY_POLL", 0)
+    model, agent, s = make(project, [text_chunks("готово после ожидания")])
+    orig, calls = model.handler, {"n": 0}
+
+    def handler(request):
+        if request.url.path.endswith("/chat/completions") and calls["n"] == 0:
+            calls["n"] += 1
+            return httpx.Response(503, json={"error": {"code": "expired", "message": "queue wait expired"}})
+        return orig(request)
+
+    agent.llm = LLM(base_url="http://mock", password="", transport=httpx.MockTransport(handler))
+    asyncio.run(agent.run_turn(s, "привет"))
+    assert s.messages[-1]["content"] == "готово после ожидания"
+    assert any("жду и повторю" in it.get("text", "") for it in s.items if it["type"] == "notice")
+
+
+def test_tool_call_parse_error_in_stream_is_retried(project, monkeypatch):
+    """Ошибка разбора вывода модели llama.cpp посреди стрима — повтор шага, а не конец хода."""
+    monkeypatch.setattr(config, "BUSY_POLL", 0)
+    model, agent, s = make(project, [
+        [{"error": {"message": "The model produced output that does not match the expected peg-native format"}}],
+        text_chunks("со второй попытки"),
+    ])
+    asyncio.run(agent.run_turn(s, "привет"))
+    assert s.messages[-1]["content"] == "со второй попытки"

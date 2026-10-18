@@ -99,6 +99,21 @@ def relpath(root: str | Path, p: Path) -> str:
     return p.resolve().relative_to(Path(root).resolve()).as_posix()
 
 
+def find_venv(root: str | Path) -> Path | None:
+    """Виртуальное окружение проекта: в самом проекте или в родительской папке (монорепо)."""
+    root = Path(root).resolve()
+    for base in (root, root.parent):
+        for name in (".venv", "venv", "env"):
+            d = base / name
+            if (d / "Scripts" / "python.exe").is_file() or (d / "bin" / "python").is_file():
+                return d
+    return None
+
+
+def venv_bin(venv: Path) -> Path:
+    return venv / "Scripts" if (venv / "Scripts").is_dir() else venv / "bin"
+
+
 def is_git(root: str | Path) -> bool:
     return (Path(root) / ".git").exists()
 

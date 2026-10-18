@@ -12,7 +12,7 @@ from fastapi import Body, FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
-from . import config, prompts, workspace
+from . import config, entities, prompts, workspace
 from .agent import Agent, rewind, session_changes
 from .llm import LLM, LLMBusy, LLMError
 from .sessions import store
@@ -148,8 +148,9 @@ async def project_sessions(pid: str):
 async def session_create(project_id: str = Body(..., embed=True), settings: dict = Body(None, embed=True)):
     p = workspace.get_project(project_id)
     tree = await asyncio.to_thread(workspace.tree_summary, p["path"])
+    modules = await asyncio.to_thread(entities.module_map, p["path"])
     name, text = workspace.read_instructions(p["path"])
-    system = prompts.build_system(p["path"], tree, text, name)
+    system = prompts.build_system(p["path"], tree, text, name, modules)
     s = store.create(project_id, system, settings)
     return {"id": s.id}
 

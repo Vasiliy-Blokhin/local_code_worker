@@ -17,7 +17,23 @@ from . import config
 
 
 class LLMError(Exception):
-    pass
+    def __init__(self, msg: str = "", transient: bool = False):
+        super().__init__(msg)
+        # временная проблема (модель переключают/упала/занята, обрыв связи) —
+        # агент дождётся освобождения GPU и повторит шаг
+        self.transient = transient
+
+
+# Коды ошибок AI Manager, после которых имеет смысл подождать и повторить
+_TRANSIENT_CODES = ("backend_error", "model_busy", "no_active_model", "expired", "timeout", "start_failed")
+_TRANSIENT_TEXT = ("HTTP 5", "HTTP 409", "decode() failed", "DeviceLost", "ConnectError", "ConnectTimeout",
+                   "ReadError", "ReadTimeout", "RemoteProtocolError",
+                   # llama.cpp не разобрал вызов инструмента в выводе модели — повтор обычно проходит
+                   "does not match the expected", "Failed to parse")
+
+
+def _is_transient(text: str) -> bool:
+    return any(s in text for s in _TRANSIENT_TEXT) or any(f'"{c}"' in text for c in _TRANSIENT_CODES)
 
 
 class LLMBusy(LLMError):
@@ -113,7 +129,10 @@ class LLM:
             except (httpx.TransportError, LLMError) as e:
                 retryable = isinstance(e, httpx.TransportError) or str(e).startswith(_RETRYABLE)
                 if got_data or attempt == 2 or not retryable:
-                    raise LLMError(str(e) or type(e).__name__) from e
+                    text = str(e) or type(e).__name__
+                    transient = (isinstance(e, httpx.TransportError) or got_data
+                                 or getattr(e, "transient", False) or _is_transient(text))
+                    raise LLMError(text, transient=transient) from e
                 await asyncio.sleep(2 + attempt * 3)
 
     async def _stream_once(self, payload: dict):
@@ -123,7 +142,8 @@ class LLM:
                                        json=payload) as r:
             if r.status_code != 200:
                 body = (await r.aread()).decode("utf-8", "replace")
-                raise LLMError(f"HTTP {r.status_code}: {_error_text(body)}")
+                raise LLMError(f"HTTP {r.status_code}: {_error_text(body)}",
+                               transient=r.status_code in (409, 502, 503, 504) or _is_transient(body))
             async for line in r.aiter_lines():
                 if not line.startswith("data:"):
                     continue
@@ -135,7 +155,8 @@ class LLM:
                 except ValueError:
                     continue
                 if "error" in chunk:
-                    raise LLMError(_error_text(json.dumps(chunk)))
+                    raw = json.dumps(chunk)
+                    raise LLMError(_error_text(raw), transient=_is_transient(raw))
                 if chunk.get("usage"):
                     comp.usage = chunk["usage"]
                 if chunk.get("timings"):

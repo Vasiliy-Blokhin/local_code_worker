@@ -155,3 +155,9 @@ dialog .or { text-align: center; color: var(--muted); font-size: 12px; margin: 1
 .plan .st-doing{font-weight:600;color:var(--accent)}
 .plan .st-failed{color:var(--err)}
 .plan .st-done .ic{color:var(--ok)}
+
+/* карточка подтверждения git_commit */
+.gitcard{display:flex;flex-direction:column;gap:6px;font-size:13px}
+.gitcard .gc-text{white-space:pre-wrap;padding-left:8px;border-left:2px solid var(--border)}
+.gitcard .gc-stat{margin:2px 0;font-size:12px;max-height:200px;overflow:auto}
+.gitcard .gc-warn{color:var(--warn);font-weight:600}

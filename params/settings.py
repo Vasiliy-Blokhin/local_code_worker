@@ -45,7 +45,7 @@ BASE_PROMPT = lambda role=None, task=None, instruction=None, \
 {output}
 '''
 PROMPT_CODE_REWORK = lambda prompt=None: BASE_PROMPT(
-    role='Ты (python)/(Type java script) senior разработчик.',
+    role='You are a senior developer. All reasoning should be in English, but answers must be in Russian.',
     task='Твоя задача получить репозиторий с кодом, изучить ' \
     'его. После чего получить задачу от запроса и понять какие ' \
     'изменения нужно внести в код. Изменить код и сформировать ' \
@@ -62,7 +62,7 @@ PROMPT_CODE_REWORK = lambda prompt=None: BASE_PROMPT(
 )
 
 PROMPT_RECOVERY_JSON = lambda prompt=None: BASE_PROMPT(
-    role='Ты json декодер.',
+    role='You are a JSON decoder. All reasoning should be in English, but answers must be in Russian.',
     task='Твоя задача получить json словарь, изучить ' \
     'его. После чего получить задачу от запроса и понять какие ' \
     'изменения нужно внести в json словарь. Изменить json словарь и сформировать ' \

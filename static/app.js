@@ -103,9 +103,27 @@ function toolSummary(it) {
   if (it.name === "grep") return `${a.pattern}${a.path ? "  in " + a.path : ""}${a.glob ? "  " + a.glob : ""}`;
   if (it.name === "glob") return `${a.pattern}${a.path ? "  in " + a.path : ""}`;
   if (it.name === "read") return `${a.path}${a.offset ? ":" + a.offset : ""}`;
+  if (it.name === "git_commit") return `${a.message || ""}${a.push ? "  → push" : ""}`;
   return a.path || a.raw || JSON.stringify(a);
 }
 const ST = {running: "выполняется…", ok: "✓", error: "ошибка", approve: "ждёт подтверждения", denied: "отклонено"};
+
+function gitCardHtml(g, esc) {
+  const N = g.files.length;
+  const pushText = g.push
+    ? "да → " + (g.upstream || ("origin/" + g.branch + " (новая ветка)"))
+    : "нет (только локальный коммит)";
+  const warn = g.protected
+    ? ` <span class="gc-warn">⚠ ветка ${esc(g.branch)} — основная</span>`
+    : "";
+  return `<div class="gitcard">
+  <div class="gc-row"><b>Коммит:</b> <code>${esc(g.message)}</code></div>
+  <div class="gc-row"><b>Что изменено:</b><div class="gc-text">${esc(g.summary)}</div></div>
+  <div class="gc-row"><b>Проведённые тесты:</b><div class="gc-text">${esc(g.tests)}</div></div>
+  <div class="gc-row"><b>Файлы (${N}):</b><pre class="gc-stat">${esc(g.stat)}</pre></div>
+  <div class="gc-row"><b>Push:</b> ${esc(pushText)}${warn}</div>
+</div>`;
+}
 
 function renderItem(i) {
   const it = state.items[i];
@@ -145,11 +163,12 @@ function renderItem(i) {
         detail.push(diffHtml(`--- ${it.args.path}\n${(it.args.old || "").split("\n").map(l => "-" + l).join("\n")}\n${(it.args.new || "").split("\n").map(l => "+" + l).join("\n")}`));
       }
       if (it.name === "write" && it.status === "approve" && !it.diff) detail.push(`<pre>${esc(it.args.path)}: ${esc(it.args.content)}</pre>`);
+      if (it.git) detail.push(gitCardHtml(it.git, esc));
       if (it.diff) detail.push(diffHtml(it.diff));
       else if (it.output) detail.push(`<pre>${esc(it.output)}</pre>`);
       el.innerHTML = `<div class="head"><span class="name">${esc(it.name)}</span><span class="arg">${esc(toolSummary(it))}</span><span class="st ${it.status}">${ST[it.status] || it.status}</span></div>`
         + (open && detail.length ? `<div class="detail">${detail.join("")}</div>` : "")
-        + (it.status === "approve" ? `<div class="approve-bar"><button class="btn primary" data-d="allow">Разрешить</button><button class="btn" data-d="always">Всегда для «${esc(it.name)}»</button><input placeholder="Комментарий при отказе…"><button class="btn danger" data-d="deny">Отклонить</button></div>` : "");
+        + (it.status === "approve" ? `<div class="approve-bar"><button class="btn primary" data-d="allow">Разрешить</button>${it.name === "git_commit" ? "" : `<button class="btn" data-d="always">Всегда для «${esc(it.name)}»</button>`}<input placeholder="Комментарий при отказе…"><button class="btn danger" data-d="deny">Отклонить</button></div>` : "");
       $(".head", el).onclick = () => { openTools.has(i) ? openTools.delete(i) : openTools.add(i); renderItem(i); };
       el.querySelectorAll("[data-d]").forEach(b => b.onclick = () => approve(it.id, b.dataset.d, $("input", el).value));
       break;
