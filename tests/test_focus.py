@@ -67,6 +67,25 @@ def test_tool_call_parse_error_retried_with_hint(project):
     assert not any("не распознан" in str(m.get("content")) for m in s.messages)
 
 
+def test_failing_project_tests_block_finish(project):
+    root = Path(project["path"])
+    (root / "tests").mkdir()
+    (root / "tests" / "test_app.py").write_text(
+        "import sys, pathlib\nsys.path.insert(0, str(pathlib.Path(__file__).parent.parent))\n"
+        "from app import hello\n\n\ndef test_hello():\n    assert hello() == 'hi'\n", encoding="utf-8")
+    model, agent, s = make(project, [
+        plan_chunks("правка", "проверка", status="done"),
+        tool_call_chunks("edit", {"path": "app.py", "old": "'hi'", "new": "'hey'"}, "c1"),
+        text_chunks("готово, всё работает"),
+        tool_call_chunks("edit", {"path": "app.py", "old": "'hey'", "new": "'hi'"}, "c2"),
+        text_chunks("вернул поведение"),
+    ])
+    asyncio.run(agent.run_turn(s, "поменяй приветствие"))
+    feedback = [m["content"] for m in s.messages if m["role"] == "user" and "тесты проекта падают" in m["content"]]
+    assert len(feedback) == 1 and "test_hello" in feedback[0]
+    assert s.messages[-1]["content"] == "вернул поведение"
+
+
 def test_new_stubs_detected(tmp_path):
     from lcw.tools import new_stubs
     (tmp_path / "w.py").write_text(

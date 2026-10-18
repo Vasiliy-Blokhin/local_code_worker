@@ -22,7 +22,7 @@ from .llm import LLM, Completion, LLMError
 from .sessions import Session
 from .tools import (MUTATING, TOOLS, ToolContext, ToolError, ToolResult, execute, normalize_plan,
                     GIT_WRITE, git_preview, preview, render_plan, syntax_errors, unused_modules, import_errors,
-                    unused_new_imports, new_stubs)
+                    unused_new_imports, new_stubs, project_tests)
 from .workspace import WorkspaceError, get_project, is_text_file, relpath, resolve
 
 UI_OUTPUT = 6000           # сколько вывода инструмента показывать в UI
@@ -211,7 +211,8 @@ class Agent:
         nudged = False
         fixes = 0
         plan_nudges = 0
-        orphan_nudges = import_nudges = stub_nudges = 0
+        orphan_nudges = import_nudges = stub_nudges = test_runs = 0
+        tested_sig = None
         refused = reviewed = pushed = False
         reviewed_at = 0
         # исходная задача хода («продолжай» — значит задача из предыдущих сообщений пользователя)
@@ -299,6 +300,22 @@ class Agent:
                           "методы, — или убери, если они не нужны. Если для реализации нужно решение "
                           "пользователя — так и напиши в итоге.")})
                     continue
+                # тесты проекта сам прогоняет harness: модель любит отчитаться, не заметив падений
+                sig = tuple(sorted((r, (ctx.root / r).stat().st_mtime_ns if (ctx.root / r).exists() else 0)
+                                   for r in originals))
+                if originals and test_runs < 2 and sig != tested_sig:
+                    tested_sig = sig
+                    res = await asyncio.to_thread(project_tests, ctx.root)
+                    if res and not res[0]:
+                        test_runs += 1
+                        s.add({"type": "notice", "level": "warn",
+                               "text": "Автопроверка: тесты проекта падают — агент исправляет."})
+                        s.messages.append({"role": "user", "content": (
+                            "Автопроверка: после твоих правок тесты проекта падают:\n" + res[1]
+                            + "\nРазберись, чем правка изменила поведение (часто — нет данных, и новая логика "
+                              "отсекает всё; сохрани прежнее поведение как запасной вариант), исправь код, а "
+                              "не тесты, и прогони тесты снова.")})
+                        continue
                 # не даём закончить, пока в плане есть незакрытые шаги
                 open_steps = [x for x in s.plan if x["status"] in ("todo", "doing")]
                 if st["planned"] and open_steps and plan_nudges < 2:

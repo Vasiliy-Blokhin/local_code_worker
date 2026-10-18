@@ -611,6 +611,29 @@ def new_stubs(root: Path, originals: dict) -> list[str]:
     return out
 
 
+def project_tests(root: Path, timeout: int = 600) -> tuple[bool, str] | None:
+    """
+    Прогон тестов проекта (pytest через venv проекта) для автопроверки в конце хода.
+    None — тестов нет или pytest недоступен; иначе (прошли ли, хвост вывода).
+    """
+    has_tests = (root / "tests").is_dir() or any(root.glob("test_*.py")) or (root / "pytest.ini").is_file()
+    if not has_tests:
+        return None
+    venv = find_venv(root)
+    py = str(venv_bin(venv) / ("python.exe" if (venv_bin(venv) / "python.exe").is_file() else "python")) \
+        if venv else sys.executable
+    try:
+        p = subprocess.run([py, "-m", "pytest", "-q", "-x", "-p", "no:cacheprovider"], cwd=str(root),
+                           capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout,
+                           env={**os.environ, "PYTHONIOENCODING": "utf-8", "CI": "1"})
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    out = (p.stdout + p.stderr).strip()
+    if p.returncode == 5 or "No module named pytest" in out:  # 5 — тесты не найдены
+        return None
+    return p.returncode == 0, _trunc(out, 3000)
+
+
 _NO_IMPORT = re.compile(r"(^|/)(main|app|manage|setup|conftest|__main__|run[^/]*)\.py$")
 
 
