@@ -229,15 +229,15 @@ def test_single_step_update_merges_into_plan(project):
 
 
 def test_open_plan_carries_over_to_next_turn(project):
+    """Ход оборвался с открытым планом (лимит шагов, стоп) — «продолжай» не требует плана заново."""
     model, agent, s = make(project, [
-        plan_chunks("правка", "проверка"),
-        text_chunks("пауза"), text_chunks("пауза"), text_chunks("пауза"),  # ход кончился с открытым планом
         tool_call_chunks("edit", {"path": "app.py", "old": "'hi'", "new": "'hey'"}, "c1"),
-        text_chunks("ok"), text_chunks("ok"), text_chunks("ok"),
+        text_chunks("ok"),
     ])
-    asyncio.run(agent.run_turn(s, "x"))
+    s.plan = [{"text": "правка", "status": "doing"}, {"text": "проверка", "status": "todo"}]
     asyncio.run(agent.run_turn(s, "продолжай"))
     assert "'hey'" in (Path(project["path"]) / "app.py").read_text()
+    assert [x["status"] for x in s.plan] == ["done", "done"]  # отчитался без plan — закрыто автоматически
 
 
 def test_unused_new_imports(tmp_path):

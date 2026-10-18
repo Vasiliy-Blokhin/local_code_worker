@@ -67,6 +67,22 @@ def test_tool_call_parse_error_retried_with_hint(project):
     assert not any("не распознан" in str(m.get("content")) for m in s.messages)
 
 
+def test_abandoned_item_gets_minimal_version_push(project):
+    model, agent, s = make(project, [
+        plan_chunks("правка", "проверка", status="done"),
+        tool_call_chunks("edit", {"path": "app.py", "old": "'hi'", "new": "'hey'"}, "c1"),
+        text_chunks("Пункт 1 готов"),
+        tool_call_chunks("read", {"path": "app.py"}, "r1"),
+        text_chunks("Пункт 2 слишком обширный, уточните, пожалуйста, детали."),
+        tool_call_chunks("edit", {"path": "app.py", "old": "", "new": "def bye():\n    return 'bye'\n"}, "c2"),
+        text_chunks("Сделал минимальный вариант"),
+        text_chunks("1. сделано. 2. сделано — app.py: bye."),
+    ])
+    asyncio.run(agent.run_turn(s, TASK))
+    assert any("брошен без правок" in it.get("text", "") for it in s.items if it["type"] == "notice")
+    assert "def bye" in (Path(project["path"]) / "app.py").read_text()
+
+
 def test_failing_project_tests_block_finish(project):
     root = Path(project["path"])
     (root / "tests").mkdir()

@@ -39,6 +39,9 @@ PARSE_ERROR = re.compile(r"does not match the expected|Failed to parse|unparsed"
 TOOL_FORMAT_HINT = ("[Система] Предыдущий вызов инструмента не распознан: неверный формат заголовка. Вызывай "
                     "ровно один инструмент обычным способом (канал commentary, получатель functions.<имя>, "
                     "аргументы — JSON-объект) — или ответь текстом. Продолжай с того же места.")
+# модель просит уточнений вместо работы
+ASKS = re.compile(r"уточни|уточнит|нужн\w* (уточнен|решени|информац)|clarif|could you|please (provide|specify)",
+                  re.IGNORECASE)
 # в ответе на сверку есть несделанные пункты
 UNDONE = re.compile(r"не\s+сделан|не\s+выполнен|частично|not\s+done|partial", re.IGNORECASE)
 # до плана разрешены проверки, которые ничего не меняют в коде: тесты, компиляция, импорт
@@ -112,7 +115,7 @@ def focus_message(root: Path, reqs: list[str], k: int, first: bool = False) -> s
     rel = entities.related(root, reqs[k], 12)
     dups = entities.duplicates(root, 12) if entities.DUP_WORDS.search(reqs[k]) else []
     head =(f"[Работа по пунктам] В запросе {len(reqs)} пунктов — выполняй их по очереди, по одному. "
-            if first else f"[Пункт {k}/{len(reqs)} закрыт] ")
+            if first else "[Следующий пункт] ")
     return (head + f"Сейчас пункт {k + 1}: {reqs[k]}\n"
             "Порядок: изучи связанный код (read с symbol=) и как он используется (grep) → реши, что "
             "конкретно меняешь в СУЩЕСТВУЮЩЕМ коде → plan с файлами и функциями → правки по шагам с "
@@ -222,7 +225,9 @@ class Agent:
         # состояние хода: составлен ли план, было ли уже напоминание, элемент плана в UI
         # незакрытый план прошлого хода («продолжай») остаётся в силе — заново не требуем
         carried = any(x["status"] in ("todo", "doing") for x in s.plan)
-        st = {"planned": carried, "plan_rejects": 0, "plan_item": None, "since_plan": 0, "tools_used": 0}
+        st = {"planned": carried, "plan_rejects": 0, "plan_item": None, "since_plan": 0, "tools_used": 0,
+              "edits": 0}
+        focus_edits, item_pushed = 0, False  # правок к началу текущего пункта; было ли дожатие пункта
         for _ in range(config.MAX_STEPS):
             if _estimate_tokens(s) > config.COMPACT_AT * config.CONTEXT:
                 await self.compact(s)
@@ -318,7 +323,15 @@ class Agent:
                         continue
                 # не даём закончить, пока в плане есть незакрытые шаги
                 open_steps = [x for x in s.plan if x["status"] in ("todo", "doing")]
-                if st["planned"] and open_steps and plan_nudges < 2:
+                if st["planned"] and open_steps and plan_nudges >= 1:
+                    # модель уже отчиталась, но plan не обновляет — закрываем шаги сами, без лишних ходов;
+                    # реальную проверку сделанного дают автопроверки и сверка с пунктами
+                    s.plan = [dict(x, status="done") if x["status"] in ("todo", "doing") else x for x in s.plan]
+                    if st["plan_item"] is not None:
+                        s.set(st["plan_item"], steps=s.plan)
+                    s.add({"type": "notice", "level": "info", "text": "Шаги плана закрыты автоматически."})
+                    open_steps = []
+                if st["planned"] and open_steps and plan_nudges < 1:
                     plan_nudges += 1
                     s.add({"type": "notice", "level": "warn",
                            "text": f"В плане незакрыто шагов: {len(open_steps)} — агент продолжает."})
@@ -329,9 +342,24 @@ class Agent:
                     continue
                 # сверка итога с пунктами запроса: маленькая модель отчитывается о части как о целом
                 reqs = requirements(task)
+                if (len(reqs) >= 2 and st["edits"] == focus_edits and not item_pushed and not reviewed
+                        and (REFUSAL.search(comp.content) or ASKS.search(comp.content))):
+                    # пункт брошен без единой правки («слишком обширно, уточните») — один раз просим
+                    # минимальный рабочий вариант, прежде чем переходить дальше
+                    item_pushed = True
+                    s.add({"type": "notice", "level": "warn",
+                           "text": f"Пункт {s.focus + 1} брошен без правок — агент делает минимальный вариант."})
+                    s.messages.append({"role": "user", "content": (
+                        f"Не откладывай пункт {s.focus + 1} и не проси уточнений: сделай минимальный рабочий "
+                        "вариант, который опирается на уже существующий код и не меняет поведение (например, "
+                        "общий словарь/функцию поверх имеющихся классов и методов, и подключи его там, где они "
+                        "сейчас вызываются). Составь plan из 3-6 шагов с конкретными файлами и выполни. "
+                        "Что останется за рамками — перечисли в итоге.")})
+                    continue
                 if len(reqs) >= 2 and s.focus < len(reqs) - 1:
-                    # текущий пункт закрыт — выдаём следующий со связанным кодом
+                    # пункт отработан — выдаём следующий со связанным кодом
                     s.focus += 1
+                    focus_edits, item_pushed = st["edits"], False
                     s.add({"type": "notice", "level": "info",
                            "text": f"Переход к пункту {s.focus + 1} из {len(reqs)}."})
                     s.messages.append({"role": "user", "content": await asyncio.to_thread(
@@ -545,6 +573,8 @@ class Agent:
                 s.settings.setdefault("always", []).append(name)
             s.set(i, status="running")
         result = await execute(ctx, name, args)
+        if name in MUTATING and result.ok:
+            st["edits"] = st.get("edits", 0) + 1
         if st["planned"] and (name in MUTATING or name == "run"):
             st["since_plan"] = st.get("since_plan", 0) + 1
             if st["since_plan"] >= 2:  # модель увлеклась и забыла про план — напоминаем
