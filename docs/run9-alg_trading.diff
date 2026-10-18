@@ -1,0 +1,94 @@
+diff --git a/elements/ai/worker.py b/elements/ai/worker.py
+index f20b2e8..b8117eb 100644
+--- a/elements/ai/worker.py
++++ b/elements/ai/worker.py
+@@ -26,6 +26,8 @@ from source.settings.settings import (
+     HTTP_TIMEOUT,
+ )
+ 
++from ..common.utils import extract_json
++
+ 
+ logger = logging.getLogger(name=__name__)
+ logger.setLevel(logging.DEBUG)
+@@ -105,8 +107,7 @@ class AIReviewer:
+ 
+     @staticmethod
+     def parse(content: str) -> dict:
+-        match = re.search(r'\{.*\}', content, re.S)
+-        data = json.loads(match.group(0) if match else content)
++        data = extract_json(content)
+         decision = str(data.get('decision', 'skip')).lower()
+         return {
+             'decision': 'buy' if decision == 'buy' else 'skip',
+diff --git a/elements/algorithm/worker.py b/elements/algorithm/worker.py
+index f37086f..a846897 100644
+--- a/elements/algorithm/worker.py
++++ b/elements/algorithm/worker.py
+@@ -55,6 +55,17 @@ class Algorithm(SQLmain):
+         dividends = pd.DataFrame(cls.run_sql_command('SELECT * FROM dividends'))
+         return dividend_features(panel, dividends)
+ 
++    @classmethod
++    def _efficient(cls, strategy: str) -> bool:
++        """Return True if last backtest for strategy has SHARPE >= 0.5."""
++        try:
++            results = cls.run_sql_command('SELECT SHARPE FROM backtest_runs WHERE STRATEGY = :s ORDER BY CREATED_AT DESC LIMIT 1', {'s': strategy})
++            if not results:
++                return True
++            return results[0]['SHARPE'] >= 0.5
++        except Exception:
++            return True
++
+     @classmethod
+     def generate_signals(cls, use_ai: bool = AI_ENABLED) -> list[dict]:
+         # Действующие пороги стратегий — из БД (их обновляет самокоррекция).
+@@ -81,7 +92,7 @@ class Algorithm(SQLmain):
+                     current['STRATEGY'] += f'+{strategy}'
+                     continue
+                 merged[row['SECID']] = cls.make_signal(row, securities, sectors, last_date, strategy, weight)
+-        if REVERSE_ENABLED:
++        if REVERSE_ENABLED and cls._efficient('reverse'):
+             cls.add_reverse(panel, merged, securities, sectors, last_date)
+         if EVOLVE_SIGNALS:
+             cls.add_evolve(panel, merged, securities, sectors, last_date)
+@@ -144,6 +155,8 @@ class Algorithm(SQLmain):
+             return
+         for pick in picks:
+             row, strategy = pick['ROW'], f'evolve:{pick["STAGE"]}'
++            if not cls._efficient(strategy):
++                continue
+             current = merged.get(row['SECID'])
+             if current:
+                 if current['STRATEGY'].startswith('evolve:'):
+diff --git a/elements/reverse/news.py b/elements/reverse/news.py
+index 2f3e4ca..c628613 100644
+--- a/elements/reverse/news.py
++++ b/elements/reverse/news.py
+@@ -20,6 +20,7 @@ import html
+ import json
+ import logging
+ import re
++from ..common.utils import extract_json
+ import xml.etree.ElementTree as ET
+ from datetime import datetime, timedelta
+ from email.utils import parsedate_to_datetime
+@@ -240,8 +241,7 @@ class NewsScorer(SQLmain):
+         return self.parse(content, batch)
+ 
+     def parse(self, content: str, batch: list[dict]) -> list[dict]:
+-        match = re.search(r'\{.*\}', content, re.S)
+-        data = json.loads(match.group(0) if match else content)
++        data = extract_json(content)
+         rows = []
+         for item in data.get('items', []):
+             try:
+=== new:
+import json, re
+
+def extract_json(content: str):
+    """Return a dict parsed from the first JSON object in *content*.
+    If no JSON object is found, return the original string.
+    """
+    match = re.search(r'\{.*\}', content, re.S)
+    return json.loads(match.group(0) if match else content)
