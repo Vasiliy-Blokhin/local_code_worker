@@ -119,7 +119,7 @@ Harness следит за выполнением:
 | `LCW_CONTEXT` | `100000` | Должен совпадать с `context` модели в реестре |
 | `LCW_AIM_PROJECT` | `local_code_worker` | Имя проекта в очереди задач AI Manager (заголовок `X-Project`) |
 | `LCW_REASONING` | `low` | Глубина рассуждений по умолчанию |
-| `LCW_MAX_STEPS` / `LCW_COMMAND_TIMEOUT` | `50` / `180` | Лимиты агента |
+| `LCW_MAX_STEPS` / `LCW_COMMAND_TIMEOUT` | `120` / `180` | Лимиты агента |
 | `LCW_COMPACT_AT` | `0.75` | Порог авто-сжатия истории |
 
 ## Структура

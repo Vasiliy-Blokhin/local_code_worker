@@ -133,3 +133,13 @@ def test_related_ranks_by_matched_stems(tmp_path):
     rel = entities.related(tmp_path, "оставить в работе только стратегии с лучшими метриками бэктеста")
     assert rel[0].startswith("bt.py") and "metrics" in rel[1] + rel[0]
     assert not any("plot" in r for r in rel)
+
+
+def test_duplicates_across_modules(tmp_path):
+    body = "def now():\n    import time\n    return time.time()\n"
+    (tmp_path / "a.py").write_text(body, encoding="utf-8")
+    (tmp_path / "b.py").write_text(body + "\n\ndef only_b():\n    return 1\n", encoding="utf-8")
+    d = entities.duplicates(tmp_path)
+    assert any(x.startswith("одноимённые now(): a.py:1, b.py:1") for x in d)
+    assert any(x.startswith("одинаковое тело:") for x in d)
+    assert not any("only_b" in x for x in d)

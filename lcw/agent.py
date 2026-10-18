@@ -22,7 +22,7 @@ from .llm import LLM, Completion, LLMError
 from .sessions import Session
 from .tools import (MUTATING, TOOLS, ToolContext, ToolError, ToolResult, execute, normalize_plan,
                     GIT_WRITE, git_preview, preview, render_plan, syntax_errors, unused_modules, import_errors,
-                    unused_new_imports)
+                    unused_new_imports, new_stubs)
 from .workspace import WorkspaceError, get_project, is_text_file, relpath, resolve
 
 UI_OUTPUT = 6000           # сколько вывода инструмента показывать в UI
@@ -98,6 +98,25 @@ def requirements(text: str) -> list[str]:
     return [m.group(1).strip()[:300] for m in _REQ.finditer(text.split("\n\n<file ")[0])][:12]
 
 
+def focus_message(root: Path, reqs: list[str], k: int, first: bool = False) -> str:
+    """
+    Задание на один пункт многопунктного запроса + связанный код из индекса сущностей.
+    Маленькая модель не удерживает несколько крупных требований сразу и не знает, где их
+    код, — поэтому harness выдаёт их по одному и сразу показывает, куда смотреть.
+    """
+    rel = entities.related(root, reqs[k], 12)
+    dups = entities.duplicates(root, 12) if entities.DUP_WORDS.search(reqs[k]) else []
+    head =(f"[Работа по пунктам] В запросе {len(reqs)} пунктов — выполняй их по очереди, по одному. "
+            if first else f"[Пункт {k}/{len(reqs)} закрыт] ")
+    return (head + f"Сейчас пункт {k + 1}: {reqs[k]}\n"
+            "Порядок: изучи связанный код (read с symbol=) и как он используется (grep) → реши, что "
+            "конкретно меняешь в СУЩЕСТВУЮЩЕМ коде → plan с файлами и функциями → правки по шагам с "
+            "проверкой. Не подменяй работу пустыми методами, заглушками и новыми неиспользуемыми файлами."
+            + ("\nКандидаты на объединение (найдены автоматически; сравни реализации через read, объединяй "
+               "только действительно одинаковое, вызовы обнови через grep):\n" + "\n".join(dups) if dups else "")
+            + ("\nСвязанный код (имена и докстринги из индекса):\n" + "\n".join(rel) if rel else ""))
+
+
 def _session_originals(s: Session) -> dict:
     """Файл → его содержимое до первой правки в сессии (None — файл создан агентом)."""
     out: dict = {}
@@ -146,7 +165,12 @@ class Agent:
             checkpoint = {"turn": s.turn, "files": {}}
             s.checkpoints.append(checkpoint)
             s.add({"type": "user", "text": text, "turn": s.turn, "msg_index": len(s.messages)})
-            s.messages.append({"role": "user", "content": expand_mentions(root, text, s)})
+            content = expand_mentions(root, text, s)
+            reqs = requirements(text)
+            if len(reqs) >= 2:  # новое многопунктное задание: ведём модель по пунктам по очереди
+                s.focus = 0
+                content += "\n\n" + await asyncio.to_thread(focus_message, root, reqs, 0, True)
+            s.messages.append({"role": "user", "content": content})
             if s.title == "Новая сессия":
                 s.title = text.strip().splitlines()[0][:70] or s.title
             ctx = ToolContext(root=root, seen=s.seen,
@@ -182,7 +206,7 @@ class Agent:
         nudged = False
         fixes = 0
         plan_nudges = 0
-        orphan_nudges = import_nudges = 0
+        orphan_nudges = import_nudges = stub_nudges = 0
         refused = reviewed = pushed = False
         reviewed_at = 0
         # исходная задача хода («продолжай» — значит задача из предыдущих сообщений пользователя)
@@ -257,6 +281,19 @@ class Agent:
                         + "\nИмпорт сам по себе ничего не меняет. Доделай изменение кода, ради которого он "
                           "добавлен (шаги — в plan), или убери импорт. Не пиши, что сделал то, чего нет в коде.")})
                     continue
+                # пустые методы «для галочки» (return [] / pass) вместо реализации
+                stubs = await asyncio.to_thread(new_stubs, ctx.root, originals)
+                if stubs and stub_nudges < 2:
+                    stub_nudges += 1
+                    s.add({"type": "notice", "level": "warn",
+                           "text": "Автопроверка: добавлены заглушки:\n" + "\n".join(stubs)})
+                    s.messages.append({"role": "user", "content": (
+                        "Автопроверка: в правках появились функции без реальной работы:\n" + "\n".join(stubs)
+                        + "\nЗаглушка не выполняет требование. Реализуй их на основе существующего кода "
+                          "класса/модуля (прочитай его через read с symbol=) — например, вызови уже имеющиеся "
+                          "методы, — или убери, если они не нужны. Если для реализации нужно решение "
+                          "пользователя — так и напиши в итоге.")})
+                    continue
                 # не даём закончить, пока в плане есть незакрытые шаги
                 open_steps = [x for x in s.plan if x["status"] in ("todo", "doing")]
                 if st["planned"] and open_steps and plan_nudges < 2:
@@ -270,6 +307,14 @@ class Agent:
                     continue
                 # сверка итога с пунктами запроса: маленькая модель отчитывается о части как о целом
                 reqs = requirements(task)
+                if len(reqs) >= 2 and s.focus < len(reqs) - 1:
+                    # текущий пункт закрыт — выдаём следующий со связанным кодом
+                    s.focus += 1
+                    s.add({"type": "notice", "level": "info",
+                           "text": f"Переход к пункту {s.focus + 1} из {len(reqs)}."})
+                    s.messages.append({"role": "user", "content": await asyncio.to_thread(
+                        focus_message, ctx.root, reqs, s.focus)})
+                    continue
                 if (reviewed and not pushed and st["tools_used"] == reviewed_at
                         and UNDONE.search(comp.content)):
                     # сверка показала несделанное, а модель просто отчиталась — один раз отправляем доделывать
@@ -295,8 +340,8 @@ class Agent:
                     s.messages.append({"role": "user", "content": (
                         "Перед завершением сверь сделанное с КАЖДЫМ пунктом запроса:\n"
                         + "\n".join(f"{n}. {r}" for n, r in enumerate(reqs, 1))
-                        + "\nПо каждому пункту: «сделано — где именно (файл: функция/класс, что изменено)» или "
-                          "«не сделано». Опирайся только на реальные правки (смотри diff через run git diff "
+                        + "\nПо каждому пункту ОДНОЙ строкой, без таблиц: «сделано — файл: функция, что изменено» "
+                          "или «не сделано — что осталось». Опирайся только на реальные правки (смотри diff через run git diff "
                           "при необходимости), не на намерения. Если что-то не сделано и выполнимо — составь "
                           "plan и доделай; иначе честно перечисли несделанное в итоговом ответе.")})
                     continue

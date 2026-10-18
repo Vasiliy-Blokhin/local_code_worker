@@ -38,7 +38,7 @@ SESSIONS_DIR = DATA_DIR / "sessions"
 WORKSPACES_DIR = DATA_DIR / "workspaces"
 PROJECTS_FILE = DATA_DIR / "projects.json"
 
-MAX_STEPS = _int("LCW_MAX_STEPS", 50)                # шагов (вызовов модели) на один запрос
+MAX_STEPS = _int("LCW_MAX_STEPS", 120)                # шагов (вызовов модели) на один запрос
 COMMAND_TIMEOUT = _int("LCW_COMMAND_TIMEOUT", 180)   # секунд на команду `run`
 TOOL_OUTPUT_CHARS = _int("LCW_TOOL_OUTPUT_CHARS", 12000)  # обрезка вывода инструментов для модели
 COMPACT_AT = float(os.getenv("LCW_COMPACT_AT", "0.75"))   # доля контекста для авто-сжатия

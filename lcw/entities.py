@@ -256,6 +256,49 @@ def related(root: str | Path, text: str, limit: int = 12) -> list[str]:
     return [line for _, line in scored[:limit]]
 
 
+_COMMON = {"__init__", "__repr__", "__str__", "__eq__", "__hash__", "main", "run", "setup", "teardown"}
+DUP_WORDS = re.compile(r"дубл|однотип|совмест|объедин|общ\w* (модул|интерфейс|структур)|duplicat|unif", re.I)
+
+
+def _body_key(node: ast.AST) -> str:
+    """Отпечаток тела функции без имени, докстринга и позиций — одинаковый у копий."""
+    body = node.body[1:] if (node.body and isinstance(node.body[0], ast.Expr)
+                             and isinstance(getattr(node.body[0], "value", None), ast.Constant)) else node.body
+    return ast.dump(ast.Module(body=body, type_ignores=[]), annotate_fields=False)
+
+
+def duplicates(root: str | Path, limit: int = 20) -> list[str]:
+    """
+    Кандидаты на объединение: одноимённые функции/методы в разных модулях и функции с одинаковым
+    телом. Даёт модели конкретный список вместо задачи «найди дубли во всём проекте».
+    """
+    root = Path(root)
+    by_name: dict[str, list[str]] = {}
+    by_body: dict[str, list[str]] = {}
+    for f in _files(root):
+        if not f.endswith(".py") or re.search(r"(^|/)tests?/|test_", f):
+            continue
+        try:
+            tree = ast.parse((root / f).read_text(encoding="utf-8", errors="replace"))
+        except (SyntaxError, OSError):
+            continue
+        for n in ast.walk(tree):
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name not in _COMMON:
+                where = f"{f}:{n.lineno}"
+                by_name.setdefault(n.name, []).append(where)
+                if len(n.body) > 1 or not isinstance(n.body[0], (ast.Pass, ast.Return)):
+                    by_body.setdefault(_body_key(n), []).append(f"{where} {n.name}")
+    out = []
+    for name, places in sorted(by_name.items(), key=lambda x: -len(x[1])):
+        files = {p.rsplit(":", 1)[0] for p in places}
+        if len(files) >= 2:
+            out.append(f"одноимённые {name}(): " + ", ".join(places[:6]))
+    for places in by_body.values():
+        if len({p.split(":", 1)[0] for p in places}) >= 2:
+            out.append("одинаковое тело: " + ", ".join(places[:6]))
+    return out[:limit]
+
+
 def _dir_map(root: Path, files: list[str]) -> str:
     out = []
     for f in files[:150]:

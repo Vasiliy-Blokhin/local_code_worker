@@ -37,6 +37,7 @@ class Session:
         self.settings: dict = data.get("settings", {"mode": "edits", "effort": config.REASONING})
         self.usage: dict = data.get("usage", {})
         self.plan: list[dict] = data.get("plan", [])                # текущий план агента [{text, status}]
+        self.focus: int = data.get("focus", 0)                      # текущий пункт многопунктного запроса
         self.seen: dict = {}            # дедупликация чтений (не сохраняется)
         # runtime
         self.ops: list[dict] = []
@@ -56,7 +57,8 @@ class Session:
                 "created": self.created, "updated": self.updated, "system": self.system,
                 "messages": self.messages, "items": self.items, "checkpoints": self.checkpoints,
                 "turn": self.turn, "rewind_floor": self.rewind_floor,
-                "settings": self.settings, "usage": self.usage, "plan": self.plan}
+                "settings": self.settings, "usage": self.usage, "plan": self.plan,
+                "focus": self.focus}
 
     def save(self) -> None:
         self.updated = time.time()

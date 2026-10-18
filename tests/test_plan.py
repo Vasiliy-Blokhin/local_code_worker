@@ -248,23 +248,6 @@ def test_unused_new_imports(tmp_path):
         ["w.py: импорт Iface добавлен, но не используется"]
 
 
-def test_requirements_review_before_finish(project):
-    task = "Сделай:\n1. переименуй приветствие в hey\n2. добавь функцию bye в app.py\n"
-    model, agent, s = make(project, [
-        plan_chunks("правка", "проверка", status="done"),
-        tool_call_chunks("edit", {"path": "app.py", "old": "'hi'", "new": "'hey'"}, "c1"),
-        text_chunks("Готово"),
-        text_chunks("1. сделано — app.py: hello. 2. не сделано: bye не добавлена."),
-        tool_call_chunks("edit", {"path": "app.py", "old": "", "new": "def bye():\n    return 'bye'\n"}, "c2"),
-        text_chunks("1. сделано. 2. сделано — app.py: bye."),
-    ])
-    asyncio.run(agent.run_turn(s, task))
-    review = [m["content"] for m in s.messages if m["role"] == "user" and "КАЖДЫМ пунктом" in m["content"]]
-    assert len(review) == 1 and "2. добавь функцию bye в app.py" in review[0]
-    assert any("несделанные пункты" in it.get("text", "") for it in s.items if it["type"] == "notice")
-    assert "def bye" in (Path(project["path"]) / "app.py").read_text()
-    assert s.messages[-1]["content"].startswith("1. сделано. 2. сделано")
-
 
 def test_requirements_parsing():
     from lcw.agent import requirements

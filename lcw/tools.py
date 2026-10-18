@@ -38,12 +38,6 @@ def _shell() -> tuple[list[str], str]:
 
 SHELL_CMD, SHELL_NAME = _shell()
 
-def t_internet_search(ctx: ToolContext, query: str) -> ToolResult:
-    """Placeholder for internet search. Returns a stub result.
-    In a real implementation this would query an API like DuckDuckGo or Bing.
-    """
-    return ToolResult(f"<internet search> query: {query}\n(placeholder result)")
-
 
 def _fn(name: str, desc: str, props: dict, required: list[str]) -> dict:
     return {"type": "function", "function": {
@@ -87,8 +81,6 @@ TOOLS = [
         ["path", "old", "new"]),
     _fn("write", "Create a new file or fully overwrite one (prefer edit for changes).",
         {"path": S, "content": S}, ["path", "content"]),
-    _fn("internet_search", "Search the internet for information. Returns a placeholder result.",
-        {"query": S}, ["query"]),
     _fn("run", f"Run a shell command ({SHELL_NAME}) in the project root: tests, linters, git, "
                f"installs. Non-interactive only. Timeout {config.COMMAND_TIMEOUT}s.",
         {"command": S, "timeout": {**I, "description": "seconds"}}, ["command"]),
@@ -102,8 +94,6 @@ TOOLS = [
         ["message", "summary", "tests"]),
 ]
 TOOL_NAMES = {t["function"]["name"] for t in TOOLS}
-# add internet_search to set for consistency
-TOOL_NAMES.add("internet_search")
 MUTATING = {"edit", "write"}
 ICONS = {"todo": "[ ]", "doing": "[>]", "done": "[x]", "failed": "[!]"}
 
@@ -566,6 +556,61 @@ def unused_new_imports(root: Path, originals: dict) -> list[str]:
     return out
 
 
+def _is_stub(fn: ast.AST) -> bool:
+    """Тело функции без реальной работы: pass / ... / return []/None/{} / raise NotImplementedError."""
+    body = list(fn.body)
+    if body and isinstance(body[0], ast.Expr) and isinstance(getattr(body[0], "value", None), ast.Constant) \
+            and isinstance(body[0].value.value, str):
+        body = body[1:]  # докстринг
+    if not body:
+        return True
+    if len(body) != 1:
+        return False
+    st = body[0]
+    if isinstance(st, ast.Pass) or (isinstance(st, ast.Expr) and isinstance(st.value, ast.Constant)):
+        return True
+    if isinstance(st, ast.Return):
+        v = st.value
+        return v is None or (isinstance(v, ast.Constant) and v.value is None) or (
+            isinstance(v, (ast.List, ast.Tuple, ast.Set)) and not v.elts) or (isinstance(v, ast.Dict) and not v.keys)
+    if isinstance(st, ast.Raise) and st.exc is not None:
+        e = st.exc.func if isinstance(st.exc, ast.Call) else st.exc
+        return isinstance(e, ast.Name) and e.id == "NotImplementedError"
+    return False
+
+
+def _stub_names(tree: ast.AST) -> set[str]:
+    out = set()
+
+    def walk(body, prefix=""):
+        for n in body:
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                abstract = any(getattr(d, "id", getattr(d, "attr", "")) == "abstractmethod" for d in n.decorator_list)
+                if not abstract and _is_stub(n):
+                    out.add(prefix + n.name)
+            elif isinstance(n, ast.ClassDef):
+                walk(n.body, prefix + n.name + ".")
+
+    walk(tree.body)
+    return out
+
+
+def new_stubs(root: Path, originals: dict) -> list[str]:
+    """Функции/методы-заглушки, появившиеся в правках агента (не в тестах, не abstractmethod)."""
+    out = []
+    for rel, before in sorted(originals.items()):
+        p = root / rel
+        if not rel.endswith(".py") or _TEST_PATH.search(rel) or not p.is_file():
+            continue
+        try:
+            new = _stub_names(ast.parse(p.read_text(encoding="utf-8", errors="replace")))
+            old = _stub_names(ast.parse(before)) if before else set()
+        except SyntaxError:
+            continue
+        out += [f"{rel}: {name} — заглушка без реальной работы" for name in sorted(new - old)]
+    return out
+
+
 _NO_IMPORT = re.compile(r"(^|/)(main|app|manage|setup|conftest|__main__|run[^/]*)\.py$")
 
 
@@ -844,7 +889,7 @@ def t_git_commit(ctx: ToolContext, **args) -> ToolResult:
     return ToolResult("OK: " + " ".join(steps))
 
 
-SYNC = {"git_commit": t_git_commit, "symbols": t_symbols, "read": t_read, "glob": t_glob, "grep": t_grep, "edit": t_edit, "write": t_write, "internet_search": t_internet_search}
+SYNC = {"git_commit": t_git_commit, "symbols": t_symbols, "read": t_read, "glob": t_glob, "grep": t_grep, "edit": t_edit, "write": t_write}
 
 
 async def execute(ctx: ToolContext, name: str, args: dict) -> ToolResult:

@@ -1,0 +1,66 @@
+"""Работа по пунктам многопунктного запроса, сверка результата и детектор заглушек."""
+import asyncio
+from pathlib import Path
+
+from conftest import plan_chunks, text_chunks, tool_call_chunks
+from test_plan import make
+
+TASK = "Сделай:\n1. переименуй приветствие hello в hey\n2. добавь функцию bye в app.py\n"
+
+
+def test_items_one_by_one_then_review(project):
+    """Пункты выдаются по одному (со связанным кодом), в конце — одна сверка."""
+    model, agent, s = make(project, [
+        plan_chunks("правка", "проверка", status="done"),
+        tool_call_chunks("edit", {"path": "app.py", "old": "'hi'", "new": "'hey'"}, "c1"),
+        text_chunks("Пункт 1 готов"),
+        tool_call_chunks("edit", {"path": "app.py", "old": "", "new": "def bye():\n    return 'bye'\n"}, "c2"),
+        text_chunks("Пункт 2 готов"),
+        text_chunks("1. сделано — app.py: hello. 2. сделано — app.py: bye."),
+    ])
+    asyncio.run(agent.run_turn(s, TASK))
+    first = s.messages[0]["content"]
+    assert "[Работа по пунктам]" in first and "Сейчас пункт 1" in first and "app.py" in first
+    users = [m["content"] for m in s.messages if m["role"] == "user"]
+    assert any("Сейчас пункт 2: добавь функцию bye" in u for u in users)
+    assert sum("КАЖДЫМ пунктом" in u for u in users) == 1
+    assert "def bye" in (Path(project["path"]) / "app.py").read_text() and s.focus == 1
+    assert s.messages[-1]["content"].startswith("1. сделано")
+
+
+def test_undone_after_review_is_pushed_once(project):
+    model, agent, s = make(project, [
+        plan_chunks("правка", "проверка", status="done"),
+        tool_call_chunks("edit", {"path": "app.py", "old": "'hi'", "new": "'hey'"}, "c1"),
+        text_chunks("Пункт 1 готов"), text_chunks("Пункт 2 сделаю позже"),
+        text_chunks("1. сделано. 2. не сделано — bye нет."),
+        text_chunks("Нужно решение пользователя: где разместить bye."),
+    ])
+    asyncio.run(agent.run_turn(s, TASK))
+    notices = [it["text"] for it in s.items if it["type"] == "notice"]
+    assert sum("несделанные пункты" in n for n in notices) == 1
+    assert s.messages[-1]["content"].startswith("Нужно решение")
+
+
+def test_stub_method_sent_back(project):
+    model, agent, s = make(project, [
+        plan_chunks("метод", "проверка", status="done"),
+        tool_call_chunks("edit", {"path": "app.py", "old": "",
+                                  "new": "def run():\n    return []\n"}, "c1"),
+        text_chunks("готово"),
+        tool_call_chunks("edit", {"path": "app.py", "old": "    return []", "new": "    return [hello()]"}, "c2"),
+        text_chunks("реализовал"),
+    ])
+    asyncio.run(agent.run_turn(s, "добавь run"))
+    assert any("заглушки" in it.get("text", "") for it in s.items if it["type"] == "notice")
+    assert "return [hello()]" in (Path(project["path"]) / "app.py").read_text()
+
+
+def test_new_stubs_detected(tmp_path):
+    from lcw.tools import new_stubs
+    (tmp_path / "w.py").write_text(
+        "from abc import abstractmethod\n\n\nclass A:\n    def run(self):\n        return []\n\n"
+        "    def old(self):\n        pass\n\n    @abstractmethod\n    def iface(self):\n        ...\n\n"
+        "    def name(self):\n        return 'a'\n", encoding="utf-8")
+    before = "class A:\n    def old(self):\n        pass\n"
+    assert new_stubs(tmp_path, {"w.py": before}) == ["w.py: A.run — заглушка без реальной работы"]
