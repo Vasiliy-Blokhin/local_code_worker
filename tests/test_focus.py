@@ -122,6 +122,18 @@ def test_merged_functions_show_before_after(tmp_path):
     assert out[1].startswith("b.py: show заменена на _f")
 
 
+def test_registry_with_same_object_twice_reported(tmp_path):
+    from lcw.tools import import_errors
+    (tmp_path / "pkg").mkdir()
+    (tmp_path / "pkg" / "__init__.py").write_text("", encoding="utf-8")
+    (tmp_path / "pkg" / "a.py").write_text("class A:\n    pass\n", encoding="utf-8")
+    (tmp_path / "pkg" / "b.py").write_text("from pkg.a import A\n\n\nclass B:\n    pass\n", encoding="utf-8")
+    (tmp_path / "pkg" / "reg.py").write_text(
+        "from pkg.a import A\nfrom pkg.b import A as BAlgo\n\nREG = {'a': A, 'b': BAlgo}\n", encoding="utf-8")
+    errs = import_errors(tmp_path, ["pkg/reg.py"])
+    assert len(errs) == 1 and "ключи 'a' и 'b' указывают на один объект pkg.a.A" in errs[0]
+
+
 def test_new_stubs_detected(tmp_path):
     from lcw.tools import new_stubs
     (tmp_path / "w.py").write_text(

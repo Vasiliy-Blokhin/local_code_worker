@@ -762,7 +762,17 @@ def import_errors(root: Path, rels, timeout: int = 90) -> list[str]:
             "        missing = sorted(set(obj.__abstractmethods__) - own)\n"
             "        if missing:\n"
             "            print(f'{m}: класс {name} абстрактный — не реализованы {\", \".join(missing)}; '\n"
-            "                  f'{name}() упадёт с TypeError')\n")
+            "                  f'{name}() упадёт с TypeError')\n"
+            # реестр, где разные ключи указывают на один объект, — обычно ошибка импорта (алиас не того имени)
+            "    for name, obj in vars(mod).items():\n"
+            "        if isinstance(obj, dict) and len(obj) >= 2 and all(callable(v) for v in obj.values()):\n"
+            "            seen = {}\n"
+            "            for k, v in obj.items():\n"
+            "                if id(v) in seen:\n"
+            "                    print(f'{m}: в {name} ключи {seen[id(v)]!r} и {k!r} указывают на один объект '\n"
+            "                          f'{getattr(v, \"__module__\", \"?\")}.{getattr(v, \"__qualname__\", v)} — '\n"
+            "                          f'проверь, что импортирован нужный класс')\n"
+            "                seen.setdefault(id(v), k)\n")
     try:
         p = subprocess.run([py, "-c", code, *mods], cwd=str(root), capture_output=True, text=True,
                            encoding="utf-8", errors="replace", timeout=timeout,
