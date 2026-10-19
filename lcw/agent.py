@@ -381,10 +381,10 @@ class Agent:
                     continue
                 # сверка итога с пунктами запроса: маленькая модель отчитывается о части как о целом
                 reqs = requirements(task)
-                if (len(reqs) >= 2 and st["edits"] == focus_edits and not item_pushed and not reviewed
-                        and (REFUSAL.search(comp.content) or ASKS.search(comp.content))):
-                    # пункт брошен без единой правки («слишком обширно, уточните») — один раз просим
-                    # минимальный рабочий вариант, прежде чем переходить дальше
+                if len(reqs) >= 2 and st["edits"] == focus_edits and not item_pushed and not reviewed:
+                    # пункт закрыт без единой правки («слишком обширно», «не требует изменений, но можно
+                    # было бы…») — один раз просим минимальный рабочий вариант; если модель и после этого
+                    # обоснует, что правки не нужны, — принимаем
                     item_pushed = True
                     s.add({"type": "notice", "level": "warn",
                            "text": f"Пункт {s.focus + 1} брошен без правок — агент делает минимальный вариант."})
@@ -404,7 +404,7 @@ class Agent:
                     s.messages.append({"role": "user", "content": await asyncio.to_thread(
                         focus_message, ctx.root, reqs, s.focus)})
                     continue
-                if (reviewed and not pushed and st["tools_used"] == reviewed_at
+                if (reviewed and not pushed and st["edits"] == reviewed_at
                         and UNDONE.search(comp.content)):
                     # сверка показала несделанное, а модель просто отчиталась — один раз отправляем доделывать
                     pushed = True
@@ -424,7 +424,7 @@ class Agent:
                         + ("\n\n" + "\n\n".join(hints) if hints else ""))})
                     continue
                 if reqs and originals and not reviewed:
-                    reviewed, reviewed_at = True, st["tools_used"]
+                    reviewed, reviewed_at = True, st["edits"]
                     s.add({"type": "notice", "level": "info", "text": "Сверка результата с пунктами запроса."})
                     s.messages.append({"role": "user", "content": (
                         "Перед завершением сверь сделанное с КАЖДЫМ пунктом запроса:\n"

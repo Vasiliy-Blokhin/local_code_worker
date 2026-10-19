@@ -75,6 +75,7 @@ def test_undone_after_review_is_pushed_once(project):
         decide("d1"), plan_chunks("правка", "проверка", status="done"),
         tool_call_chunks("edit", {"path": "app.py", "old": "'hi'", "new": "'hey'"}, "c1"),
         text_chunks("Пункт 1 готов"), text_chunks("Пункт 2 сделаю позже"),
+        text_chunks("Пункт 2: без решения пользователя не сделать"),  # ответ на дожатие пункта без правок
         text_chunks("1. сделано. 2. не сделано — bye нет."),
         text_chunks("Нужно решение пользователя: где разместить bye."),
     ])
