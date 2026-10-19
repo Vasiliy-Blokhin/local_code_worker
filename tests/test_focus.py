@@ -175,3 +175,13 @@ def test_sampling_sent_to_model(project):
     model, agent, s = make(project, [text_chunks("ok")])
     asyncio.run(agent.run_turn(s, "привет"))
     assert model.requests[0]["temperature"] == config.SAMPLING["temperature"] == 0.4
+
+
+def test_undefined_names_after_removed_import(tmp_path):
+    from lcw.tools import undefined_names
+    before = "import json\nfrom pkg import Algo\n\n\ndef run(x):\n    return Algo.go(json.dumps(x))\n"
+    (tmp_path / "main.py").write_text(
+        "import json\n\n\ndef run(x, *, y=None):\n    for i in range(2):\n        z = i\n"
+        "    return Algo.go(json.dumps(x)), z, y, undefined_before\n", encoding="utf-8")
+    out = undefined_names(tmp_path, {"main.py": before + "\nundefined_before\n"})
+    assert out == ["main.py:7: имя Algo не определено (импорт или определение удалены?) — NameError"]

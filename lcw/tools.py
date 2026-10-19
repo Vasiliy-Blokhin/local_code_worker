@@ -540,6 +540,60 @@ def _imported_names(tree: ast.AST) -> set[str]:
     return out
 
 
+def _unbound_names(tree: ast.AST) -> dict[str, int]:
+    """
+    Имена, которые читаются, но нигде в модуле не связываются (импорт, def/class, присваивание,
+    параметр, for/with/except, global) и не встроенные. Грубо по всему модулю, без областей
+    видимости, — зато без ложных срабатываний на обычном коде. {имя: первая строка}.
+    """
+    import builtins
+    bound = set(dir(builtins)) | {"__file__", "__name__", "__doc__", "__spec__", "__package__", "__builtins__"}
+    for n in ast.walk(tree):
+        if isinstance(n, (ast.Import, ast.ImportFrom)):
+            if any(a.name == "*" for a in n.names):
+                return {}  # import * — не узнать, что определено
+            bound.update((a.asname or a.name).split(".")[0] for a in n.names)
+        elif isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            bound.add(n.name)
+        elif isinstance(n, ast.arg):
+            bound.add(n.arg)
+        elif isinstance(n, ast.Name) and isinstance(n.ctx, (ast.Store, ast.Del)):
+            bound.add(n.id)
+        elif isinstance(n, ast.ExceptHandler) and n.name:
+            bound.add(n.name)
+        elif isinstance(n, (ast.Global, ast.Nonlocal)):
+            bound.update(n.names)
+        elif isinstance(n, (ast.MatchAs, ast.MatchStar)) and n.name:
+            bound.add(n.name)
+        elif isinstance(n, ast.MatchMapping) and n.rest:
+            bound.add(n.rest)
+    out = {}
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load) and n.id not in bound:
+            out.setdefault(n.id, n.lineno)
+    return out
+
+
+def undefined_names(root: Path, originals: dict) -> list[str]:
+    """
+    Имена, ставшие неопределёнными после правок: агент убрал импорт/определение, а использование
+    осталось — NameError при выполнении (часто в точках входа, которые тесты не импортируют).
+    """
+    out = []
+    for rel, before in sorted(originals.items()):
+        p = root / rel
+        if not rel.endswith(".py") or not p.is_file():
+            continue
+        try:
+            new = _unbound_names(ast.parse(p.read_text(encoding="utf-8", errors="replace")))
+            old = _unbound_names(ast.parse(before)) if before else {}
+        except SyntaxError:
+            continue
+        out += [f"{rel}:{line}: имя {name} не определено (импорт или определение удалены?) — NameError"
+                for name, line in sorted(new.items(), key=lambda x: x[1]) if name not in old]
+    return out[:20]
+
+
 def unused_new_imports(root: Path, originals: dict) -> list[str]:
     """
     Импорты, добавленные агентом в существующие файлы и нигде в файле не используемые, —
