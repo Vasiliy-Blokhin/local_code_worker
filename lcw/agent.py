@@ -182,7 +182,7 @@ class Agent:
             content = expand_mentions(root, text, s)
             reqs = requirements(text)
             if len(reqs) >= 2:  # новое многопунктное задание: ведём модель по пунктам по очереди
-                s.focus = 0
+                s.focus, s.decisions = 0, {}
                 content += "\n\n" + await asyncio.to_thread(focus_message, root, reqs, 0, True)
             s.messages.append({"role": "user", "content": content})
             if s.title == "Новая сессия":
@@ -233,7 +233,7 @@ class Agent:
         # незакрытый план прошлого хода («продолжай») остаётся в силе — заново не требуем
         carried = any(x["status"] in ("todo", "doing") for x in s.plan)
         st = {"planned": carried, "plan_rejects": 0, "plan_item": None, "since_plan": 0, "tools_used": 0,
-              "edits": 0}
+              "edits": 0, "reqs": requirements(task), "decide_rejects": 0}
         focus_edits, item_pushed = 0, False  # правок к началу текущего пункта; было ли дожатие пункта
         for _ in range(config.MAX_STEPS):
             if _estimate_tokens(s) > config.COMPACT_AT * config.CONTEXT:
@@ -421,6 +421,10 @@ class Agent:
                     s.messages.append({"role": "user", "content": (
                         "Перед завершением сверь сделанное с КАЖДЫМ пунктом запроса:\n"
                         + "\n".join(f"{n}. {r}" for n, r in enumerate(reqs, 1))
+                        + ("\nЗафиксированные решения (перечисли их и в итоговом ответе — пользователь должен "
+                           "их проверить):\n" + "\n".join(
+                               f"{int(k) + 1}. {v['decision']} (если данных нет: {v['fallback']})"
+                               for k, v in sorted(s.decisions.items())) if s.decisions else "")
                         + "\nПо каждому пункту ОДНОЙ строкой, без таблиц: «сделано — файл: функция, что изменено» "
                           "или «не сделано — что осталось». Опирайся только на реальные правки (смотри diff через run git diff "
                           "при необходимости), не на намерения. Если что-то не сделано и выполнимо — составь "
@@ -468,7 +472,7 @@ class Agent:
         try:
             async for kind, val in self.llm.stream(
                     build_request(s) + ([{"role": "user", "content": hint}] if hint else []),
-                    TOOLS, max_tokens=max_tokens,
+                    TOOLS, max_tokens=max_tokens, **config.SAMPLING,
                     reasoning_effort=s.settings.get("effort", config.REASONING),
                     chat_template_kwargs={"reasoning_effort": s.settings.get("effort", config.REASONING)}):
                 if kind == "reasoning":
@@ -533,6 +537,20 @@ class Agent:
             return ToolResult(f"Ошибка: аргументы не являются корректным JSON ({e}). Повтори вызов.", ok=False)
         if name == "plan":
             return self._plan(s, args, st)
+        if name == "decide":
+            return await asyncio.to_thread(self._decide, s, ctx, args, st)
+        if (name in MUTATING and len(st.get("reqs", [])) >= 2 and str(s.focus) not in s.decisions
+                and st.get("decide_rejects", 0) < 2):
+            # проектные пункты маленькая модель решает наугад: сначала — решение, привязанное к коду
+            st["decide_rejects"] = st.get("decide_rejects", 0) + 1
+            s.add({"type": "tool", "id": call_id, "name": name, "args": _ui_args(name, args),
+                   "status": "error", "output": "Сначала решение по пункту (decide)."})
+            return ToolResult(
+                f"Не выполнено: перед правками пункта {s.focus + 1} зафиксируй решение через decide: "
+                "decision — что конкретно меняешь (критерий/метрика/порог или структура и где подключается), "
+                "uses — существующие функции/классы/настройки проекта, на которых оно строится (если в проекте "
+                "уже есть механизм — метрики, отбор, флаги, — используй его, а не придумывай новый), fallback — "
+                "что происходит, когда данных нет (обычно — прежнее поведение).", ok=False)
         if name == "run" and GIT_WRITE.search(args.get("command", "")):
             s.add({"type": "tool", "id": call_id, "name": name, "args": _ui_args(name, args),
                    "status": "error", "output": "git add/commit/push — только через git_commit."})
@@ -615,6 +633,26 @@ class Agent:
         ui_out = out if len(out) <= UI_OUTPUT else out[:UI_OUTPUT] + "\n…"
         s.set(i, status="ok" if result.ok else "error", output=ui_out, diff=result.diff, path=result.path)
         return result
+
+    def _decide(self, s: Session, ctx: ToolContext, args: dict, st: dict) -> ToolResult:
+        """Решение по текущему пункту: конкретное правило, на чём строится, что без данных."""
+        decision = str(args.get("decision", "")).strip()
+        uses = [str(x) for x in (args.get("uses") or []) if str(x).strip()]
+        fallback = str(args.get("fallback", "")).strip()
+        if len(decision) < 20 or not uses or not fallback:
+            return ToolResult("Ошибка: нужны decision (конкретное правило, не общие слова), uses (непустой "
+                              "список существующих сущностей) и fallback.", ok=False)
+        missing = entities.check_names(ctx.root, uses)
+        if missing:
+            lines = [f"- {n}: нет в проекте" + (f" (похожие: {', '.join(sim)})" if sim else "")
+                     for n, sim in missing.items()]
+            return ToolResult("Ошибка: решение опирается на несуществующие сущности:\n" + "\n".join(lines)
+                              + "\nНайди реальные через symbols/grep и пришли decide заново.", ok=False)
+        s.decisions[str(s.focus)] = {"decision": decision, "uses": uses, "fallback": fallback}
+        s.add({"type": "notice", "level": "info",
+               "text": f"Решение по пункту {s.focus + 1}: {decision}\nОпирается на: {', '.join(uses)}\n"
+                       f"Если данных нет: {fallback}"})
+        return ToolResult(f"Решение по пункту {s.focus + 1} принято. Теперь plan и правки по нему.")
 
     def _plan(self, s: Session, args: dict, st: dict) -> ToolResult:
         raw = args.get("steps")

@@ -39,6 +39,7 @@ class Session:
         self.plan: list[dict] = data.get("plan", [])                # текущий план агента [{text, status}]
         self.focus: int = data.get("focus", 0)                      # текущий пункт многопунктного запроса
         self.worktree: dict | None = data.get("worktree")            # {path, branch, base} — изолированная копия
+        self.decisions: dict = data.get("decisions", {})            # пункт запроса -> зафиксированное решение
         self.seen: dict = {}            # дедупликация чтений (не сохраняется)
         # runtime
         self.ops: list[dict] = []
@@ -59,7 +60,8 @@ class Session:
                 "messages": self.messages, "items": self.items, "checkpoints": self.checkpoints,
                 "turn": self.turn, "rewind_floor": self.rewind_floor,
                 "settings": self.settings, "usage": self.usage, "plan": self.plan,
-                "focus": self.focus, "worktree": self.worktree}
+                "focus": self.focus, "worktree": self.worktree,
+                "decisions": self.decisions}
 
     def save(self) -> None:
         self.updated = time.time()

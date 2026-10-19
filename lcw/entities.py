@@ -300,6 +300,35 @@ def duplicates(root: str | Path, limit: int = 20) -> list[str]:
     return out[:limit]
 
 
+def check_names(root: str | Path, names: list[str]) -> dict[str, list[str]]:
+    """
+    Проверка, что имена из решения модели существуют в проекте (сущность из индекса или
+    идентификатор в коде — настройки вроде EVOLVE_MIN_CAGR). Возвращает {отсутствующее: похожие}.
+    """
+    import difflib
+    root = Path(root)
+    known: set[str] = set()
+    texts = []
+    for f in _files(root):
+        _, ents = file_entities(root, f)
+        known.update(e.name for e in ents)
+        known.update(e.name.rsplit(".", 1)[-1] for e in ents)
+        try:
+            texts.append((root / f).read_text(encoding="utf-8", errors="replace"))
+        except OSError:
+            pass
+    blob = "\n".join(texts)
+    known.update(re.findall(r"^([A-Z][A-Z0-9_]{2,})\s*=", blob, re.M))  # константы/настройки модулей
+    missing = {}
+    for raw in names:
+        name = str(raw).strip().strip("`").removesuffix("()")
+        last = re.split(r"[.:/]", name)[-1]
+        if not last or name in known or last in known or re.search(rf"\b{re.escape(last)}\b", blob):
+            continue
+        missing[name] = difflib.get_close_matches(last, sorted(known), n=4, cutoff=0.5)
+    return missing
+
+
 def _dir_map(root: Path, files: list[str]) -> str:
     out = []
     for f in files[:150]:

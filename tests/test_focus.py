@@ -5,15 +5,21 @@ from pathlib import Path
 from conftest import plan_chunks, text_chunks, tool_call_chunks
 from test_plan import make
 
+def decide(cid="d1"):
+    """Решение по пункту — обязательно перед правками в попунктном режиме."""
+    return tool_call_chunks("decide", {"decision": "менять функцию hello в app.py, остальное не трогать",
+                                       "uses": ["hello"], "fallback": "прежнее поведение"}, cid)
+
+
 TASK = "Сделай:\n1. переименуй приветствие hello в hey\n2. добавь функцию bye в app.py\n"
 
 
 def test_items_one_by_one_then_review(project):
     """Пункты выдаются по одному (со связанным кодом), в конце — одна сверка."""
     model, agent, s = make(project, [
-        plan_chunks("правка", "проверка", status="done"),
+        decide("d1"), plan_chunks("правка", "проверка", status="done"),
         tool_call_chunks("edit", {"path": "app.py", "old": "'hi'", "new": "'hey'"}, "c1"),
-        text_chunks("Пункт 1 готов"),
+        text_chunks("Пункт 1 готов"), decide("d2"),
         tool_call_chunks("edit", {"path": "app.py", "old": "", "new": "def bye():\n    return 'bye'\n"}, "c2"),
         text_chunks("Пункт 2 готов"),
         text_chunks("1. сделано — app.py: hello. 2. сделано — app.py: bye."),
@@ -28,9 +34,29 @@ def test_items_one_by_one_then_review(project):
     assert s.messages[-1]["content"].startswith("1. сделано")
 
 
-def test_undone_after_review_is_pushed_once(project):
+def test_decide_gate_and_unknown_names(project):
+    """Без решения правка пункта не проходит; решение с выдуманными сущностями отклоняется."""
     model, agent, s = make(project, [
         plan_chunks("правка", "проверка", status="done"),
+        tool_call_chunks("edit", {"path": "app.py", "old": "'hi'", "new": "'hey'"}, "c1"),
+        tool_call_chunks("decide", {"decision": "отбирать по метрике sharpe из таблицы метрик",
+                                    "uses": ["MetricsTable.sharpe", "helo"], "fallback": "как раньше"}, "d0"),
+        decide("d1"),
+        tool_call_chunks("edit", {"path": "app.py", "old": "'hi'", "new": "'hey'"}, "c2"),
+        text_chunks("Пункт 1 готов"), text_chunks("Пункт 2 нет"), text_chunks("1. сделано. 2. сделано."),
+    ])
+    asyncio.run(agent.run_turn(s, TASK))
+    res = [m["content"] for m in s.messages if m["role"] == "tool"]
+    assert "зафиксируй решение через decide" in res[1]
+    assert "MetricsTable.sharpe: нет в проекте" in res[2] and "helo: нет в проекте (похожие: hello)" in res[2]
+    assert res[4].startswith("OK:") and s.decisions["0"]["uses"] == ["hello"]
+    review = next(m["content"] for m in s.messages if m["role"] == "user" and "КАЖДЫМ пунктом" in m["content"])
+    assert "Зафиксированные решения" in review and "менять функцию hello" in review
+
+
+def test_undone_after_review_is_pushed_once(project):
+    model, agent, s = make(project, [
+        decide("d1"), plan_chunks("правка", "проверка", status="done"),
         tool_call_chunks("edit", {"path": "app.py", "old": "'hi'", "new": "'hey'"}, "c1"),
         text_chunks("Пункт 1 готов"), text_chunks("Пункт 2 сделаю позже"),
         text_chunks("1. сделано. 2. не сделано — bye нет."),
@@ -69,11 +95,11 @@ def test_tool_call_parse_error_retried_with_hint(project):
 
 def test_abandoned_item_gets_minimal_version_push(project):
     model, agent, s = make(project, [
-        plan_chunks("правка", "проверка", status="done"),
+        decide("d1"), plan_chunks("правка", "проверка", status="done"),
         tool_call_chunks("edit", {"path": "app.py", "old": "'hi'", "new": "'hey'"}, "c1"),
         text_chunks("Пункт 1 готов"),
         tool_call_chunks("read", {"path": "app.py"}, "r1"),
-        text_chunks("Пункт 2 слишком обширный, уточните, пожалуйста, детали."),
+        text_chunks("Пункт 2 слишком обширный, уточните, пожалуйста, детали."), decide("d2"),
         tool_call_chunks("edit", {"path": "app.py", "old": "", "new": "def bye():\n    return 'bye'\n"}, "c2"),
         text_chunks("Сделал минимальный вариант"),
         text_chunks("1. сделано. 2. сделано — app.py: bye."),
@@ -90,7 +116,7 @@ def test_failing_project_tests_block_finish(project):
         "import sys, pathlib\nsys.path.insert(0, str(pathlib.Path(__file__).parent.parent))\n"
         "from app import hello\n\n\ndef test_hello():\n    assert hello() == 'hi'\n", encoding="utf-8")
     model, agent, s = make(project, [
-        plan_chunks("правка", "проверка", status="done"),
+        decide("d1"), plan_chunks("правка", "проверка", status="done"),
         tool_call_chunks("edit", {"path": "app.py", "old": "'hi'", "new": "'hey'"}, "c1"),
         text_chunks("готово, всё работает"),
         tool_call_chunks("edit", {"path": "app.py", "old": "'hey'", "new": "'hi'"}, "c2"),
@@ -142,3 +168,10 @@ def test_new_stubs_detected(tmp_path):
         "    def name(self):\n        return 'a'\n", encoding="utf-8")
     before = "class A:\n    def old(self):\n        pass\n"
     assert new_stubs(tmp_path, {"w.py": before}) == ["w.py: A.run — заглушка без реальной работы"]
+
+
+def test_sampling_sent_to_model(project):
+    from lcw import config
+    model, agent, s = make(project, [text_chunks("ok")])
+    asyncio.run(agent.run_turn(s, "привет"))
+    assert model.requests[0]["temperature"] == config.SAMPLING["temperature"] == 0.4

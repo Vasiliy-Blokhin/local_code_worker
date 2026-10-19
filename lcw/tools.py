@@ -56,6 +56,13 @@ TOOLS = [
         {"steps": {"type": "array", "items": {"type": "object", "properties": {
             "text": S, "status": {"type": "string", "enum": list(PLAN_STATUSES)}},
             "required": ["text", "status"]}}}, ["steps"]),
+    _fn("decide", "Record the design decision for the current request item BEFORE editing it: what exactly "
+                  "changes, which EXISTING project entities it is built on, what happens when data is missing.",
+        {"decision": {**S, "description": "concrete rule: criterion/metric/threshold or structure, where it plugs in"},
+         "uses": {"type": "array", "items": S,
+                  "description": "existing functions/classes/settings it relies on (real names from the code)"},
+         "fallback": {**S, "description": "behaviour when data is missing or the check cannot run"}},
+        ["decision", "uses", "fallback"]),
     _fn("symbols", "Project entity index (classes/functions with line ranges and docstrings). "
                    "path=file: its outline; query: search names+docstrings (words, `|` = or) in path; "
                    "use it to find code before read/grep.",
@@ -1034,8 +1041,8 @@ SYNC = {"git_commit": t_git_commit, "symbols": t_symbols, "read": t_read, "glob"
 async def execute(ctx: ToolContext, name: str, args: dict) -> ToolResult:
     if name not in TOOL_NAMES:
         return ToolResult(f"Неизвестный инструмент {name}. Доступны: {', '.join(sorted(TOOL_NAMES))}.", ok=False)
-    if name == "plan":  # состояние плана живёт в сессии — обрабатывает агент
-        return ToolResult("plan обрабатывается агентом.", ok=False)
+    if name in ("plan", "decide"):  # состояние живёт в сессии — обрабатывает агент
+        return ToolResult(f"{name} обрабатывается агентом.", ok=False)
     try:
         if name == "run":
             return await t_run(ctx, **args)

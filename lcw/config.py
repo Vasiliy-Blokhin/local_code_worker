@@ -32,6 +32,10 @@ AIM_PROJECT = os.getenv("LCW_AIM_PROJECT", "local_code_worker")
 CONTEXT = _int("LCW_CONTEXT", 100000)
 REASONING = os.getenv("LCW_REASONING", "low")  # low | medium | high
 MAX_TOKENS = _int("LCW_MAX_TOKENS", 8192)      # лимит одного ответа модели
+# Сэмплирование: по умолчанию llama.cpp берёт temperature 0.8 — для агента это лишний разброс
+# между прогонами (одна и та же задача то решается, то бросается). Пустое значение — не передавать.
+SAMPLING = {k: float(v) for k, v in (("temperature", os.getenv("LCW_TEMPERATURE", "0.4")),
+                                     ("top_p", os.getenv("LCW_TOP_P", "0.95"))) if v.strip()}
 
 DATA_DIR = Path(os.getenv("LCW_DATA_DIR", str(ROOT / "data"))).resolve()
 SESSIONS_DIR = DATA_DIR / "sessions"
