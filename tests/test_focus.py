@@ -201,3 +201,16 @@ def test_undefined_names_after_removed_import(tmp_path):
         "    return Algo.go(json.dumps(x)), z, y, undefined_before\n", encoding="utf-8")
     out = undefined_names(tmp_path, {"main.py": before + "\nundefined_before\n"})
     assert out == ["main.py:7: имя Algo не определено (импорт или определение удалены?) — NameError"]
+
+
+def test_sql_unknown_column_reported(tmp_path):
+    from lcw.tools import sql_column_errors
+    (tmp_path / "tables.py").write_text(
+        "class BacktestRun(Base):\n    __tablename__ = 'backtest_runs'\n    id: int\n    STRATEGY: str\n"
+        "    SHARPE: float\n", encoding="utf-8")
+    (tmp_path / "main.py").write_text(
+        "Q1 = 'SELECT DISTINCT STRATEGY FROM backtest_runs WHERE SHARPE > 0 AND CAGR > :m ORDER BY id'\n"
+        "Q2 = 'SELECT COUNT(*) AS n FROM backtest_runs b WHERE b.SHARPE > 0'\n"
+        "Q3 = 'SELECT x FROM other_table'\n", encoding="utf-8")
+    out = sql_column_errors(tmp_path, {"main.py": ""})
+    assert len(out) == 1 and out[0].startswith("main.py:1: в SQL колонки CAGR нет у таблиц backtest_runs")

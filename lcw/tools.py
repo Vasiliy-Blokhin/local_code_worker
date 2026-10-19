@@ -594,6 +594,89 @@ def undefined_names(root: Path, originals: dict) -> list[str]:
     return out[:20]
 
 
+_SQL = re.compile(r"^\s*(SELECT|UPDATE|INSERT|DELETE|WITH)\b", re.IGNORECASE)
+_SQL_WORDS = {
+    "select", "from", "where", "and", "or", "not", "in", "is", "null", "as", "on", "join", "left", "right",
+    "inner", "outer", "group", "by", "order", "asc", "desc", "limit", "offset", "distinct", "count", "sum",
+    "avg", "min", "max", "having", "update", "set", "insert", "into", "values", "delete", "case", "when",
+    "then", "else", "end", "like", "between", "exists", "union", "all", "with", "coalesce", "ifnull",
+    "cast", "date", "datetime", "abs", "round", "true", "false", "lower", "upper", "length", "over",
+    "partition", "row_number", "replace", "conflict", "do", "nothing", "excluded", "strftime", "julianday"}
+
+
+def _schema(root: Path) -> dict[str, set[str]]:
+    """Таблицы из моделей SQLAlchemy проекта: {__tablename__: {колонки}}."""
+    out = {}
+    for f in list_files(root):
+        if not f.endswith(".py") or _TEST_PATH.search(f):
+            continue
+        try:
+            text = (root / f).read_text(encoding="utf-8", errors="replace")
+            if "__tablename__" not in text:
+                continue
+            tree = ast.parse(text)
+        except (SyntaxError, OSError):
+            continue
+        for c in ast.walk(tree):
+            if not isinstance(c, ast.ClassDef):
+                continue
+            name, cols = None, set()
+            for st in c.body:
+                if isinstance(st, ast.Assign) and any(getattr(t, "id", "") == "__tablename__" for t in st.targets) \
+                        and isinstance(st.value, ast.Constant):
+                    name = str(st.value.value)
+                elif isinstance(st, ast.AnnAssign) and isinstance(st.target, ast.Name):
+                    cols.add(st.target.id)
+                elif isinstance(st, ast.Assign):
+                    cols.update(t.id for t in st.targets if isinstance(t, ast.Name))
+            if name:
+                out[name] = cols
+    return out
+
+
+def sql_column_errors(root: Path, originals: dict) -> list[str]:
+    """
+    Новые SQL-строки, которые ссылаются на колонки, которых нет у таблиц из моделей проекта
+    (SQLAlchemy: __tablename__ + атрибуты). Такие ошибки всплывают только при выполнении запроса,
+    а тесты на пустой БД их обычно не доходят.
+    """
+    schema = None
+    out = []
+    for rel, before in sorted(originals.items()):
+        p = root / rel
+        if not rel.endswith(".py") or _TEST_PATH.search(rel) or not p.is_file():
+            continue
+        try:
+            new_tree = ast.parse(p.read_text(encoding="utf-8", errors="replace"))
+            old_tree = ast.parse(before) if before else None
+        except SyntaxError:
+            continue
+        old = {n.value for n in ast.walk(old_tree) if isinstance(n, ast.Constant)} if old_tree else set()
+        for n in ast.walk(new_tree):
+            if not (isinstance(n, ast.Constant) and isinstance(n.value, str) and _SQL.match(n.value)) \
+                    or n.value in old:
+                continue
+            if schema is None:
+                schema = _schema(root)
+            if not schema:
+                return []
+            sql = re.sub(r"'[^']*'", "", n.value)  # строковые литералы
+            tables = re.findall(r"\b(?:FROM|JOIN|UPDATE|INTO)\s+[\"`]?(\w+)", sql, re.IGNORECASE)
+            known = [t for t in tables if t in schema]
+            if not known:
+                continue
+            cols = set().union(*(schema[t] for t in known))
+            aliases = set(re.findall(r"\bAS\s+[\"`]?(\w+)", sql, re.IGNORECASE)) | set(tables)
+            aliases |= set(re.findall(r"\b(?:FROM|JOIN)\s+\w+\s+(?!WHERE|JOIN|ON|ORDER|GROUP|LIMIT|LEFT|INNER)(\w+)",
+                                      sql, re.IGNORECASE))
+            for word in dict.fromkeys(re.findall(r"(?<![:@$.\w])[A-Za-z_]\w*", sql)):
+                if word.lower() in _SQL_WORDS or word in aliases or word in cols or word.isdigit():
+                    continue
+                out.append(f"{rel}:{n.lineno}: в SQL колонки {word} нет у таблиц {', '.join(known)} "
+                           f"(есть: {', '.join(sorted(cols))[:200]})")
+    return out[:10]
+
+
 def unused_new_imports(root: Path, originals: dict) -> list[str]:
     """
     Импорты, добавленные агентом в существующие файлы и нигде в файле не используемые, —

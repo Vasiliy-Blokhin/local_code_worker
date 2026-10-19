@@ -22,7 +22,8 @@ from .llm import LLM, Completion, LLMError
 from .sessions import Session
 from .tools import (MUTATING, TOOLS, ToolContext, ToolError, ToolResult, execute, normalize_plan,
                     GIT_WRITE, git_preview, preview, render_plan, syntax_errors, unused_modules, import_errors,
-                    unused_new_imports, new_stubs, project_tests, find_merges, undefined_names)
+                    unused_new_imports, new_stubs, project_tests, find_merges, undefined_names,
+                    sql_column_errors)
 from .workspace import WorkspaceError, get_project, is_text_file, relpath, resolve
 
 UI_OUTPUT = 6000           # сколько вывода инструмента показывать в UI
@@ -272,6 +273,7 @@ class Agent:
                     errors = await asyncio.to_thread(import_errors, ctx.root, changed)
                     # и что не осталось имён без импорта/определения (точки входа тесты не импортируют)
                     errors += await asyncio.to_thread(undefined_names, ctx.root, originals)
+                    errors += await asyncio.to_thread(sql_column_errors, ctx.root, originals)
                 if errors and fixes < 3:
                     fixes += 1
                     s.add({"type": "notice", "level": "warn",
