@@ -23,7 +23,7 @@ from .sessions import Session
 from .tools import (MUTATING, TOOLS, ToolContext, ToolError, ToolResult, execute, normalize_plan,
                     GIT_WRITE, git_preview, preview, render_plan, syntax_errors, unused_modules, import_errors,
                     unused_new_imports, new_stubs, project_tests, find_merges, undefined_names,
-                    sql_column_errors)
+                    sql_column_errors, dropped_dependencies)
 from .workspace import WorkspaceError, get_project, is_text_file, relpath, resolve
 
 UI_OUTPUT = 6000           # сколько вывода инструмента показывать в UI
@@ -225,7 +225,8 @@ class Agent:
         nudged = False
         fixes = 0
         plan_nudges = 0
-        orphan_nudges = import_nudges = stub_nudges = test_runs = 0
+        orphan_nudges = import_nudges = stub_nudges = test_runs = dep_nudges = 0
+        dropped_seen: set[str] = set()
         tested_sig = None
         merge_sig, merge_nudges = None, 0  # дифференциальная проверка объединений: по чему и сколько раз
         refused = reviewed = pushed = False
@@ -306,6 +307,21 @@ class Agent:
                         "Автопроверка: добавленные импорты нигде в файле не используются:\n" + "\n".join(idle)
                         + "\nИмпорт сам по себе ничего не меняет. Доделай изменение кода, ради которого он "
                           "добавлен (шаги — в plan), или убери импорт. Не пиши, что сделал то, чего нет в коде.")})
+                    continue
+                # пропавшие зависимости: настройка/флаг/функция больше не используется — поведение пропало?
+                dropped = [d for d in await asyncio.to_thread(dropped_dependencies, ctx.root, originals)
+                           if d not in dropped_seen]
+                if dropped and dep_nudges < 2:
+                    dep_nudges += 1
+                    dropped_seen.update(dropped)
+                    s.add({"type": "notice", "level": "warn",
+                           "text": "Автопроверка: перестали использоваться:\n" + "\n".join(dropped)})
+                    s.messages.append({"role": "user", "content": (
+                        "Автопроверка: после правок перестали использоваться имена, от которых раньше "
+                        "зависело поведение:\n" + "\n".join(dropped) + "\nПроверь, не пропало ли поведение "
+                        "(например, настройка или флаг больше не учитывается, вызов выпал). Если пропало — "
+                        "верни его (новая логика должна учитывать и прежнее условие); если имя действительно "
+                        "больше не нужно — убери его импорт и коротко объясни в итоге, почему.")})
                     continue
                 # пустые методы «для галочки» (return [] / pass) вместо реализации
                 stubs = await asyncio.to_thread(new_stubs, ctx.root, originals)

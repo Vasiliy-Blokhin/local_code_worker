@@ -677,6 +677,43 @@ def sql_column_errors(root: Path, originals: dict) -> list[str]:
     return out[:10]
 
 
+def dropped_dependencies(root: Path, originals: dict) -> list[str]:
+    """
+    Импортированные имена, которые использовались до правки, а после — нет (импорт остался или
+    удалён вместе с использованием). Часто это пропавшее поведение: настройка/флаг больше не
+    проверяется (REVERSE_ENABLED), вызов функции выпал. Тесты такое обычно не замечают.
+    """
+    out = []
+    for rel, before in sorted(originals.items()):
+        p = root / rel
+        if not before or not rel.endswith(".py") or rel.endswith("__init__.py") or not p.is_file():
+            continue
+        try:
+            old, new = ast.parse(before), ast.parse(p.read_text(encoding="utf-8", errors="replace"))
+        except SyntaxError:
+            continue
+        # использования внутри функций, которые из файла удалены (перенесены в общий модуль), не в счёт
+        old_defs, new_defs = _defs(old), _defs(new)
+        moved = {id(fn) for name, fn in old_defs.items() if name not in new_defs}
+
+        def used(tree, skip=()):
+            out, stack = set(), [tree]
+            while stack:
+                n = stack.pop()
+                if id(n) in skip:
+                    continue
+                if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load):
+                    out.add(n.id)
+                stack.extend(ast.iter_child_nodes(n))
+            return out
+
+        old_used, new_used = used(old, moved), used(new)
+        for name in sorted(_imported_names(old)):
+            if name in old_used and name not in new_used:
+                out.append(f"{rel}: {name} использовался до правки, а теперь нигде не используется")
+    return out[:15]
+
+
 def unused_new_imports(root: Path, originals: dict) -> list[str]:
     """
     Импорты, добавленные агентом в существующие файлы и нигде в файле не используемые, —

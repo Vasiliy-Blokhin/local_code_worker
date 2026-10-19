@@ -215,3 +215,14 @@ def test_sql_unknown_column_reported(tmp_path):
         "Q3 = 'SELECT x FROM other_table'\n", encoding="utf-8")
     out = sql_column_errors(tmp_path, {"main.py": ""})
     assert len(out) == 1 and out[0].startswith("main.py:1: в SQL колонки CAGR нет у таблиц backtest_runs")
+
+
+def test_dropped_dependency_reported(tmp_path):
+    from lcw.tools import dropped_dependencies
+    before = ("from settings import REVERSE_ENABLED, TZ\n\n\ndef now():\n    return TZ\n\n\n"
+              "def run():\n    if REVERSE_ENABLED:\n        return 1\n")
+    (tmp_path / "w.py").write_text("from settings import REVERSE_ENABLED\nfrom common import now\n\n\n"
+                                   "def run():\n    return 1\n", encoding="utf-8")
+    # now() перенесена в общий модуль — TZ не в счёт; флаг REVERSE_ENABLED перестал проверяться
+    assert dropped_dependencies(tmp_path, {"w.py": before}) == [
+        "w.py: REVERSE_ENABLED использовался до правки, а теперь нигде не используется"]
