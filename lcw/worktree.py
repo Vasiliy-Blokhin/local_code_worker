@@ -12,6 +12,7 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import tempfile
 from pathlib import Path
 
 from . import config
@@ -52,10 +53,17 @@ def create(project_root: str | Path, sid: str) -> dict:
     return {"path": str(path), "branch": branch, "base": base}
 
 
-def patch(wt: dict) -> str:
-    """Все изменения worktree относительно базового коммита (с новыми файлами) — unified diff."""
+def patch(wt: dict) -> bytes:
+    """
+    Все изменения worktree относительно базового коммита (с новыми файлами) — unified diff.
+    Байтами, без текстового режима: на Windows он превращает \n в \r\n и портит патч.
+    """
     _stage(wt["path"])
-    return _check(_git(wt["path"], "diff", "--cached", "--binary", wt["base"], "--", *_PATHSPEC), "git diff")
+    p = subprocess.run(["git", "diff", "--cached", "--binary", wt["base"], "--", *_PATHSPEC], cwd=wt["path"],
+                       capture_output=True, timeout=120, env={**os.environ, "GIT_PAGER": "cat"})
+    if p.returncode != 0:
+        raise WorkspaceError("git diff: " + p.stderr.decode("utf-8", "replace").strip()[-600:])
+    return p.stdout
 
 
 def _stage(path: str) -> None:
@@ -82,13 +90,18 @@ def apply(project_root: str | Path, wt: dict) -> list[str]:
         raise WorkspaceError("В изолированной копии нет изменений.")
     files = changed_files(wt)
     root = Path(project_root)
-    if _git(root, "apply", "--check", "-", input=diff).returncode == 0:
-        _check(_git(root, "apply", "-", input=diff), "git apply")
-    else:
-        p = _git(root, "apply", "--3way", "-", input=diff)
-        if p.returncode != 0:
-            raise WorkspaceError("Изменения не накладываются на текущую рабочую копию проекта "
-                                 f"(она ушла вперёд или есть конфликт): {(p.stderr or p.stdout).strip()[-600:]}")
+    with tempfile.NamedTemporaryFile("wb", suffix=".patch", delete=False) as f:
+        f.write(diff)
+    try:
+        if _git(root, "apply", "--check", f.name).returncode == 0:
+            _check(_git(root, "apply", f.name), "git apply")
+        else:
+            p = _git(root, "apply", "--3way", f.name)
+            if p.returncode != 0:
+                raise WorkspaceError("Изменения не накладываются на текущую рабочую копию проекта "
+                                     f"(она ушла вперёд или есть конфликт): {(p.stderr or p.stdout).strip()[-600:]}")
+    finally:
+        os.unlink(f.name)
     return files
 
 

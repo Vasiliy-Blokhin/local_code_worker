@@ -17,12 +17,12 @@ import re
 import uuid
 from pathlib import Path
 
-from . import config, entities, prompts
+from . import config, entities, equivalence, prompts
 from .llm import LLM, Completion, LLMError
 from .sessions import Session
 from .tools import (MUTATING, TOOLS, ToolContext, ToolError, ToolResult, execute, normalize_plan,
                     GIT_WRITE, git_preview, preview, render_plan, syntax_errors, unused_modules, import_errors,
-                    unused_new_imports, new_stubs, project_tests, merged_functions)
+                    unused_new_imports, new_stubs, project_tests, find_merges)
 from .workspace import WorkspaceError, get_project, is_text_file, relpath, resolve
 
 UI_OUTPUT = 6000           # сколько вывода инструмента показывать в UI
@@ -222,7 +222,7 @@ class Agent:
         plan_nudges = 0
         orphan_nudges = import_nudges = stub_nudges = test_runs = 0
         tested_sig = None
-        merged_seen: set[str] = set()  # о каких объединениях уже сказали модели
+        merge_sig, merge_nudges = None, 0  # дифференциальная проверка объединений: по чему и сколько раз
         refused = reviewed = pushed = False
         reviewed_at = 0
         # исходная задача хода («продолжай» — значит задача из предыдущих сообщений пользователя)
@@ -313,19 +313,29 @@ class Agent:
                           "пользователя — так и напиши в итоге.")})
                     continue
                 # объединение функций: показываем «было / стало» — модель склеивает похожее, не замечая различий
-                merged = [m for m in await asyncio.to_thread(merged_functions, ctx.root, originals)
-                          if m.split("\n", 1)[0] not in merged_seen]
-                if merged:
-                    merged_seen.update(m.split("\n", 1)[0] for m in merged)
-                    s.add({"type": "notice", "level": "warn",
-                           "text": "Автопроверка: сверка поведения объединённых функций."})
-                    s.messages.append({"role": "user", "content": (
-                        "Автопроверка: ты заменил функции общей реализацией. Сравни построчно «было» и "
-                        "«стало»:\n\n" + "\n\n".join(merged) + "\n\nДаёт ли новая версия ровно тот же результат "
-                        "на тех же входах (текст и порядок полей, типы, часовой пояс, обработка None)? Если "
-                        "нет — исправь общую функцию (например, параметром) или верни прежнюю реализацию в "
-                        "этом месте. Если различие намеренное и безопасное — объясни это в итоговом ответе.")})
-                    continue
+                # и проверяем дифференциально: старая и новая версия на реальных аргументах из тестов
+                files_sig = tuple(sorted((r, (ctx.root / r).stat().st_mtime_ns if (ctx.root / r).exists() else 0)
+                                         for r in originals))
+                merges = await asyncio.to_thread(find_merges, ctx.root, originals)
+                if merges and files_sig != merge_sig and merge_nudges < 3:
+                    merge_sig = files_sig
+                    results = await asyncio.to_thread(equivalence.check_merges, ctx.root, merges)
+                    bad, good = equivalence.describe(merges, results) if results else (
+                        [m["text"] for m in merges], [])
+                    if good:
+                        s.add({"type": "notice", "level": "info", "text": "Автопроверка: " + "; ".join(good)})
+                    if bad:
+                        merge_nudges += 1
+                        s.add({"type": "notice", "level": "warn",
+                               "text": "Автопроверка: объединённые функции ведут себя иначе:\n"
+                                       + "\n".join(b.split("\n", 1)[0] for b in bad)})
+                        s.messages.append({"role": "user", "content": (
+                            "Автопроверка поведения: ты заменил функции общей реализацией. Старая и новая "
+                            "версии вызваны с одними и теми же аргументами (взяты из реальных вызовов в тестах):"
+                            "\n\n" + "\n\n".join(bad) + "\n\nРезультат должен совпадать ТОЧНО (текст, порядок "
+                            "полей, типы, часовой пояс). Исправь общую функцию (например, параметром, который "
+                            "сохраняет прежний вариант для этого места) или верни прежнюю реализацию здесь.")})
+                        continue
                 # тесты проекта сам прогоняет harness: модель любит отчитаться, не заметив падений
                 sig = tuple(sorted((r, (ctx.root / r).stat().st_mtime_ns if (ctx.root / r).exists() else 0)
                                    for r in originals))

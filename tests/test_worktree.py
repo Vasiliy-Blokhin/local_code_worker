@@ -42,6 +42,21 @@ def test_create_patch_apply_remove(tmp_path):
     assert not path.exists() and "lcw/s1" not in git(root, "branch")
 
 
+def test_apply_keeps_crlf_files_intact(tmp_path):
+    root = repo(tmp_path)
+    git(root, "config", "core.autocrlf", "false")
+    (root / "win.py").write_bytes(b"A = 1\r\nB = 2\r\n")
+    git(root, "add", "-A")
+    git(root, "commit", "-qm", "crlf")
+    wt = worktree.create(root, "s3")
+    try:
+        (Path(wt["path"]) / "win.py").write_bytes(b"A = 1\r\nB = 3\r\n")
+        assert worktree.apply(root, wt) == ["win.py"]
+        assert (root / "win.py").read_bytes() == b"A = 1\r\nB = 3\r\n"
+    finally:
+        worktree.remove(root, wt)
+
+
 def test_venv_found_from_worktree(tmp_path):
     root = repo(tmp_path)
     (tmp_path / ".venv" / "Scripts").mkdir(parents=True)

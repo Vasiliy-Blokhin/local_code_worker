@@ -644,10 +644,15 @@ def _delegate(fn: ast.AST) -> str | None:
 
 
 def merged_functions(root: Path, originals: dict) -> list[str]:
+    return [m["text"] for m in find_merges(root, originals)]
+
+
+def find_merges(root: Path, originals: dict) -> list[dict]:
     """
     Функции, которые агент заменил общей реализацией (удалил и импортировал одноимённую из модуля
-    проекта или свёл тело к вызову другой функции). Возвращает «было / стало» для сверки поведения:
-    маленькая модель объединяет «похожие» функции, не замечая различий в формате, порядке, типах.
+    проекта или свёл тело к вызову другой функции), причём тела отличаются. Для каждой — «было /
+    стало» (text) и данные для дифференциальной проверки (equivalence.check_merges): маленькая
+    модель объединяет «похожие» функции, не замечая различий в формате, порядке, типах.
     """
     out = []
     for rel, before in sorted(originals.items()):
@@ -665,6 +670,7 @@ def merged_functions(root: Path, originals: dict) -> list[str]:
             if isinstance(n, ast.ImportFrom) and n.module and n.level == 0:
                 for a in n.names:
                     imports[a.asname or a.name] = (n.module, a.name)
+        own_mod = rel[:-3].replace("/", ".").removesuffix(".__init__")
         for name, old_fn in old_d.items():
             new_fn = new_d.get(name)
             if new_fn is not None and ast.dump(old_fn) == ast.dump(new_fn):
@@ -674,20 +680,35 @@ def merged_functions(root: Path, originals: dict) -> list[str]:
                 continue
             if target not in imports:  # делегирование функции из этого же файла
                 tgt = new_d.get(target)
-                where, tgt_text = rel, text
+                where, tgt_text, tgt_mod, tgt_name = rel, text, own_mod, target
             else:
-                mod, real = imports[target]
-                f = _module_file(root, mod)
+                tgt_mod, tgt_name = imports[target]
+                f = _module_file(root, tgt_mod)
                 if f is None or f.is_dir():
                     continue
                 tgt_text = f.read_text(encoding="utf-8", errors="replace")
-                tgt = _defs(ast.parse(tgt_text)).get(real)
+                tgt = _defs(ast.parse(tgt_text)).get(tgt_name)
                 where = relpath(root, f)
             if tgt is None or _body_key_eq(old_fn, tgt):
                 continue
-            out.append(f"{rel}: {name} заменена на {target} из {where}.\nБыло:\n{_src(before, old_fn)}\n"
-                       f"Стало ({target}):\n{_src(tgt_text, tgt)}"
-                       + (f"\nВызов в {rel}:\n{_src(text, new_fn)}" if new_fn is not None else ""))
+            static = any(getattr(d, "id", "") == "staticmethod" for d in old_fn.decorator_list)
+            out.append({
+                "text": f"{rel}: {name} заменена на {target} из {where}.\nБыло:\n{_src(before, old_fn)}\n"
+                        f"Стало ({target}):\n{_src(tgt_text, tgt)}"
+                        + (f"\nВызов в {rel}:\n{_src(text, new_fn)}" if new_fn is not None else ""),
+                "name": name, "old_src": ast.get_source_segment(before, old_fn) or "",
+                # импорты старого файла: старой версии нужны её имена (ZoneInfo, константы настроек)
+                "old_imports": [ast.unparse(n) for n in old_t.body
+                                if isinstance(n, (ast.Import, ast.ImportFrom)) and not getattr(n, "level", 0)],
+                # старую версию исполняем в пространстве имён модуля, где функция теперь «живёт»
+                "ns_module": tgt_mod if new_fn is None else own_mod,
+                # новая версия: обёртка в своём модуле или сама общая функция
+                "new_module": own_mod if new_fn is not None else tgt_mod,
+                "new_name": name if new_fn is not None else tgt_name,
+                # вызовы перехватываем там, где их делает код (у точек входа — нет: побочные эффекты)
+                "patch_module": None if _NO_IMPORT.search(rel) else own_mod,
+                "plain": "." not in name or static,
+            })
     return out[:6]
 
 
