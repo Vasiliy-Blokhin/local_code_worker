@@ -62,6 +62,9 @@
           <option value="medium">Рассуждения: средне</option>
           <option value="high">Рассуждения: глубоко</option>
         </select>
+        <label class="chk small" title="Новая сессия работает в отдельном git worktree на своей ветке: рабочая копия проекта (и запущенные из неё сервисы) не меняется, пока вы не перенесёте изменения">
+          <input type="checkbox" id="worktreeChk"> изолированно (git worktree)</label>
+        <span id="wtPill" class="pill hidden" title="Сессия работает в изолированной копии"></span>
         <span class="spacer"></span>
         <span id="runState" class="muted small"></span>
         <button class="btn primary" id="sendBtn">Отправить</button>

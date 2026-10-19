@@ -134,6 +134,13 @@ def _session_originals(s: Session) -> dict:
     return out
 
 
+def session_root(s: Session) -> Path:
+    """Папка, в которой работает сессия: изолированный worktree или сам проект."""
+    if s.worktree:
+        return Path(s.worktree["path"])
+    return Path(get_project(s.project_id)["path"])
+
+
 def expand_mentions(root: Path, text: str, s: Session) -> str:
     """@путь/к/файлу в сообщении → содержимое файла прикладывается сразу (экономит шаг read)."""
     files = []
@@ -162,8 +169,7 @@ class Agent:
         s.running = True
         s.push_meta()
         try:
-            proj = get_project(s.project_id)
-            root = Path(proj["path"])
+            root = session_root(s)
             if text.strip() == "/compact":
                 await self.compact(s, manual=True)
                 return
@@ -668,8 +674,7 @@ def rewind(s: Session, turn: int) -> list[str]:
         raise RuntimeError("Сессия выполняется — сначала остановите.")
     if turn <= s.rewind_floor:
         raise RuntimeError("Этот ход был до сжатия контекста — откат недоступен.")
-    proj = get_project(s.project_id)
-    root = Path(proj["path"])
+    root = session_root(s)
     restored = []
     for cp in sorted((c for c in s.checkpoints if c["turn"] >= turn), key=lambda c: -c["turn"]):
         for rel, text in cp["files"].items():
@@ -696,8 +701,7 @@ def rewind(s: Session, turn: int) -> list[str]:
 def session_changes(s: Session) -> list[dict]:
     """Итоговые диффы всех файлов, изменённых агентом в сессии (оригинал → сейчас)."""
     import difflib
-    proj = get_project(s.project_id)
-    root = Path(proj["path"])
+    root = session_root(s)
     originals = _session_originals(s)
     out = []
     for rel, before in sorted(originals.items()):

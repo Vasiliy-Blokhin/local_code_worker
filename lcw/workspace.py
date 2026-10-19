@@ -102,7 +102,14 @@ def relpath(root: str | Path, p: Path) -> str:
 def find_venv(root: str | Path) -> Path | None:
     """Виртуальное окружение проекта: в самом проекте или в родительской папке (монорепо)."""
     root = Path(root).resolve()
-    for base in (root, root.parent):
+    bases = [root, root.parent]
+    dotgit = root / ".git"
+    if dotgit.is_file():  # git worktree: venv лежит у основного репозитория
+        line = dotgit.read_text(encoding="utf-8", errors="replace").strip()
+        if line.startswith("gitdir:"):
+            main = Path(line[7:].strip()).resolve().parents[2]  # <main>/.git/worktrees/<name>
+            bases += [main, main.parent]
+    for base in bases:
         for name in (".venv", "venv", "env"):
             d = base / name
             if (d / "Scripts" / "python.exe").is_file() or (d / "bin" / "python").is_file():
