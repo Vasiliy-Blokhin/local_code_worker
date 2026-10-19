@@ -42,6 +42,10 @@ TOOL_FORMAT_HINT = ("[Система] Предыдущий вызов инстр
 # модель просит уточнений вместо работы
 ASKS = re.compile(r"уточни|уточнит|нужн\w* (уточнен|решени|информац)|clarif|could you|please (provide|specify)",
                   re.IGNORECASE)
+# запасной вариант решения, выключающий функциональность при отсутствии данных
+DISABLING = re.compile(r"не генерир|не созда|не (будут|будет) (генерир|создав|работ|участв)|ничего не|"
+                       r"пуст\w* (список|множеств|результат)|отключ|сигнал\w* нет|не выдава|"
+                       r"no signals|nothing|disabled?|empty (set|list)", re.IGNORECASE)
 # в ответе на сверку есть несделанные пункты
 UNDONE = re.compile(r"не\s+сделан|не\s+выполнен|частично|not\s+done|partial", re.IGNORECASE)
 # до плана разрешены проверки, которые ничего не меняют в коде: тесты, компиляция, импорт
@@ -432,6 +436,11 @@ class Agent:
                           "при необходимости), не на намерения. Если что-то не сделано и выполнимо — составь "
                           "plan и доделай; иначе честно перечисли несделанное в итоговом ответе.")})
                     continue
+                if s.decisions and reviewed:
+                    # проектные решения — на проверку человеку, даже если модель забыла их перечислить
+                    s.add({"type": "notice", "level": "warn", "text": "Проектные решения агента — проверьте:\n"
+                           + "\n".join(f"Пункт {int(k) + 1}: {v['decision']}\n  опирается на: {', '.join(v['uses'])}"
+                                       f"\n  если данных нет: {v['fallback']}" for k, v in sorted(s.decisions.items()))})
                 return
             for n, tc in enumerate(comp.tool_calls):
                 call_id = tc["id"] or f"call_{uuid.uuid4().hex[:8]}"
@@ -650,6 +659,14 @@ class Agent:
                      for n, sim in missing.items()]
             return ToolResult("Ошибка: решение опирается на несуществующие сущности:\n" + "\n".join(lines)
                               + "\nНайди реальные через symbols/grep и пришли decide заново.", ok=False)
+        if DISABLING.search(fallback) and not st.get("fallback_warned"):
+            # «нет данных — ничего не делаем» молча выключает работающую функцию (сигналы, отчёты)
+            st["fallback_warned"] = True
+            return ToolResult(
+                f"Внимание: fallback «{fallback}» выключает работающую функциональность, когда данных нет "
+                "(например, пустая таблица на свежей установке или в тестах). Обычно нужно сохранить прежнее "
+                "поведение. Пришли decide снова: либо с fallback «прежнее поведение», либо с этим же fallback, "
+                "если такое изменение прямо требуется задачей.", ok=False)
         s.decisions[str(s.focus)] = {"decision": decision, "uses": uses, "fallback": fallback}
         s.add({"type": "notice", "level": "info",
                "text": f"Решение по пункту {s.focus + 1}: {decision}\nОпирается на: {', '.join(uses)}\n"

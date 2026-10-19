@@ -54,6 +54,22 @@ def test_decide_gate_and_unknown_names(project):
     assert "Зафиксированные решения" in review and "менять функцию hello" in review
 
 
+def test_disabling_fallback_warned_once_and_decisions_shown(project):
+    task = "Сделай:\n1. в работу — только эффективные алгоритмы\n2. добавь функцию bye в app.py\n"
+    bad = tool_call_chunks("decide", {"decision": "фильтровать сигналы функции hello по метрике",
+                                      "uses": ["hello"], "fallback": "если данных нет — сигналы не генерируются"}, "d0")
+    model, agent, s = make(project, [
+        bad, decide("d1"), plan_chunks("правка", "проверка", status="done"),
+        tool_call_chunks("edit", {"path": "app.py", "old": "'hi'", "new": "'hey'"}, "c1"),
+        text_chunks("Пункт 1 готов"), text_chunks("Пункт 2 нет"), text_chunks("1. сделано. 2. сделано."),
+    ])
+    asyncio.run(agent.run_turn(s, task))
+    res = [m["content"] for m in s.messages if m["role"] == "tool"]
+    assert "выключает работающую функциональность" in res[0] and "принято" in res[1]
+    last = [it["text"] for it in s.items if it["type"] == "notice"][-1]
+    assert last.startswith("Проектные решения агента — проверьте") and "менять функцию hello" in last
+
+
 def test_undone_after_review_is_pushed_once(project):
     model, agent, s = make(project, [
         decide("d1"), plan_chunks("правка", "проверка", status="done"),
