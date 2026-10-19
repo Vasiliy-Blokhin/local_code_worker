@@ -43,6 +43,8 @@ TOOL_FORMAT_HINT = ("[Система] Предыдущий вызов инстр
 # модель просит уточнений вместо работы
 ASKS = re.compile(r"уточни|уточнит|нужн\w* (уточнен|решени|информац)|clarif|could you|please (provide|specify)",
                   re.IGNORECASE)
+# имя-настройка в сообщении о пропавших зависимостях («…: REVERSE_ENABLED использовался…»)
+SETTING = re.compile(r": [A-Z][A-Z0-9]*_[A-Z0-9_]+ использовался")
 # запасной вариант решения, выключающий функциональность при отсутствии данных
 DISABLING = re.compile(r"не генерир|не созда|не (будут|будет) (генерир|создав|работ|участв)|ничего не|"
                        r"пуст\w* (список|множеств|результат)|отключ|сигнал\w* нет|не выдава|"
@@ -309,9 +311,12 @@ class Agent:
                           "добавлен (шаги — в plan), или убери импорт. Не пиши, что сделал то, чего нет в коде.")})
                     continue
                 # пропавшие зависимости: настройка/флаг/функция больше не используется — поведение пропало?
-                dropped = [d for d in await asyncio.to_thread(dropped_dependencies, ctx.root, originals)
-                           if d not in dropped_seen]
-                if dropped and dep_nudges < 2:
+                all_dropped = await asyncio.to_thread(dropped_dependencies, ctx.root, originals)
+                # настройки (UPPER_CASE) напоминаем, пока не вернутся: отключить настройку пользователя
+                # модель не вправе; прочие имена — один раз, с возможностью объяснить
+                settings_lost = [d for d in all_dropped if SETTING.search(d)]
+                dropped = settings_lost + [d for d in all_dropped if d not in dropped_seen and d not in settings_lost]
+                if dropped and dep_nudges < 3:
                     dep_nudges += 1
                     dropped_seen.update(dropped)
                     s.add({"type": "notice", "level": "warn",
@@ -319,9 +324,12 @@ class Agent:
                     s.messages.append({"role": "user", "content": (
                         "Автопроверка: после правок перестали использоваться имена, от которых раньше "
                         "зависело поведение:\n" + "\n".join(dropped) + "\nПроверь, не пропало ли поведение "
-                        "(например, настройка или флаг больше не учитывается, вызов выпал). Если пропало — "
-                        "верни его (новая логика должна учитывать и прежнее условие); если имя действительно "
-                        "больше не нужно — убери его импорт и коротко объясни в итоге, почему.")})
+                        "(флаг больше не учитывается, вызов выпал). Если пропало — верни его: новая логика должна "
+                        "учитывать и прежнее условие. "
+                        + ("Имена в ВЕРХНЕМ РЕГИСТРЕ — настройки пользователя (.env/settings): их НЕЛЬЗЯ просто "
+                           "убрать, они должны продолжать действовать (например, `FLAG and новое_условие`). "
+                           if settings_lost else "")
+                        + "Прочие имена, если действительно больше не нужны, — убери импорт и объясни в итоге.")})
                     continue
                 # пустые методы «для галочки» (return [] / pass) вместо реализации
                 stubs = await asyncio.to_thread(new_stubs, ctx.root, originals)
