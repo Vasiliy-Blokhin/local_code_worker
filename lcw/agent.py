@@ -122,6 +122,15 @@ def requirements(text: str) -> list[str]:
     return [m.group(1).strip()[:300] for m in _REQ.finditer(text.split("\n\n<file ")[0])][:12]
 
 
+_FACT = re.compile(r"\d{4}-\d{2}-\d{2}[T ]\d{2}(?::\d{2})?|\d{1,3}(?:\.\d{1,3}){3}|\d{2}:\d{2}|\d{3,}")
+
+
+def grounded(cause: str, seen: str) -> bool:
+    """В причине есть факт (дата-время, адрес, число от 3 цифр), который встречался в собранных логах/выводе."""
+    seen_norm = seen.replace("T", " ")
+    return any(f.replace("T", " ") in seen_norm for f in _FACT.findall(cause))
+
+
 def evidence_hint(root: Path) -> str:
     """Где искать факты: логи в проекте и документы, где сказано, как добраться до логов на сервере."""
     root = Path(root)
@@ -730,6 +739,7 @@ class Agent:
                           or name == "run" and EVIDENCE_CMD.search(args.get("command", ""))
                           or name in ("read", "grep") and EVIDENCE_PATH.search(str(args.get("path", "")))):
             st["evidence"] = st.get("evidence", 0) + 1
+            st["evidence_text"] = (st.get("evidence_text", "") + "\n" + result.output)[-200_000:]
             if name != "read" and name != "grep" or re.search(r"(^|/)logs?/|\.log$", str(args.get("path", ""))):
                 st["log_evidence"] = st.get("log_evidence", 0) + 1
         if name in MUTATING and result.ok:
@@ -769,6 +779,10 @@ class Agent:
             elif len(cause) < 30 or not re.search(r"\d", cause):
                 why = ("cause должна называть причину с фактами: время сбоев, числа из логов, файл:строка "
                        "кода, который к этому приводит")
+            elif not grounded(cause, st.get("evidence_text", "")):
+                why = ("в cause нет ни одного факта из того, что ты видел в логах и выводе команд (время, число, "
+                       "адрес): это догадка. Найди в логах подтверждение (logstats match=/by=/bucket=) и процитируй "
+                       "числа оттуда — или опровержение и другую причину")
             if why:
                 st["cause_rejects"] = st.get("cause_rejects", 0) + 1
                 return ToolResult(f"Ошибка: пункт {s.focus + 1} — расследование, решение без найденной причины "

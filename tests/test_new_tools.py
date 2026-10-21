@@ -86,3 +86,10 @@ def test_untested_changes(tmp_path):
     assert untested_changes(tmp_path, {"app/g.py": "X = 1\n"}) == ["app/g.py (тесты: tests/test_g.py)"]
     assert untested_changes(tmp_path, {"app/g.py": "X = 1\n", "tests/test_g.py": ""}) == []
     assert untested_changes(tmp_path, {"app/g.py": "X = 2\n"}) == []  # не изменился
+
+
+def test_cause_must_quote_seen_facts():
+    from lcw.agent import grounded
+    seen = "пики по hour: 2026-10-18 08 ×118\nпо ip: 79.124.58.82 ×1380"
+    assert grounded("сайт закрыт 2026-10-18 08: один IP 79.124.58.82 дал 1380 запросов", seen)
+    assert not grounded("внутренние запросы 127.0.0.1 и 192.168.0.1 вызывают закрытие", seen)
