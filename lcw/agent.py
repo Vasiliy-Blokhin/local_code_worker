@@ -49,6 +49,15 @@ SETTING = re.compile(r": [A-Z][A-Z0-9]*_[A-Z0-9_]+ использовался")
 DISABLING = re.compile(r"не генерир|не созда|не (будут|будет) (генерир|создав|работ|участв)|ничего не|"
                        r"пуст\w* (список|множеств|результат)|отключ|сигнал\w* нет|не выдава|"
                        r"no signals|nothing|disabled?|empty (set|list)", re.IGNORECASE)
+# пункт-расследование: причину надо найти по фактам, а не угадать
+INVESTIGATE = re.compile(r"причин|проблем|почему|периодическ|отключ|пада[ею]т|лома[ею]т|сбо[ий]|не работа|"
+                         r"изуч|исследу|проанализ|investigat|root cause|\bwhy\b|outage|crash|analy[sz]",
+                         re.IGNORECASE)
+# вызовы, которые собирают факты: логи, конфиги, документы о развёртывании
+EVIDENCE_CMD = re.compile(r"\b(ssh|scp|journalctl|tail|zcat|Get-Content|Select-String|grep|wc)\b|/var/log",
+                          re.IGNORECASE)
+EVIDENCE_PATH = re.compile(r"(^|/)(logs?|deploy|nginx|docs|etc)/|\.(log|conf|inc|service|md|ya?ml)$",
+                           re.IGNORECASE)
 # в ответе на сверку есть несделанные пункты
 UNDONE = re.compile(r"не\s+сделан|не\s+выполнен|частично|not\s+done|partial", re.IGNORECASE)
 # до плана разрешены проверки, которые ничего не меняют в коде: тесты, компиляция, импорт
@@ -113,6 +122,38 @@ def requirements(text: str) -> list[str]:
     return [m.group(1).strip()[:300] for m in _REQ.finditer(text.split("\n\n<file ")[0])][:12]
 
 
+def evidence_hint(root: Path) -> str:
+    """Где искать факты: логи в проекте и документы, где сказано, как добраться до логов на сервере."""
+    root = Path(root)
+    logs = []
+    for d in ("logs", "log"):
+        if (root / d).is_dir():
+            files = [q for q in (root / d).rglob("*") if q.is_file()]
+            if files:
+                logs.append(f"{d}/ ({len(files)} файлов: " + ", ".join(q.name for q in files[:6])
+                            + ("…" if len(files) > 6 else "") + ")")
+    docs = []
+    for q in sorted(list(root.glob("*.md")) + list(root.glob("docs/**/*.md")) + list(root.glob("deploy/**/*"))):
+        if not q.is_file() or q.stat().st_size > 500_000:
+            continue
+        try:
+            text = q.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        hits = [n for n, line in enumerate(text.splitlines(), 1)
+                if re.search(r"journalctl|/var/log|access\.log|ssh -i", line)]
+        if hits:
+            docs.append(f"{q.relative_to(root).as_posix()} (строки {', '.join(map(str, hits[:5]))})")
+    out = ("\nЭто расследование: сначала найди причину по фактам, потом правь. `logstats` даёт сводку лога "
+           "(пики по времени, топ адресов/статусов/сообщений); сравни время сбоев с тем, что делает код. "
+           "В decide укажи cause — причину с фактами.")
+    if logs:
+        out += "\nЛоги в проекте: " + "; ".join(logs)
+    if docs:
+        out += "\nГде описаны логи/сервер (команды — только чтение): " + "; ".join(docs[:6])
+    return out
+
+
 def focus_message(root: Path, reqs: list[str], k: int, first: bool = False) -> str:
     """
     Задание на один пункт многопунктного запроса + связанный код из индекса сущностей.
@@ -129,6 +170,7 @@ def focus_message(root: Path, reqs: list[str], k: int, first: bool = False) -> s
             "проверкой. Не подменяй работу пустыми методами, заглушками и новыми неиспользуемыми файлами."
             + ("\nКандидаты на объединение (найдены автоматически; сравни реализации через read, объединяй "
                "только действительно одинаковое, вызовы обнови через grep):\n" + "\n".join(dups) if dups else "")
+            + (evidence_hint(root) if INVESTIGATE.search(reqs[k]) else "")
             + ("\nСвязанный код (имена и докстринги из индекса):\n" + "\n".join(rel) if rel else ""))
 
 
@@ -659,6 +701,10 @@ class Agent:
                 s.settings.setdefault("always", []).append(name)
             s.set(i, status="running")
         result = await execute(ctx, name, args)
+        if result.ok and (name == "logstats"
+                          or name == "run" and EVIDENCE_CMD.search(args.get("command", ""))
+                          or name in ("read", "grep") and EVIDENCE_PATH.search(str(args.get("path", "")))):
+            st["evidence"] = st.get("evidence", 0) + 1
         if name in MUTATING and result.ok:
             st["edits"] = st.get("edits", 0) + 1
         if st["planned"] and (name in MUTATING or name == "run"):
@@ -679,6 +725,21 @@ class Agent:
         if len(decision) < 20 or not uses or not fallback:
             return ToolResult("Ошибка: нужны decision (конкретное правило, не общие слова), uses (непустой "
                               "список существующих сущностей) и fallback.", ok=False)
+        reqs = st.get("reqs") or []
+        item = reqs[s.focus] if 0 <= s.focus < len(reqs) else ""
+        cause = str(args.get("cause", "")).strip()
+        if INVESTIGATE.search(item) and st.get("cause_rejects", 0) < 2:
+            why = ""
+            if not st.get("evidence"):
+                why = ("ты ещё не смотрел факты: логи (logstats), конфиги, документы о развёртывании (где логи "
+                       "сервера и как их прочитать)")
+            elif len(cause) < 30 or not re.search(r"\d", cause):
+                why = ("cause должна называть причину с фактами: время сбоев, числа из логов, файл:строка "
+                       "кода, который к этому приводит")
+            if why:
+                st["cause_rejects"] = st.get("cause_rejects", 0) + 1
+                return ToolResult(f"Ошибка: пункт {s.focus + 1} — расследование, решение без найденной причины "
+                                  f"не принимается: {why}. Затем decide с полем cause.", ok=False)
         missing = entities.check_names(ctx.root, uses)
         if missing:
             lines = [f"- {n}: нет в проекте" + (f" (похожие: {', '.join(sim)})" if sim else "")
@@ -693,9 +754,10 @@ class Agent:
                 "(например, пустая таблица на свежей установке или в тестах). Обычно нужно сохранить прежнее "
                 "поведение. Пришли decide снова: либо с fallback «прежнее поведение», либо с этим же fallback, "
                 "если такое изменение прямо требуется задачей.", ok=False)
-        s.decisions[str(s.focus)] = {"decision": decision, "uses": uses, "fallback": fallback}
+        s.decisions[str(s.focus)] = {"decision": decision, "uses": uses, "fallback": fallback, "cause": cause}
         s.add({"type": "notice", "level": "info",
-               "text": f"Решение по пункту {s.focus + 1}: {decision}\nОпирается на: {', '.join(uses)}\n"
+               "text": (f"Причина: {cause}\n" if cause else "")
+                       + f"Решение по пункту {s.focus + 1}: {decision}\nОпирается на: {', '.join(uses)}\n"
                        f"Если данных нет: {fallback}"})
         return ToolResult(f"Решение по пункту {s.focus + 1} принято. Теперь plan и правки по нему.")
 

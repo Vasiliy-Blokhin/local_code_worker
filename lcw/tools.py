@@ -61,7 +61,9 @@ TOOLS = [
         {"decision": {**S, "description": "concrete rule: criterion/metric/threshold or structure, where it plugs in"},
          "uses": {"type": "array", "items": S,
                   "description": "existing functions/classes/settings it relies on (real names from the code)"},
-         "fallback": {**S, "description": "behaviour when data is missing or the check cannot run"}},
+         "fallback": {**S, "description": "behaviour when data is missing or the check cannot run"},
+         "cause": {**S, "description": "for 'find why / fix the problem' items: the cause you found, with "
+                                       "evidence (log times, counts, file:line)"}},
         ["decision", "uses", "fallback"]),
     _fn("symbols", "Project entity index (classes/functions with line ranges and docstrings). "
                    "path=file: its outline; query: search names+docstrings (words, `|` = or) in path; "

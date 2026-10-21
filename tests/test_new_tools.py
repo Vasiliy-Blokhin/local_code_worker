@@ -63,3 +63,15 @@ def test_logstats_json_and_text(tmp_path):
     assert out.startswith("6 строк") and "1.1.1.1 ×6" in out and "2026-10-18 08:20 ×2" in out
     out = t_logstats(_ctx(tmp_path), "logs", match="ERROR", by="message").output
     assert "2 строк" in out and "×2" in out  # числа нормализованы — одно сообщение
+
+
+def test_evidence_hint_points_to_logs_and_server_docs(tmp_path):
+    from lcw.agent import INVESTIGATE, evidence_hint
+    (tmp_path / "logs").mkdir()
+    (tmp_path / "logs" / "site.log").write_text("x\n", encoding="utf-8")
+    (tmp_path / "docs").mkdir()
+    (tmp_path / "docs" / "vm.md").write_text("intro\n`sudo journalctl -u guard`\n", encoding="utf-8")
+    hint = evidence_hint(tmp_path)
+    assert "logs/ (1 файлов: site.log)" in hint and "docs/vm.md (строки 2)" in hint
+    assert INVESTIGATE.search("найти причину периодического отключения сайта")
+    assert not INVESTIGATE.search("добавить кнопку экспорта")
