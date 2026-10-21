@@ -21,7 +21,7 @@ import sys
 import tempfile
 from pathlib import Path
 
-from .workspace import find_venv, venv_bin
+from .workspace import find_venv, pytest_env, venv_bin
 
 _PROBE = r'''
 import copy, datetime as _dt, importlib, inspect, json, sys, textwrap
@@ -146,7 +146,7 @@ def check_merges(root: Path, merges: list[dict], timeout: int = 600) -> list[dic
         try:
             p = subprocess.run([py, str(probe), str(cfg), str(root)], cwd=str(root), capture_output=True,
                                text=True, encoding="utf-8", errors="replace", timeout=timeout,
-                               env={**os.environ, "PYTHONIOENCODING": "utf-8", "CI": "1"})
+                               env=pytest_env({**os.environ, "PYTHONIOENCODING": "utf-8", "CI": "1"}))
         except (OSError, subprocess.TimeoutExpired):
             return []
     line = next((l for l in p.stdout.splitlines()[::-1] if l.startswith("@@LCW@@")), "")

@@ -19,7 +19,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import config, entities
-from .workspace import WorkspaceError, find_venv, is_text_file, list_files, relpath, resolve, venv_bin
+from .workspace import WorkspaceError, find_venv, is_text_file, list_files, pytest_env, relpath, resolve, venv_bin
 
 READ_LIMIT = 400        # строк по умолчанию
 LINE_CHARS = 400        # обрезка длинных строк при чтении
@@ -78,6 +78,23 @@ TOOLS = [
         {"pattern": S, "path": {**S, "description": "file or subdir"},
          "glob": {**S, "description": "file filter, e.g. *.py"},
          "ignore_case": {"type": "boolean"}}, ["pattern"]),
+    _fn("refs", "All references of a name (whole word): definition, imports, uses, each with the enclosing "
+                "function; for snake_case settings also NAME_UPPER (.env). Use before renaming or changing "
+                "a function/setting to find every place to update.",
+        {"name": {**S, "description": "identifier, e.g. guard_ip_limit or Guard.analyze"},
+         "path": {**S, "description": "file or subdir"}}, ["name"]),
+    _fn("test", "Run the project's pytest (project venv) and get a SHORT report: each failure's test, "
+                "location and `E` lines. path = test file/dir, or a source module to run the tests that "
+                "import it; keyword = -k filter. Use it to verify each step.",
+        {"path": S, "keyword": S, "timeout": {**I, "description": "seconds"}}, []),
+    _fn("logstats", "Summarize a log file or folder instead of reading it: line count, time range, top values, "
+                    "peaks over time. Works with JSON lines (nginx) and text logs. Use it to find evidence "
+                    "of a problem (errors, attacks, outages) before changing code.",
+        {"path": {**S, "description": "log file or folder (e.g. logs)"},
+         "match": {**S, "description": "regex filter of lines, e.g. ERROR|503"},
+         "by": {**S, "description": "JSON field (status, ip, uri…) or level | message: top values"},
+         "bucket": {"type": "string", "enum": ["minute", "hour", "day"], "description": "histogram over time"},
+         "show": {**I, "description": "also show the last N matching lines (<=30)"}}, ["path"]),
     _fn("edit", "Replace an exact unique snippet in a file. `old` must match the file "
                 "exactly (copy from read output without line numbers, keep trailing \\ etc.); "
                 "include enough lines to be unique. Plain text, NOT patch/diff format. "
@@ -300,6 +317,305 @@ def t_grep(ctx: ToolContext, pattern: str, path: str = "", glob: str = "",
                     out.append(f"…лимит {GREP_MAX} совпадений, уточните запрос")
                     return ToolResult("\n".join(out))
     return ToolResult("\n".join(out) if out else "Нет совпадений.")
+
+
+
+REFS_MAX = 80
+_IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _enclosing(root: Path, rel: str, line: int) -> str:
+    """Самая вложенная сущность (функция/метод/класс), в которую попадает строка; '' — уровень модуля."""
+    if not entities.supported(rel):
+        return ""
+    best = None
+    for e in entities.file_entities(root, rel)[1]:
+        if e.line <= line <= e.end and (best is None or e.end - e.line < best.end - best.line):
+            best = e
+    return best.name if best else ""
+
+
+def _scope_files(root: Path, path: str) -> list[str]:
+    target = resolve(root, path or ".")
+    if target.is_file():
+        return [relpath(root, target)]
+    base = relpath(root, target)
+    base = "" if base == "." else base + "/"
+    return [f for f in list_files(root) if f.startswith(base)]
+
+
+def t_refs(ctx: ToolContext, name: str, path: str = "") -> ToolResult:
+    """
+    Все упоминания имени (целым словом) с охватывающей функцией: где определено, где импортируется,
+    где используется. Для snake_case-настроек ищется и ИМЯ_В_ВЕРХНЕМ_РЕГИСТРЕ (.env, документация).
+    """
+    name = name.strip().rsplit(".", 1)[-1]  # settings.guard_ip_limit -> guard_ip_limit
+    if not _IDENT.match(name):
+        return ToolResult("Ошибка: name — один идентификатор (функция, класс, переменная, настройка).", ok=False)
+    variants = {name}
+    if name.lower() == name and "_" in name:
+        variants.add(name.upper())
+    rx = re.compile(r"(?<![A-Za-z0-9_])(?:" + "|".join(map(re.escape, sorted(variants))) + r")(?![A-Za-z0-9_])")
+    defn = re.compile(r"^\s*(?:async\s+def|def|class)\s+" + re.escape(name) + r"\b|^\s*" + re.escape(name)
+                      + r"\s*(?::[^=]*)?=(?!=)")
+    groups: dict[str, list[str]] = {}
+    n = 0
+    for f in _scope_files(ctx.root, path):
+        p = ctx.root / f
+        if not is_text_file(p) or p.stat().st_size > 2_000_000:
+            continue
+        try:
+            text = p.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for i, line in enumerate(text.splitlines(), 1):
+            if not rx.search(line):
+                continue
+            kind = ("def" if defn.match(line) else
+                    "import" if re.match(r"\s*(from\s+\S+\s+)?import\b", line) else "use")
+            where = _enclosing(ctx.root, f, i)
+            groups.setdefault(f, []).append(f"  {i} [{kind}{' in ' + where if where else ''}] {line.strip()[:160]}")
+            n += 1
+            if n >= REFS_MAX:
+                break
+        if n >= REFS_MAX:
+            break
+    if not groups:
+        return ToolResult(f"«{name}» нигде не упоминается" + (f" в {path}" if path else "") + ".")
+    tests = [f for f in groups if re.search(r"(^|/)(tests?/|test_)", f)]
+    head = (f"{n} упоминаний «{'/'.join(sorted(variants))}» в {len(groups)} файлах"
+            + (f" (лимит {REFS_MAX}, уточните path)" if n >= REFS_MAX else "")
+            + (f"; тесты: {', '.join(tests)}" if tests else "; в тестах не упоминается") + ":")
+    return ToolResult(head + "\n" + "\n".join(f"{f}\n" + "\n".join(lines) for f, lines in groups.items()))
+
+
+def _pytest_python(root: Path) -> str:
+    venv = find_venv(root)
+    if not venv:
+        return sys.executable
+    exe = venv_bin(venv) / ("python.exe" if (venv_bin(venv) / "python.exe").is_file() else "python")
+    return str(exe)
+
+
+def _is_test_file(rel: str) -> bool:
+    name = rel.rsplit("/", 1)[-1]
+    return rel.endswith(".py") and (name.startswith("test_") or name.endswith("_test.py"))
+
+
+def covering_tests(root: Path, rel: str) -> list[str]:
+    """Тестовые файлы, которые импортируют модуль rel (app/guard/watch.py -> app.guard.watch)."""
+    if not rel.endswith(".py"):
+        return []
+    mod = rel[:-3].replace("/", ".")
+    if mod.endswith(".__init__"):
+        mod = mod[: -len(".__init__")]
+    last = mod.rsplit(".", 1)[-1]
+    parent = mod.rsplit(".", 1)[0] if "." in mod else ""
+    pats = [re.compile(r"\b(from|import)\s+" + re.escape(mod) + r"\b")]
+    if parent:
+        pats.append(re.compile(r"\bfrom\s+" + re.escape(parent) + r"\s+import\s+[^\n]*\b" + re.escape(last) + r"\b"))
+    out = []
+    for f in list_files(root):
+        if not _is_test_file(f):
+            continue
+        try:
+            text = (root / f).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        if any(p.search(text) for p in pats):
+            out.append(f)
+    return out
+
+
+_FAIL_HEAD = re.compile(r"^_{3,} (.+?) _{3,}$")
+_TB_PLACE = re.compile(r"^[\w./\\:-]+\.py:\d+:")
+
+
+def condense_pytest(out: str, max_fail: int = 6) -> str:
+    """
+    Вывод pytest -> коротко: по каждому падению — имя теста, место (файл:строка) и строки `E`,
+    затем итоговая строка. Полные трейсбеки маленькой модели только мешают.
+    """
+    lines = out.splitlines()
+    summary = next((l.strip("= ").strip() for l in reversed(lines)
+                    if re.search(r"\b(passed|failed|errors?|no tests ran)\b", l)), "")
+    fails, cur = [], None
+    for l in lines:
+        st = l.strip()
+        m = _FAIL_HEAD.match(st)
+        if m:
+            cur = {"name": m.group(1), "where": "", "e": []}
+            fails.append(cur)
+            continue
+        if l.startswith("="):
+            cur = None  # секция кончилась (short test summary, warnings…)
+            continue
+        if cur is None:
+            continue
+        if _TB_PLACE.match(st):
+            cur["where"] = st[:200]  # последнее место в трейсбеке — ближе всего к причине
+        elif l.startswith("E ") and len(cur["e"]) < 10:
+            cur["e"].append(l[:220])
+    if not fails:
+        errs = [l for l in lines if l.startswith(("E ", "ERROR", "ImportError", "ModuleNotFoundError"))][:15]
+        return "\n".join(errs + [summary or "\n".join(lines[-15:])])
+    parts = [f"✗ {f['name']}" + (f"\n  at {f['where']}" if f["where"] else "")
+             + ("\n" + "\n".join(f["e"]) if f["e"] else "") for f in fails[:max_fail]]
+    if len(fails) > max_fail:
+        parts.append(f"…ещё {len(fails) - max_fail} падений")
+    return "\n".join(parts + [summary])
+
+
+def t_test(ctx: ToolContext, path: str = "", keyword: str = "", timeout: int | None = None) -> ToolResult:
+    """
+    pytest проекта (через его venv) с кратким отчётом. path — тестовый файл/папка или исходный модуль:
+    для модуля запускаются тесты, которые его импортируют. keyword — фильтр -k.
+    """
+    root = ctx.root
+    args: list[str] = []
+    note = ""
+    if path:
+        target = resolve(root, path)
+        rel = relpath(root, target)
+        if target.is_file() and rel.endswith(".py") and not _is_test_file(rel):
+            found = covering_tests(root, rel)
+            if not found:
+                return ToolResult(f"Ни один тест не импортирует {rel}. Напиши тест (tests/test_<модуль>.py) "
+                                  "или запусти test без path — все тесты.", ok=False)
+            args += found
+            note = f"Тесты, импортирующие {rel}: {', '.join(found)}\n"
+        else:
+            args.append(rel)
+    if keyword:
+        args += ["-k", keyword]
+    timeout = max(10, min(int(timeout or config.COMMAND_TIMEOUT), 1800))
+    cmd = [_pytest_python(root), "-m", "pytest", "-q", "--tb=short", "-p", "no:cacheprovider", *args]
+    try:
+        p = subprocess.run(cmd, cwd=str(root), capture_output=True, text=True, encoding="utf-8",
+                           errors="replace", timeout=timeout,
+                           env=pytest_env({**os.environ, "PYTHONIOENCODING": "utf-8", "CI": "1"}))
+    except subprocess.TimeoutExpired:
+        return ToolResult(f"Тесты не уложились в {timeout} с.", ok=False)
+    except OSError as e:
+        return ToolResult(f"Не удалось запустить pytest: {e}", ok=False)
+    out = (p.stdout + p.stderr).strip()
+    if p.returncode == 5:
+        return ToolResult(note + "Тесты не найдены (" + (" ".join(args) or "весь проект") + ").", ok=False)
+    if "No module named pytest" in out:
+        return ToolResult("pytest не установлен в окружении проекта.", ok=False)
+    return ToolResult(note + _trunc(condense_pytest(out), 4000), ok=p.returncode == 0)
+
+
+_TS = re.compile(r"(\d{4}-\d{2}-\d{2})[T ](\d{2}):(\d{2})")
+_LEVEL = re.compile(r"\b(CRITICAL|ERROR|WARNING|WARN|INFO|DEBUG)\b")
+_NUMS = re.compile(r"\d+(?:[.:]\d+)*")
+
+
+def _log_lines(p: Path, limit: int = 50 * 1024 * 1024) -> list[str]:
+    """Строки лога (и .gz); не больше limit байт с конца файла."""
+    import gzip
+    if p.suffix == ".gz":
+        with gzip.open(p, "rb") as f:
+            data = f.read(limit * 4)
+    else:
+        with p.open("rb") as f:
+            size = p.stat().st_size
+            f.seek(max(0, size - limit))
+            data = f.read()
+    return data.decode("utf-8", "replace").splitlines()
+
+
+def t_logstats(ctx: ToolContext, path: str, match: str = "", by: str = "", bucket: str = "",
+               show: int = 0) -> ToolResult:
+    """
+    Сводка по логу вместо чтения его целиком: строки JSON (nginx log_format json и т.п.) или текст.
+    match — regex-фильтр строк; by — поле JSON (status, ip, uri…) или `level`/`message` для текста:
+    топ значений; bucket — minute|hour|day: гистограмма по времени; show — показать N последних строк.
+    """
+    target = resolve(ctx.root, path)
+    every = ([relpath(ctx.root, q) for q in sorted(target.rglob("*")) if q.is_file()]
+             if target.is_dir() else [])  # логи обычно в .gitignore — list_files их не видит
+    files = [f for f in every
+             if re.search(r"\.(log|jsonl|json|txt|out|err)(\.\d+)?(\.gz)?$", f) or "log" in f.rsplit("/", 1)[-1]]
+    if target.is_file():
+        files = [relpath(ctx.root, target)]
+    if not files:
+        return ToolResult(f"В {path} нет файлов логов.", ok=False)
+    try:
+        rx = re.compile(match, re.IGNORECASE) if match else None
+    except re.error:
+        rx = re.compile(re.escape(match), re.IGNORECASE)
+    rows: list[tuple[str, dict | None]] = []
+    for f in files[:30]:
+        try:
+            lines = _log_lines(ctx.root / f)
+        except OSError:
+            continue
+        for line in lines:
+            if not line.strip() or (rx and not rx.search(line)):
+                continue
+            d = None
+            if line.lstrip().startswith("{"):
+                try:
+                    d = json.loads(line)
+                except ValueError:
+                    d = None
+            rows.append((line, d if isinstance(d, dict) else None))
+    out = [f"{len(rows)} строк" + (f" по «{match}»" if match else "") + f" в {len(files)} файлах"
+           + (f" ({', '.join(files[:5])}{'…' if len(files) > 5 else ''})" if len(files) > 1 else "")]
+    if not rows:
+        return ToolResult(out[0] + ".")
+    times = []
+    for line, d in rows:
+        m = _TS.search(str(d.get("time") or d.get("ts") or d.get("timestamp") or "") if d else line) or _TS.search(line)
+        times.append(m)
+    found = [m for m in times if m]
+    if found:
+        stamps = sorted(f"{m.group(1)} {m.group(2)}:{m.group(3)}" for m in found)
+        out.append(f"время: {stamps[0]} … {stamps[-1]}")
+    keys = {}
+    for _, d in rows:
+        if d:
+            for k in d:
+                keys[k] = keys.get(k, 0) + 1
+    if keys:
+        out.append("поля JSON: " + ", ".join(sorted(keys, key=lambda k: -keys[k])[:20]))
+
+    def top(values, n=12):
+        c: dict[str, int] = {}
+        for v in values:
+            c[v] = c.get(v, 0) + 1
+        items = sorted(c.items(), key=lambda kv: -kv[1])
+        return f"{len(c)} разных: " + ", ".join(f"{k[:80]} ×{v}" for k, v in items[:n])
+
+    if by:
+        if by == "level":
+            vals = [(m.group(1) if (m := _LEVEL.search(line)) else "-") for line, _ in rows]
+        elif by == "message":  # текст без чисел: одинаковые сообщения с разными временем/адресами склеиваются
+            vals = [_NUMS.sub("#", _TS.sub("", line))[:120].strip() for line, _ in rows]
+        else:
+            vals = [str(d.get(by, "-")) if d else "-" for _, d in rows]
+            if all(v == "-" for v in vals):
+                out.append(f"поля «{by}» нет ни в одной строке")
+                vals = []
+        if vals:
+            out.append(f"по {by}: " + top(vals))
+    elif keys:  # без by — самые полезные поля для разбора
+        for k in [k for k in ("status", "ip", "method", "level") if k in keys]:
+            out.append(f"по {k}: " + top([str(d.get(k, "-")) if d else "-" for _, d in rows], 8))
+    else:
+        out.append("по level: " + top([(m.group(1) if (m := _LEVEL.search(line)) else "-") for line, _ in rows], 6))
+    if bucket in ("minute", "hour", "day"):
+        cut = {"minute": 16, "hour": 13, "day": 10}[bucket]
+        c: dict[str, int] = {}
+        for m in found:
+            k = f"{m.group(1)} {m.group(2)}:{m.group(3)}"[:cut]
+            c[k] = c.get(k, 0) + 1
+        peak = sorted(c.items(), key=lambda kv: -kv[1])[:15]
+        out.append(f"пики по {bucket}: " + ", ".join(f"{k} ×{v}" for k, v in sorted(peak)))
+    if show:
+        out.append("последние строки:\n" + "\n".join(line[:300] for line, _ in rows[-min(int(show), 30):]))
+    return ToolResult(_trunc("\n".join(out), 5000))
 
 
 def _find_block(text: str, old: str) -> tuple[int, int] | None:
@@ -912,7 +1228,7 @@ def project_tests(root: Path, timeout: int = 600) -> tuple[bool, str] | None:
     try:
         p = subprocess.run([py, "-m", "pytest", "-q", "-x", "-p", "no:cacheprovider"], cwd=str(root),
                            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout,
-                           env={**os.environ, "PYTHONIOENCODING": "utf-8", "CI": "1"})
+                           env=pytest_env({**os.environ, "PYTHONIOENCODING": "utf-8", "CI": "1"}))
     except (OSError, subprocess.TimeoutExpired):
         return None
     out = (p.stdout + p.stderr).strip()
@@ -1076,6 +1392,8 @@ async def t_run(ctx: ToolContext, command: str, timeout: int | None = None) -> T
     timeout = max(1, min(int(timeout or config.COMMAND_TIMEOUT), 1800))
     env = {**os.environ, "PYTHONIOENCODING": "utf-8", "PYTHONUTF8": "1", "GIT_PAGER": "cat",
            "PAGER": "cat", "GIT_TERMINAL_PROMPT": "0", "CI": "1"}
+    if "pytest" in command:
+        env = pytest_env(env)
     venv = find_venv(ctx.root)
     if venv:  # python/pytest проекта, а не системные
         env["VIRTUAL_ENV"] = str(venv)
@@ -1209,7 +1527,8 @@ def t_git_commit(ctx: ToolContext, **args) -> ToolResult:
     return ToolResult("OK: " + " ".join(steps))
 
 
-SYNC = {"git_commit": t_git_commit, "symbols": t_symbols, "read": t_read, "glob": t_glob, "grep": t_grep, "edit": t_edit, "write": t_write}
+SYNC = {"git_commit": t_git_commit, "symbols": t_symbols, "refs": t_refs, "test": t_test,
+        "logstats": t_logstats, "read": t_read, "glob": t_glob, "grep": t_grep, "edit": t_edit, "write": t_write}
 
 
 async def execute(ctx: ToolContext, name: str, args: dict) -> ToolResult:

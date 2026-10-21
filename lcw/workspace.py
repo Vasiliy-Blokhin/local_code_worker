@@ -6,6 +6,7 @@ import json
 import os
 import re
 import subprocess
+import tempfile
 import uuid
 import zipfile
 from pathlib import Path
@@ -119,6 +120,15 @@ def find_venv(root: str | Path) -> Path | None:
 
 def venv_bin(venv: Path) -> Path:
     return venv / "Scripts" if (venv / "Scripts").is_dir() else venv / "bin"
+
+
+def pytest_env(env: dict) -> dict:
+    """
+    env с отдельным --basetemp для pytest: на Windows общий %TEMP%/pytest-of-<user> ломается
+    (ссылку pytest-current нельзя удалить — WinError 5), и все тесты падают ещё до запуска.
+    """
+    tmp = tempfile.mkdtemp(prefix="lcw-pytest-")
+    return {**env, "PYTEST_ADDOPTS": (env.get("PYTEST_ADDOPTS", "") + f' --basetemp="{tmp}"').strip()}
 
 
 def is_git(root: str | Path) -> bool:
