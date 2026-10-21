@@ -12,7 +12,7 @@ from fastapi import Body, FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
-from . import config, prompts, workspace
+from . import config, entities, prompts, workspace, worktree
 from .agent import Agent, rewind, session_changes
 from .llm import LLM, LLMBusy, LLMError
 from .sessions import store
@@ -147,10 +147,22 @@ async def project_sessions(pid: str):
 @app.post("/api/sessions")
 async def session_create(project_id: str = Body(..., embed=True), settings: dict = Body(None, embed=True)):
     p = workspace.get_project(project_id)
-    tree = await asyncio.to_thread(workspace.tree_summary, p["path"])
-    name, text = workspace.read_instructions(p["path"])
-    system = prompts.build_system(p["path"], tree, text, name)
-    s = store.create(project_id, system, settings)
+    settings = dict(settings or {})
+    isolated = bool(settings.pop("worktree", False))
+    s = store.create(project_id, "", settings)
+    root = p["path"]
+    if isolated:  # своя копия на своей ветке: рабочая копия проекта (и то, что из неё запущено) не трогается
+        try:
+            s.worktree = await asyncio.to_thread(worktree.create, p["path"], s.id)
+        except WorkspaceError:
+            store.delete(s.id)
+            raise
+        root = s.worktree["path"]
+    tree = await asyncio.to_thread(workspace.tree_summary, root)
+    modules = await asyncio.to_thread(entities.module_map, root)
+    name, text = workspace.read_instructions(root)
+    s.system = prompts.build_system(root, tree, text, name, modules)
+    s.save()
     return {"id": s.id}
 
 
@@ -180,8 +192,26 @@ async def session_patch(sid: str, settings: dict = Body(None, embed=True), title
 
 @app.delete("/api/sessions/{sid}")
 async def session_delete(sid: str):
+    s = _session(sid)
+    if s.worktree:
+        await asyncio.to_thread(worktree.remove, workspace.get_project(s.project_id)["path"], s.worktree)
     store.delete(sid)
     return {"ok": True}
+
+
+@app.post("/api/sessions/{sid}/worktree/apply")
+async def session_worktree_apply(sid: str):
+    """Перенести изменения изолированной копии в рабочую копию проекта (без коммита)."""
+    s = _session(sid)
+    if not s.worktree:
+        raise HTTPException(400, "Сессия работает прямо в проекте — переносить нечего.")
+    if s.running:
+        raise HTTPException(409, "Сессия выполняется — сначала остановите.")
+    files = await asyncio.to_thread(worktree.apply, workspace.get_project(s.project_id)["path"], s.worktree)
+    s.add({"type": "notice", "level": "info",
+           "text": f"Изменения перенесены в рабочую копию проекта ({len(files)} файлов): " + ", ".join(files[:20])})
+    s.save()
+    return {"files": files}
 
 
 @app.post("/api/sessions/{sid}/message")

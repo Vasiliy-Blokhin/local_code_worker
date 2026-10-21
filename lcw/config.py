@@ -32,16 +32,24 @@ AIM_PROJECT = os.getenv("LCW_AIM_PROJECT", "local_code_worker")
 CONTEXT = _int("LCW_CONTEXT", 100000)
 REASONING = os.getenv("LCW_REASONING", "low")  # low | medium | high
 MAX_TOKENS = _int("LCW_MAX_TOKENS", 8192)      # лимит одного ответа модели
+# Сэмплирование: по умолчанию llama.cpp берёт temperature 0.8 — для агента это лишний разброс
+# между прогонами (одна и та же задача то решается, то бросается). Пустое значение — не передавать.
+SAMPLING = {k: float(v) for k, v in (("temperature", os.getenv("LCW_TEMPERATURE", "0.4")),
+                                     ("top_p", os.getenv("LCW_TOP_P", "0.95"))) if v.strip()}
 
 DATA_DIR = Path(os.getenv("LCW_DATA_DIR", str(ROOT / "data"))).resolve()
 SESSIONS_DIR = DATA_DIR / "sessions"
 WORKSPACES_DIR = DATA_DIR / "workspaces"
 PROJECTS_FILE = DATA_DIR / "projects.json"
 
-MAX_STEPS = _int("LCW_MAX_STEPS", 50)                # шагов (вызовов модели) на один запрос
+MAX_STEPS = _int("LCW_MAX_STEPS", 120)                # шагов (вызовов модели) на один запрос
 COMMAND_TIMEOUT = _int("LCW_COMMAND_TIMEOUT", 180)   # секунд на команду `run`
 TOOL_OUTPUT_CHARS = _int("LCW_TOOL_OUTPUT_CHARS", 12000)  # обрезка вывода инструментов для модели
 COMPACT_AT = float(os.getenv("LCW_COMPACT_AT", "0.75"))   # доля контекста для авто-сжатия
+# Модель занята/переключена/упала: сколько ждать освобождения GPU и повторять шаг (сек), пауза опроса
+BUSY_WAIT = _int("LCW_BUSY_WAIT", 1800)
+BUSY_POLL = _int("LCW_BUSY_POLL", 10)
+RECOVER_TRIES = _int("LCW_RECOVER_TRIES", 5)  # повторов одного шага после восстановления
 
 for d in (SESSIONS_DIR, WORKSPACES_DIR):
     d.mkdir(parents=True, exist_ok=True)

@@ -109,3 +109,22 @@ def test_edit_ambiguous_lists_lines(project):
     assert not r.ok and "строки 2, 5" in r.output and "replace_all" not in r.output
     r = run(ctx, "edit", path="m.py", old="def b():\n    pass", new="def b():\n    return 1")
     assert r.ok and "def b():" in r.output
+
+
+def test_run_uses_project_venv(tmp_path):
+    from lcw import workspace
+    venv = tmp_path / ".venv"
+    (venv / "Scripts").mkdir(parents=True)
+    (venv / "Scripts" / "python.exe").write_bytes(b"")
+    (venv / "bin").mkdir()
+    (venv / "bin" / "python").write_bytes(b"")
+    proj = tmp_path / "sub"
+    proj.mkdir()
+    assert workspace.find_venv(proj) == venv.resolve()  # venv в родительской папке (монорепо)
+    r = run(ToolContext(root=proj), "run", command="echo $VIRTUAL_ENV")
+    assert ".venv" in r.output
+
+
+def test_grep_invalid_regex_falls_back_to_literal(project):
+    g = run(ctx_for(project), "grep", pattern="hello(")
+    assert g.ok and g.output.startswith("app.py:1:")

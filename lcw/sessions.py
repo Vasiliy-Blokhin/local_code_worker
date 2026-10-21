@@ -37,6 +37,9 @@ class Session:
         self.settings: dict = data.get("settings", {"mode": "edits", "effort": config.REASONING})
         self.usage: dict = data.get("usage", {})
         self.plan: list[dict] = data.get("plan", [])                # текущий план агента [{text, status}]
+        self.focus: int = data.get("focus", 0)                      # текущий пункт многопунктного запроса
+        self.worktree: dict | None = data.get("worktree")            # {path, branch, base} — изолированная копия
+        self.decisions: dict = data.get("decisions", {})            # пункт запроса -> зафиксированное решение
         self.seen: dict = {}            # дедупликация чтений (не сохраняется)
         # runtime
         self.ops: list[dict] = []
@@ -56,7 +59,9 @@ class Session:
                 "created": self.created, "updated": self.updated, "system": self.system,
                 "messages": self.messages, "items": self.items, "checkpoints": self.checkpoints,
                 "turn": self.turn, "rewind_floor": self.rewind_floor,
-                "settings": self.settings, "usage": self.usage, "plan": self.plan}
+                "settings": self.settings, "usage": self.usage, "plan": self.plan,
+                "focus": self.focus, "worktree": self.worktree,
+                "decisions": self.decisions}
 
     def save(self) -> None:
         self.updated = time.time()
@@ -70,7 +75,8 @@ class Session:
 
     def meta(self) -> dict:
         return {"running": self.running, "usage": self.usage, "settings": self.settings,
-                "title": self.title, "context": config.CONTEXT}
+                "title": self.title, "context": config.CONTEXT,
+                "worktree": {"branch": self.worktree["branch"]} if self.worktree else None}
 
     # ---------- события ----------
     def _push(self, op: dict) -> None:

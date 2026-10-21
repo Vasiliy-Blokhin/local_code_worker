@@ -91,7 +91,7 @@ def test_single_step_plan_rejected(project):
         text_chunks("ok"),
     ])
     asyncio.run(agent.run_turn(s, "x"))
-    assert "Слишком крупный план" in tool_results(s)[0]
+    assert "В плане один шаг" in tool_results(s)[0]
 
 
 def test_reminder_after_two_changes_without_plan_update(project):
@@ -106,9 +106,151 @@ def test_reminder_after_two_changes_without_plan_update(project):
     assert "Напоминание" not in res[1] and "Напоминание: обнови plan" in res[2]
 
 
-def test_gate_persists_until_valid_plan_then_gives_up(project):
+def test_gate_rejects_twice_then_creates_plan_itself(project):
+    """Без плана — два отказа с примером вызова; дальше harness заводит план сам и пропускает правку."""
     edit = lambda cid: tool_call_chunks("edit", {"path": "app.py", "old": "'hi'", "new": "'hey'"}, cid)
-    model, agent, s = make(project, [edit("c1"), edit("c2"), edit("c3"), edit("c4"), text_chunks("ok")])
+    model, agent, s = make(project, [edit("c1"), edit("c2"), edit("c3"), text_chunks("ok"), text_chunks("ok")])
     asyncio.run(agent.run_turn(s, "x"))
     res = tool_results(s)
-    assert all("сначала составь план" in r for r in res[:3]) and "OK:" in res[3]
+    assert all("сначала составь план" in r for r in res[:2]) and "plan({" in res[0]
+    assert res[2].startswith("OK:") and "'hey'" in (Path(project["path"]) / "app.py").read_text()
+    assert s.plan[0]["text"] == "правка app.py"
+
+
+def test_tests_allowed_before_plan_and_file_view_redirected(project):
+    model, agent, s = make(project, [
+        tool_call_chunks("run", {"command": "python -m py_compile app.py"}, "c1"),
+        tool_call_chunks("run", {"command": "sed -n '1,200p' app.py"}, "c2"),
+        text_chunks("ok"),
+    ])
+    asyncio.run(agent.run_turn(s, "x"))
+    res = tool_results(s)
+    assert res[0].startswith("[exit 0]")
+    assert "read" in res[1] and "через run" in res[1]
+    assert not any("сначала составь план" in r for r in res)
+
+
+def test_unused_new_module_nudged_until_integrated(project):
+    model, agent, s = make(project, [
+        plan_chunks("создать реестр", "подключить в app.py", "проверка", status="done"),
+        tool_call_chunks("write", {"path": "pkg/registry.py", "content": "REG = {}\n"}, "c1"),
+        text_chunks("готово"),  # заглушка — автопроверка возвращает агента
+        tool_call_chunks("edit", {"path": "app.py", "old": "def hello", "new": "from pkg.registry import REG\n\nREG['hello'] = 1\n\n\ndef hello"}, "c2"),
+        text_chunks("встроил"),
+    ])
+    asyncio.run(agent.run_turn(s, "x"))
+    notices = [it["text"] for it in s.items if it["type"] == "notice"]
+    assert any("pkg/registry.py" in n and "не используются" in n for n in notices)
+    assert s.messages[-1]["content"] == "встроил"
+
+
+def test_unused_modules_ignores_tests_and_used(tmp_path):
+    from lcw.tools import unused_modules
+    (tmp_path / "a.py").write_text("import b\n", encoding="utf-8")
+    (tmp_path / "b.py").write_text("X = 1\n", encoding="utf-8")
+    (tmp_path / "c.py").write_text("Y = 1\n", encoding="utf-8")
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "test_c.py").write_text("import c\n", encoding="utf-8")
+    assert unused_modules(tmp_path, ["b.py", "c.py", "tests/test_c.py"]) == ["c.py"]
+
+
+def test_new_package_and_import_errors(tmp_path):
+    from lcw.tools import import_errors, unused_modules
+    (tmp_path / "core").mkdir()
+    (tmp_path / "core" / "__init__.py").write_text("", encoding="utf-8")
+    (tmp_path / "core" / "a.py").write_text("X = 1\n", encoding="utf-8")
+    (tmp_path / "algos").mkdir()
+    (tmp_path / "algos" / "__init__.py").write_text("from .missing import Y\n", encoding="utf-8")
+    (tmp_path / "main.py").write_text("raise SystemExit('не импортируется')\n", encoding="utf-8")
+    created = ["algos/__init__.py", "core/__init__.py"]
+    assert unused_modules(tmp_path, created) == ["algos/__init__.py"]  # core уже был пакетом
+    errs = import_errors(tmp_path, ["algos/__init__.py", "core/a.py", "main.py"])
+    assert len(errs) == 1 and errs[0].startswith("algos: ModuleNotFoundError")
+
+
+def test_entry_point_imports_checked_statically(tmp_path):
+    from lcw.tools import import_errors
+    (tmp_path / "pkg").mkdir()
+    (tmp_path / "pkg" / "__init__.py").write_text("", encoding="utf-8")
+    (tmp_path / "pkg" / "w.py").write_text("class Real:\n    pass\n", encoding="utf-8")
+    (tmp_path / "main.py").write_text(
+        "import os\nfrom pkg.w import Real\nfrom pkg.w import Fake\nfrom pkg.gone import x\n"
+        "raise SystemExit('точку входа не исполняем')\n", encoding="utf-8")
+    errs = import_errors(tmp_path, ["main.py"])
+    assert errs == ["main.py:3: в pkg.w нет имени Fake", "main.py:4: модуль pkg.gone не найден в проекте"]
+
+
+def test_refusal_without_tools_is_sent_back_once(project):
+    model, agent, s = make(project, [
+        text_chunks("I'm sorry, but this is far beyond what can be done. Please provide a clear specification."),
+        tool_call_chunks("symbols", {"path": "app.py"}, "c1"),
+        text_chunks("Изучил: в app.py одна функция hello."),
+    ])
+    asyncio.run(agent.run_turn(s, "переделай всю архитектуру"))
+    assert any("отказался" in it.get("text", "") for it in s.items if it["type"] == "notice")
+    assert s.messages[-1]["content"].startswith("Изучил")
+
+
+def test_plain_answer_not_treated_as_refusal(project):
+    model, agent, s = make(project, [text_chunks("Привет! Чем помочь?")])
+    asyncio.run(agent.run_turn(s, "привет"))
+    assert not any(it["type"] == "notice" for it in s.items) and len(model.requests) == 1
+
+
+def test_class_made_abstract_is_reported(tmp_path):
+    from lcw.tools import import_errors
+    (tmp_path / "pkg").mkdir()
+    (tmp_path / "pkg" / "__init__.py").write_text("", encoding="utf-8")
+    (tmp_path / "pkg" / "base.py").write_text(
+        "from abc import ABC, abstractmethod\n\n\nclass Iface(ABC):\n    @abstractmethod\n"
+        "    def run(self):\n        ...\n", encoding="utf-8")
+    (tmp_path / "pkg" / "algo.py").write_text(
+        "from pkg.base import Iface\n\n\nclass Good(Iface):\n    def run(self):\n        return 1\n\n\n"
+        "class Bad(Iface):\n    pass\n", encoding="utf-8")
+    errs = import_errors(tmp_path, ["pkg/base.py", "pkg/algo.py"])
+    assert errs == ["pkg.algo: класс Bad абстрактный — не реализованы run; Bad() упадёт с TypeError"]
+
+
+def test_single_step_update_merges_into_plan(project):
+    model, agent, s = make(project, [
+        plan_chunks("шаг А", "шаг Б", "проверка"),
+        tool_call_chunks("plan", {"steps": [{"text": "шаг А", "status": "done"}]}, "p2"),
+        tool_call_chunks("plan", {"steps": [{"text": "чужой шаг", "status": "done"}]}, "p3"),
+        tool_call_chunks("plan", {"steps": [{"text": "шаг Б", "status": "done"},
+                                            ]}, "p4"),
+        tool_call_chunks("plan", {"steps": [{"text": "проверка", "status": "done"}]}, "p5"),
+        text_chunks("ok"),
+    ])
+    asyncio.run(agent.run_turn(s, "x"))
+    res = tool_results(s)
+    assert "[x] 1. шаг А" in res[1] and "[ ] 2. шаг Б" in res[1]
+    assert "ПОЛНЫЙ список" in res[2]  # шага нет в плане — понятная ошибка
+    assert [x["status"] for x in s.plan] == ["done", "done", "done"]
+
+
+def test_open_plan_carries_over_to_next_turn(project):
+    """Ход оборвался с открытым планом (лимит шагов, стоп) — «продолжай» не требует плана заново."""
+    model, agent, s = make(project, [
+        tool_call_chunks("edit", {"path": "app.py", "old": "'hi'", "new": "'hey'"}, "c1"),
+        text_chunks("ok"),
+    ])
+    s.plan = [{"text": "правка", "status": "doing"}, {"text": "проверка", "status": "todo"}]
+    asyncio.run(agent.run_turn(s, "продолжай"))
+    assert "'hey'" in (Path(project["path"]) / "app.py").read_text()
+    assert [x["status"] for x in s.plan] == ["done", "done"]  # отчитался без plan — закрыто автоматически
+
+
+def test_unused_new_imports(tmp_path):
+    from lcw.tools import unused_new_imports
+    (tmp_path / "w.py").write_text("import os\nfrom base import Iface, reg\n\n\n@reg\nclass A:\n    pass\n",
+                                   encoding="utf-8")
+    assert unused_new_imports(tmp_path, {"w.py": "import os\n\n\nclass A:\n    pass\n"}) == \
+        ["w.py: импорт Iface добавлен, но не используется"]
+
+
+
+def test_requirements_parsing():
+    from lcw.agent import requirements
+    assert requirements("просто вопрос") == []
+    assert requirements("1. первое требование\n2) второе требование\n- третье требование") == [
+        "первое требование", "второе требование", "третье требование"]

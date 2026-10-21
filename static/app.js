@@ -103,9 +103,27 @@ function toolSummary(it) {
   if (it.name === "grep") return `${a.pattern}${a.path ? "  in " + a.path : ""}${a.glob ? "  " + a.glob : ""}`;
   if (it.name === "glob") return `${a.pattern}${a.path ? "  in " + a.path : ""}`;
   if (it.name === "read") return `${a.path}${a.offset ? ":" + a.offset : ""}`;
+  if (it.name === "git_commit") return `${a.message || ""}${a.push ? "  → push" : ""}`;
   return a.path || a.raw || JSON.stringify(a);
 }
 const ST = {running: "выполняется…", ok: "✓", error: "ошибка", approve: "ждёт подтверждения", denied: "отклонено"};
+
+function gitCardHtml(g, esc) {
+  const N = g.files.length;
+  const pushText = g.push
+    ? "да → " + (g.upstream || ("origin/" + g.branch + " (новая ветка)"))
+    : "нет (только локальный коммит)";
+  const warn = g.protected
+    ? ` <span class="gc-warn">⚠ ветка ${esc(g.branch)} — основная</span>`
+    : "";
+  return `<div class="gitcard">
+  <div class="gc-row"><b>Коммит:</b> <code>${esc(g.message)}</code></div>
+  <div class="gc-row"><b>Что изменено:</b><div class="gc-text">${esc(g.summary)}</div></div>
+  <div class="gc-row"><b>Проведённые тесты:</b><div class="gc-text">${esc(g.tests)}</div></div>
+  <div class="gc-row"><b>Файлы (${N}):</b><pre class="gc-stat">${esc(g.stat)}</pre></div>
+  <div class="gc-row"><b>Push:</b> ${esc(pushText)}${warn}</div>
+</div>`;
+}
 
 function renderItem(i) {
   const it = state.items[i];
@@ -145,11 +163,12 @@ function renderItem(i) {
         detail.push(diffHtml(`--- ${it.args.path}\n${(it.args.old || "").split("\n").map(l => "-" + l).join("\n")}\n${(it.args.new || "").split("\n").map(l => "+" + l).join("\n")}`));
       }
       if (it.name === "write" && it.status === "approve" && !it.diff) detail.push(`<pre>${esc(it.args.path)}: ${esc(it.args.content)}</pre>`);
+      if (it.git) detail.push(gitCardHtml(it.git, esc));
       if (it.diff) detail.push(diffHtml(it.diff));
       else if (it.output) detail.push(`<pre>${esc(it.output)}</pre>`);
       el.innerHTML = `<div class="head"><span class="name">${esc(it.name)}</span><span class="arg">${esc(toolSummary(it))}</span><span class="st ${it.status}">${ST[it.status] || it.status}</span></div>`
         + (open && detail.length ? `<div class="detail">${detail.join("")}</div>` : "")
-        + (it.status === "approve" ? `<div class="approve-bar"><button class="btn primary" data-d="allow">Разрешить</button><button class="btn" data-d="always">Всегда для «${esc(it.name)}»</button><input placeholder="Комментарий при отказе…"><button class="btn danger" data-d="deny">Отклонить</button></div>` : "");
+        + (it.status === "approve" ? `<div class="approve-bar"><button class="btn primary" data-d="allow">Разрешить</button>${it.name === "git_commit" ? "" : `<button class="btn" data-d="always">Всегда для «${esc(it.name)}»</button>`}<input placeholder="Комментарий при отказе…"><button class="btn danger" data-d="deny">Отклонить</button></div>` : "");
       $(".head", el).onclick = () => { openTools.has(i) ? openTools.delete(i) : openTools.add(i); renderItem(i); };
       el.querySelectorAll("[data-d]").forEach(b => b.onclick = () => approve(it.id, b.dataset.d, $("input", el).value));
       break;
@@ -212,6 +231,9 @@ function renderMeta() {
   btn.classList.toggle("danger", !!m.running);
   $("#runState").textContent = m.running ? "агент работает…" : "";
   if (m.settings) { $("#modeSel").value = m.settings.mode; $("#effortSel").value = m.settings.effort; }
+  const wt = $("#wtPill");
+  wt.classList.toggle("hidden", !m.worktree);
+  wt.textContent = m.worktree ? `⑂ ${m.worktree.branch}` : "";
   if (m.title && state.session) {
     const li = document.querySelector(`#sessions li[data-id="${state.session}"] .t`);
     if (li) li.textContent = m.title;
@@ -283,8 +305,11 @@ async function openSession(id) {
 
 async function newSession() {
   if (!state.project) return;
-  const s = await api("POST", "/api/sessions", {project_id: state.project.id,
-    settings: {mode: $("#modeSel").value, effort: $("#effortSel").value}});
+  let s;
+  try {
+    s = await api("POST", "/api/sessions", {project_id: state.project.id,
+      settings: {mode: $("#modeSel").value, effort: $("#effortSel").value, worktree: $("#worktreeChk").checked}});
+  } catch (e) { alert(e.message || e); return; }
   await loadSessions();
   await openSession(s.id);
   $("#input").focus();
@@ -297,6 +322,7 @@ async function send() {
   if (!text) return;
   if (text === "/clear") { box.value = ""; return newSession(); }
   if (!state.session) await newSession();
+  if (!state.session) return;
   box.value = "";
   try {
     await api("POST", `/api/sessions/${state.session}/message`, {text});
@@ -401,11 +427,22 @@ async function openFile(path) {
 async function loadChanges() {
   if (!state.session) { $("#tab-changes").innerHTML = `<p class="muted">Нет сессии</p>`; return; }
   const ch = await api("GET", `/api/sessions/${state.session}/changes`);
-  const zip = `<p><a class="btn small" href="/api/projects/${state.project.id}/zip">Скачать проект (.zip)</a></p>`;
+  const wt = state.meta && state.meta.worktree;
+  const zip = `<p><a class="btn small" href="/api/projects/${state.project.id}/zip">Скачать проект (.zip)</a>`
+    + (wt ? ` <button class="btn small primary" id="wtApply" title="Наложить изменения изолированной копии на рабочую копию проекта (без коммита)">Перенести в проект</button>`
+          + ` <span class="muted small">ветка ${esc(wt.branch)}</span>` : "") + `</p>`;
   $("#tab-changes").innerHTML = zip + (ch.length ? ch.map(c =>
     `<div class="change"><div class="ch"><span class="badge ${c.status}">${c.status === "added" ? "новый" : c.status === "deleted" ? "удалён" : "изменён"}</span><a href="#" data-p="${esc(c.path)}">${esc(c.path)}</a></div>${diffHtml(c.diff)}</div>`).join("")
     : `<p class="muted">Агент ещё не менял файлы в этой сессии.</p>`);
   document.querySelectorAll("#tab-changes a[data-p]").forEach(a => a.onclick = e => { e.preventDefault(); openFile(a.dataset.p); });
+  const ap = $("#wtApply");
+  if (ap) ap.onclick = async () => {
+    if (!confirm("Перенести изменения из изолированной копии в рабочую копию проекта? Коммит не делается.")) return;
+    try {
+      const r = await api("POST", `/api/sessions/${state.session}/worktree/apply`);
+      alert(`Перенесено файлов: ${r.files.length}`);
+    } catch (e) { alert(e.message || e); }
+  };
 }
 
 function showPanel(tab) {
@@ -497,6 +534,8 @@ function bind() {
   $("#togglePanel").onclick = () => $("#panel").classList.contains("hidden") ? showPanel("changes") : $("#panel").classList.add("hidden");
   $("#panelRefresh").onclick = () => $("#tab-changes").classList.contains("hidden") ? null : loadChanges();
   document.querySelectorAll(".tabs [data-tab]").forEach(b => b.onclick = () => showPanel(b.dataset.tab));
+  $("#worktreeChk").checked = LS.get("worktree", "") === "1";
+  $("#worktreeChk").onchange = e => LS.set("worktree", e.target.checked ? "1" : "");
   for (const [sel, key] of [["#modeSel", "mode"], ["#effortSel", "effort"]]) {
     $(sel).onchange = e => {
       LS.set(key, e.target.value);
