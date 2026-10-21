@@ -148,7 +148,7 @@ def evidence_hint(root: Path) -> str:
                 hits.append(n)
                 # готовые команды из документации: ssh-подключение и чтение логов на сервере
                 for cmd in re.findall(r"`([^`]*(?:ssh -i|journalctl|tail [^`]*log)[^`]*)`", line):
-                    if cmd not in commands and not re.search(r"\b(rm|nano|vi|restart|stop|start|reboot)\b", cmd):
+                    if cmd not in commands and not re.search(r"\b(rm|nano|vi|restart|stop|start|reboot)\b|tail -f", cmd):
                         commands.append(cmd)
         if hits:
             docs.append(f"{q.relative_to(root).as_posix()} (строки {', '.join(map(str, hits[:5]))})")
