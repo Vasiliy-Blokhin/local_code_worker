@@ -108,3 +108,12 @@ def test_edit_strips_diff_plus_marks(tmp_path):
     with _pytest.raises(ToolError):
         t_edit(c, "t.py", "def zzz():", "def yyy():")
     assert "def b():" in t_read(c, "t.py").output
+
+
+def test_tool_called_through_shell_is_routed():
+    from lcw.agent import tool_from_shell
+    assert tool_from_shell("logstats --path=logs/access.log --match=ERROR|WARNING") == (
+        "logstats", {"path": "logs/access.log", "match": "ERROR|WARNING"})
+    assert tool_from_shell("logstats logs --show 5") == ("logstats", {"path": "logs", "show": 5})
+    assert tool_from_shell("refs guard_ip_limit") == ("refs", {"name": "guard_ip_limit"})
+    assert tool_from_shell("pytest -q") is None and tool_from_shell("ls logs") is None

@@ -37,6 +37,39 @@ REFUSAL = re.compile(r"I'?m sorry|I can(no|')t|cannot (help|do|complete)|beyond 
                      r"выходит за рамки|предостав\w* (специфика|подробн|пример)", re.IGNORECASE)
 # сбой разбора вызова инструмента в llama.cpp и подсказка для повтора
 PARSE_ERROR = re.compile(r"does not match the expected|Failed to parse|unparsed", re.IGNORECASE)
+_SHELL_TOOLS = ("logstats", "refs", "symbols", "test")  # имена, которых нет среди программ оболочки
+
+
+def tool_from_shell(command: str) -> tuple[str, dict] | None:
+    """
+    `logstats --path=logs/a.log --match=ERROR` / `refs name=foo` → (инструмент, аргументы).
+    Маленькая модель путает инструменты с командами оболочки; ответ «команда не найдена» её только сбивает.
+    """
+    import shlex
+    try:
+        parts = shlex.split(command.strip())
+    except ValueError:
+        return None
+    if not parts or parts[0] not in _SHELL_TOOLS:
+        return None
+    name = parts[0]
+    spec = next(t["function"]["parameters"]["properties"] for t in TOOLS if t["function"]["name"] == name)
+    args: dict = {}
+    rest = parts[1:]
+    k = 0
+    while k < len(rest):
+        tok = rest[k].lstrip("-")
+        key, eq, val = tok.partition("=")
+        if not eq and key in spec and k + 1 < len(rest) and not rest[k + 1].startswith("-"):
+            val, k = rest[k + 1], k + 1
+        elif not eq:  # позиционный аргумент — первый обязательный параметр
+            key, val = next(iter(spec)), tok
+        if key in spec:
+            args[key] = int(val) if spec[key].get("type") == "integer" and val.isdigit() else val
+        k += 1
+    return name, args
+
+
 TOOL_FORMAT_HINT = ("[Система] Предыдущий вызов инструмента не распознан: неверный формат заголовка. Вызывай "
                     "ровно один инструмент обычным способом (канал commentary, получатель functions.<имя>, "
                     "аргументы — JSON-объект) — или ответь текстом. Продолжай с того же места.")
@@ -670,6 +703,9 @@ class Agent:
             return ToolResult("Не выполнено: изменять историю git через run нельзя. Для add/commit/push "
                               "используй git_commit (с описанием изменений и проведённых тестов) — "
                               "пользователь подтвердит его.", ok=False)
+        routed = tool_from_shell(args.get("command", "")) if name == "run" else None
+        if routed:  # «run logstats --path=…»: модель вызвала инструмент как программу — выполняем как инструмент
+            name, args = routed
         if name == "run" and FILE_VIEW.match(args.get("command", "")):
             # чтение файлов через shell обходит read (номера строк, оглавление, дедупликацию)
             s.add({"type": "tool", "id": call_id, "name": name, "args": _ui_args(name, args),
