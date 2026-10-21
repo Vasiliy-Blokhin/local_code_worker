@@ -19,7 +19,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import config, entities
-from .workspace import WorkspaceError, find_venv, is_text_file, list_files, pytest_env, relpath, resolve, venv_bin
+from .workspace import WorkspaceError, find_venv, is_text_file, list_files, main_checkout, pytest_env, relpath, resolve, venv_bin
 
 READ_LIMIT = 400        # строк по умолчанию
 LINE_CHARS = 400        # обрезка длинных строк при чтении
@@ -271,7 +271,7 @@ def t_read(ctx: ToolContext, path: str, offset: int = 1, limit: int = READ_LIMIT
 def t_glob(ctx: ToolContext, pattern: str, path: str = "") -> ToolResult:
     base = relpath(ctx.root, resolve(ctx.root, path or "."))
     base = "" if base == "." else base.rstrip("/") + "/"
-    pat = pattern.strip().replace("\\", "/").removeprefix("./")
+    pat = pattern.strip().replace("\\", "/").removeprefix("./") or "*"  # пустой шаблон — всё в path
     files = [f for f in list_files(ctx.root) if f.startswith(base)]
     hits = []
     for f in files:
@@ -534,13 +534,19 @@ def t_logstats(ctx: ToolContext, path: str, match: str = "", by: str = "", bucke
     match — regex-фильтр строк; by — поле JSON (status, ip, uri…) или `level`/`message` для текста:
     топ значений; bucket — minute|hour|day: гистограмма по времени; show — показать N последних строк.
     """
-    target = resolve(ctx.root, path)
-    every = ([relpath(ctx.root, q) for q in sorted(target.rglob("*")) if q.is_file()]
+    base, note = ctx.root, ""
+    target = resolve(base, path)
+    main = main_checkout(ctx.root)
+    if not target.exists() and main and resolve(main, path).exists():
+        # изолированный worktree: логи (.gitignore) есть только в основной копии проекта
+        base, target = main, resolve(main, path)
+        note = f"(логи основной копии проекта {main})\n"
+    every = ([relpath(base, q) for q in sorted(target.rglob("*")) if q.is_file()]
              if target.is_dir() else [])  # логи обычно в .gitignore — list_files их не видит
     files = [f for f in every
              if re.search(r"\.(log|jsonl|json|txt|out|err)(\.\d+)?(\.gz)?$", f) or "log" in f.rsplit("/", 1)[-1]]
     if target.is_file():
-        files = [relpath(ctx.root, target)]
+        files = [relpath(base, target)]
     if not files:
         return ToolResult(f"В {path} нет файлов логов.", ok=False)
     try:
@@ -550,7 +556,7 @@ def t_logstats(ctx: ToolContext, path: str, match: str = "", by: str = "", bucke
     rows: list[tuple[str, dict | None]] = []
     for f in files[:30]:
         try:
-            lines = _log_lines(ctx.root / f)
+            lines = _log_lines(base / f)
         except OSError:
             continue
         for line in lines:
@@ -617,7 +623,7 @@ def t_logstats(ctx: ToolContext, path: str, match: str = "", by: str = "", bucke
         out.append(f"пики по {bucket}: " + ", ".join(f"{k} ×{v}" for k, v in sorted(peak)))
     if show:
         out.append("последние строки:\n" + "\n".join(line[:300] for line, _ in rows[-min(int(show), 30):]))
-    return ToolResult(_trunc("\n".join(out), 5000))
+    return ToolResult(note + _trunc("\n".join(out), 5000))
 
 
 def _find_block(text: str, old: str) -> tuple[int, int] | None:

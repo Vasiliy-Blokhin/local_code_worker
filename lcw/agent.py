@@ -24,7 +24,7 @@ from .tools import (MUTATING, TOOLS, ToolContext, ToolError, ToolResult, execute
                     GIT_WRITE, git_preview, preview, render_plan, syntax_errors, unused_modules, import_errors,
                     unused_new_imports, new_stubs, project_tests, find_merges, undefined_names,
                     sql_column_errors, dropped_dependencies)
-from .workspace import WorkspaceError, get_project, is_text_file, relpath, resolve
+from .workspace import WorkspaceError, get_project, is_text_file, main_checkout, relpath, resolve
 
 UI_OUTPUT = 6000           # сколько вывода инструмента показывать в UI
 CHARS_PER_TOKEN = 3.2      # грубая оценка для бюджета контекста
@@ -126,9 +126,11 @@ def evidence_hint(root: Path) -> str:
     """Где искать факты: логи в проекте и документы, где сказано, как добраться до логов на сервере."""
     root = Path(root)
     logs = []
+    main = main_checkout(root)
     for d in ("logs", "log"):
-        if (root / d).is_dir():
-            files = [q for q in (root / d).rglob("*") if q.is_file()]
+        where = root / d if (root / d).is_dir() else main / d if main and (main / d).is_dir() else None
+        if where:
+            files = [q for q in where.rglob("*") if q.is_file()]
             if files:
                 logs.append(f"{d}/ ({len(files)} файлов: " + ", ".join(q.name for q in files[:6])
                             + ("…" if len(files) > 6 else "") + ")")
