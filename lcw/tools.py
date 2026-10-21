@@ -461,6 +461,29 @@ def covering_tests(root: Path, rel: str) -> list[str]:
     return out
 
 
+def _norm(text: str) -> str:
+    return text.replace(chr(13) + chr(10), chr(10))
+
+
+def untested_changes(root: Path, originals: dict) -> list[str]:
+    """Изменённые рабочие модули с тестами, когда ни один тестовый файл в сессии не менялся."""
+    if any(_is_test_file(rel) for rel in originals):
+        return []
+    out = []
+    for rel, orig in originals.items():
+        if not rel.endswith(".py") or orig is None or not (root / rel).is_file():
+            continue
+        try:
+            if _norm((root / rel).read_text(encoding="utf-8", errors="replace")) == _norm(orig):
+                continue
+        except OSError:
+            continue
+        tests = covering_tests(root, rel)
+        if tests:
+            out.append(f"{rel} (тесты: {', '.join(tests[:3])})")
+    return out
+
+
 _FAIL_HEAD = re.compile(r"^_{3,} (.+?) _{3,}$")
 _TB_PLACE = re.compile(r"^[\w./\\:-]+\.py:\d+:")
 

@@ -75,3 +75,14 @@ def test_evidence_hint_points_to_logs_and_server_docs(tmp_path):
     assert "logs/ (1 файлов: site.log)" in hint and "docs/vm.md (строки 2)" in hint
     assert INVESTIGATE.search("найти причину периодического отключения сайта")
     assert not INVESTIGATE.search("добавить кнопку экспорта")
+
+
+def test_untested_changes(tmp_path):
+    from lcw.tools import untested_changes
+    (tmp_path / "app").mkdir()
+    (tmp_path / "app" / "g.py").write_text("X = 2\n", encoding="utf-8")
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "test_g.py").write_text("from app.g import X\n", encoding="utf-8")
+    assert untested_changes(tmp_path, {"app/g.py": "X = 1\n"}) == ["app/g.py (тесты: tests/test_g.py)"]
+    assert untested_changes(tmp_path, {"app/g.py": "X = 1\n", "tests/test_g.py": ""}) == []
+    assert untested_changes(tmp_path, {"app/g.py": "X = 2\n"}) == []  # не изменился
