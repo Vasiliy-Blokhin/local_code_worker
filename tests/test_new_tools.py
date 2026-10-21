@@ -93,3 +93,18 @@ def test_cause_must_quote_seen_facts():
     seen = "пики по hour: 2026-10-18 08 ×118\nпо ip: 79.124.58.82 ×1380"
     assert grounded("сайт закрыт 2026-10-18 08: один IP 79.124.58.82 дал 1380 запросов", seen)
     assert not grounded("внутренние запросы 127.0.0.1 и 192.168.0.1 вызывают закрытие", seen)
+
+
+def test_edit_strips_diff_plus_marks(tmp_path):
+    import pytest as _pytest
+    from lcw.tools import ToolError, t_edit, t_read
+    (tmp_path / "t.py").write_text("def a():\n    return 1\n", encoding="utf-8")
+    c = _ctx(tmp_path)
+    t_edit(c, "t.py", "def a():\n    return 1\n",
+           "def a():\n    return 1\n+\n+\n+def b():\n+    return 2\n")
+    assert (tmp_path / "t.py").read_text(encoding="utf-8") == "def a():\n    return 1\n\n\ndef b():\n    return 2\n"
+    # неудачная правка сбрасывает «уже видел»: повторное чтение снова отдаёт текст
+    t_read(c, "t.py")
+    with _pytest.raises(ToolError):
+        t_edit(c, "t.py", "def zzz():", "def yyy():")
+    assert "def b():" in t_read(c, "t.py").output

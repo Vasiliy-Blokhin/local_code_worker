@@ -782,6 +782,21 @@ def _unpatch(old: str, new: str) -> tuple[str, str]:
     return "\n".join(o), "\n".join(n)
 
 
+def _strip_added_marks(old: str, new: str) -> str:
+    """
+    Модель пишет в `new` добавленные строки с «+» в начале (как в диффе), а `old` — без них:
+    в файл попадает «+def test_…» и ломает синтаксис. Если ВСЕ новые строки начинаются с «+»
+    (а в old таких строк нет), это разметка, а не код, — снимаем её.
+    """
+    old_lines = set(old.split("\n"))
+    if any(l.startswith("+") for l in old_lines):
+        return new
+    added = [l for l in new.split("\n") if l.strip() and l not in old_lines]
+    if len(added) < 2 or not all(l.startswith("+") for l in added):
+        return new
+    return "\n".join(l[1:] if l.startswith("+") and l not in old_lines else l for l in new.split("\n"))
+
+
 def _plan_edit(ctx: ToolContext, path: str, old: str, new: str, replace_all: bool = False):
     """Вычисляет правку без записи. Возвращает (p, rel, text, after, nl, start, new, summary)."""
     p = resolve(ctx.root, path)
@@ -792,6 +807,8 @@ def _plan_edit(ctx: ToolContext, path: str, old: str, new: str, replace_all: boo
     old, new = _unpatch(old.replace("\r\n", "\n"), new.replace("\r\n", "\n"))
     # модель копирует номера строк из вывода read («129│код») — маркер «│» наш, срезаем его
     old, new = _LINE_NO.sub("", old), _LINE_NO.sub("", new)
+    if not rel.endswith((".diff", ".patch", ".md")):
+        new = _strip_added_marks(old, new)
     if old == new:
         raise ToolError("old и new совпадают.")
     if not old:  # дописать в конец файла
@@ -825,7 +842,16 @@ def _plan_edit(ctx: ToolContext, path: str, old: str, new: str, replace_all: boo
 
 
 def t_edit(ctx: ToolContext, path: str, old: str, new: str, replace_all: bool = False) -> ToolResult:
-    p, rel, text, after, nl, start, new, summary = _plan_edit(ctx, path, old, new, replace_all)
+    try:
+        p, rel, text, after, nl, start, new, summary = _plan_edit(ctx, path, old, new, replace_all)
+    except ToolError:
+        # после неудачной правки модель перечитывает место, чтобы скопировать точный текст, —
+        # заглушка «не изменился с прошлого чтения» тут только зацикливает её
+        try:
+            _forget(ctx, relpath(ctx.root, resolve(ctx.root, path)))
+        except (WorkspaceError, ValueError):
+            pass
+        raise
     return _finish_edit(ctx, p, rel, text, after, nl, start, new, summary)
 
 
