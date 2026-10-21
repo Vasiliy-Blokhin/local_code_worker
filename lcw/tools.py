@@ -227,6 +227,12 @@ def t_read(ctx: ToolContext, path: str, offset: int = 1, limit: int = READ_LIMIT
     if p.is_dir():
         return t_glob(ctx, "*", path)
     if not p.is_file():
+        alt = _in_main(ctx, path)
+        if alt is not None:  # worktree: файл из .gitignore (логи, данные) есть только в основной копии
+            if alt.is_dir() or LOG_FILE.search(alt.name):
+                return ToolResult(f"{path} есть только в основной копии проекта ({alt}). Логи смотри через "
+                                  f"logstats path={path} (сводка, match=, by=, bucket=, show=).")
+            raise ToolError(f"Файл не найден: {path} (есть только в основной копии проекта, не в этой ветке)")
         raise ToolError(f"Файл не найден: {path}")
     if not is_text_file(p):
         raise ToolError(f"Бинарный файл: {path}")
@@ -268,7 +274,25 @@ def t_read(ctx: ToolContext, path: str, offset: int = 1, limit: int = READ_LIMIT
     return ToolResult(_trunc("\n".join(out)) + tail, path=rel)
 
 
+LOG_FILE = re.compile(r"\.(log|out|err)(\.\d+)?(\.gz)?$|^access|^error", re.IGNORECASE)
+
+
+def _in_main(ctx: ToolContext, path: str) -> Path | None:
+    """Путь, которого нет в worktree, но есть в основной копии проекта (папки из .gitignore: logs/, data/)."""
+    main = main_checkout(ctx.root)
+    if not main or not path or resolve(ctx.root, path).exists():
+        return None
+    alt = resolve(main, path)
+    return alt if alt.exists() else None
+
+
 def t_glob(ctx: ToolContext, pattern: str, path: str = "") -> ToolResult:
+    alt = _in_main(ctx, path)
+    if alt is not None and alt.is_dir():
+        names = sorted(q.relative_to(alt).as_posix() for q in alt.rglob("*") if q.is_file())[:200]
+        return ToolResult(f"{path} есть только в основной копии проекта ({alt}); файлы:\n"
+                          + "\n".join(f"{path.rstrip('/')}/{n}" for n in names)
+                          + "\nЛоги смотри через logstats (сводка без чтения целиком).")
     base = relpath(ctx.root, resolve(ctx.root, path or "."))
     base = "" if base == "." else base.rstrip("/") + "/"
     pat = pattern.strip().replace("\\", "/").removeprefix("./") or "*"  # пустой шаблон — всё в path

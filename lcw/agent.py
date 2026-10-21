@@ -707,6 +707,8 @@ class Agent:
                           or name == "run" and EVIDENCE_CMD.search(args.get("command", ""))
                           or name in ("read", "grep") and EVIDENCE_PATH.search(str(args.get("path", "")))):
             st["evidence"] = st.get("evidence", 0) + 1
+            if name != "read" and name != "grep" or re.search(r"(^|/)logs?/|\.log$", str(args.get("path", ""))):
+                st["log_evidence"] = st.get("log_evidence", 0) + 1
         if name in MUTATING and result.ok:
             st["edits"] = st.get("edits", 0) + 1
         if st["planned"] and (name in MUTATING or name == "run"):
@@ -730,9 +732,15 @@ class Agent:
         reqs = st.get("reqs") or []
         item = reqs[s.focus] if 0 <= s.focus < len(reqs) else ""
         cause = str(args.get("cause", "")).strip()
-        if INVESTIGATE.search(item) and st.get("cause_rejects", 0) < 2:
+        if INVESTIGATE.search(item) and st.get("cause_rejects", 0) < 3:
             why = ""
-            if not st.get("evidence"):
+            main = main_checkout(ctx.root)
+            has_logs = any((r / d).is_dir() for r in (ctx.root, main) if r for d in ("logs", "log"))
+            if has_logs and not st.get("log_evidence"):
+                why = ("в проекте есть логи (logs/), а ты их не смотрел: logstats path=logs (match=ERROR|WARNING, "
+                       "by=message; для JSON-логов by=status|ip, bucket=hour), а логи сервера — командами из "
+                       "документов о развёртывании")
+            elif not st.get("evidence"):
                 why = ("ты ещё не смотрел факты: логи (logstats), конфиги, документы о развёртывании (где логи "
                        "сервера и как их прочитать)")
             elif len(cause) < 30 or not re.search(r"\d", cause):
