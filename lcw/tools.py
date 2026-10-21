@@ -62,9 +62,9 @@ TOOLS = [
          "uses": {"type": "array", "items": S,
                   "description": "existing functions/classes/settings it relies on (real names from the code)"},
          "fallback": {**S, "description": "behaviour when data is missing or the check cannot run"},
-         "cause": {**S, "description": "for 'find why / fix the problem' items: the cause you found, with "
-                                       "evidence (log times, counts, file:line)"}},
-        ["decision", "uses", "fallback"]),
+         "cause": {**S, "description": "the problem this solves and its cause, with evidence you found (log "
+                                       "times, counts, file:line); '-' only if the item is not about a problem"}},
+        ["decision", "uses", "fallback", "cause"]),
     _fn("symbols", "Project entity index (classes/functions with line ranges and docstrings). "
                    "path=file: its outline; query: search names+docstrings (words, `|` = or) in path; "
                    "use it to find code before read/grep.",
@@ -317,18 +317,26 @@ def t_grep(ctx: ToolContext, pattern: str, path: str = "", glob: str = "",
         rx = re.compile(pattern, flags)
     except re.error:  # «Rotation(» и т.п. — модель имела в виду буквальную строку
         rx = re.compile(re.escape(pattern), flags)
-    target = resolve(ctx.root, path or ".")
-    if target.is_file():
-        files = [relpath(ctx.root, target)]
+    root, note = ctx.root, ""
+    alt = _in_main(ctx, path)
+    if alt is not None:  # worktree: логи и данные из .gitignore есть только в основной копии
+        root = main_checkout(ctx.root)
+        note = f"(основная копия проекта {root})\n"
+        files = ([relpath(root, alt)] if alt.is_file() else
+                 [relpath(root, q) for q in sorted(alt.rglob("*")) if q.is_file()])
     else:
-        base = relpath(ctx.root, target)
-        base = "" if base == "." else base + "/"
-        files = [f for f in list_files(ctx.root) if f.startswith(base)]
+        target = resolve(ctx.root, path or ".")
+        if target.is_file():
+            files = [relpath(ctx.root, target)]
+        else:
+            base = relpath(ctx.root, target)
+            base = "" if base == "." else base + "/"
+            files = [f for f in list_files(ctx.root) if f.startswith(base)]
     if glob:
         files = [f for f in files if fnmatch.fnmatch(f.rsplit("/", 1)[-1], glob) or fnmatch.fnmatch(f, glob)]
     out, n = [], 0
     for f in files:
-        p = ctx.root / f
+        p = root / f
         if not is_text_file(p) or p.stat().st_size > 2_000_000:
             continue
         try:
@@ -341,8 +349,8 @@ def t_grep(ctx: ToolContext, pattern: str, path: str = "", glob: str = "",
                 n += 1
                 if n >= GREP_MAX:
                     out.append(f"…лимит {GREP_MAX} совпадений, уточните запрос")
-                    return ToolResult("\n".join(out))
-    return ToolResult("\n".join(out) if out else "Нет совпадений.")
+                    return ToolResult(note + "\n".join(out))
+    return ToolResult(note + ("\n".join(out) if out else "Нет совпадений."))
 
 
 

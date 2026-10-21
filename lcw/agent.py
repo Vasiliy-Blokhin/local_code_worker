@@ -749,7 +749,9 @@ class Agent:
             if why:
                 st["cause_rejects"] = st.get("cause_rejects", 0) + 1
                 return ToolResult(f"Ошибка: пункт {s.focus + 1} — расследование, решение без найденной причины "
-                                  f"не принимается: {why}. Затем decide с полем cause.", ok=False)
+                                  f"не принимается: {why}. Затем снова decide, ОБЯЗАТЕЛЬНО с полем cause: "
+                                  '{"decision": "...", "uses": [...], "fallback": "...", "cause": "<что видно в логах: '
+                                  'время, числа, адреса> -> <какой код (файл:строка) к этому приводит>"}', ok=False)
         missing = entities.check_names(ctx.root, uses)
         if missing:
             lines = [f"- {n}: нет в проекте" + (f" (похожие: {', '.join(sim)})" if sim else "")
