@@ -134,7 +134,7 @@ def evidence_hint(root: Path) -> str:
             if files:
                 logs.append(f"{d}/ ({len(files)} файлов: " + ", ".join(q.name for q in files[:6])
                             + ("…" if len(files) > 6 else "") + ")")
-    docs = []
+    docs, commands = [], []
     for q in sorted(list(root.glob("*.md")) + list(root.glob("docs/**/*.md")) + list(root.glob("deploy/**/*"))):
         if not q.is_file() or q.stat().st_size > 500_000:
             continue
@@ -142,8 +142,14 @@ def evidence_hint(root: Path) -> str:
             text = q.read_text(encoding="utf-8", errors="replace")
         except OSError:
             continue
-        hits = [n for n, line in enumerate(text.splitlines(), 1)
-                if re.search(r"journalctl|/var/log|access\.log|ssh -i", line)]
+        hits = []
+        for n, line in enumerate(text.splitlines(), 1):
+            if re.search(r"journalctl|/var/log|access\.log|ssh -i", line):
+                hits.append(n)
+                # готовые команды из документации: ssh-подключение и чтение логов на сервере
+                for cmd in re.findall(r"`([^`]*(?:ssh -i|journalctl|tail [^`]*log)[^`]*)`", line):
+                    if cmd not in commands and not re.search(r"\b(rm|nano|vi|restart|stop|start|reboot)\b", cmd):
+                        commands.append(cmd)
         if hits:
             docs.append(f"{q.relative_to(root).as_posix()} (строки {', '.join(map(str, hits[:5]))})")
     out = ("\nЭто расследование: сначала найди причину по фактам, потом правь. `logstats` даёт сводку лога "
@@ -153,6 +159,11 @@ def evidence_hint(root: Path) -> str:
         out += "\nЛоги в проекте: " + "; ".join(logs)
     if docs:
         out += "\nГде описаны логи/сервер (команды — только чтение): " + "; ".join(docs[:6])
+    if commands:
+        out += ("\nКоманды из документации (сервер — только читать, ничего не менять): "
+                + "; ".join(f"`{c}`" for c in commands[:6])
+                + "\nЛог с сервера разбирай так: run `ssh … \"cat /путь/к/логу\" > logs/server_<имя>.log` "
+                  "(через ssh из этих команд, без sudo, если лог читается и так), затем logstats path=logs/server_<имя>.log.")
     return out
 
 
