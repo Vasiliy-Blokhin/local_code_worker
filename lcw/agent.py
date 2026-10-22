@@ -195,6 +195,29 @@ def server_commands(root: Path) -> list[str]:
     return _server_docs(Path(root))[1]
 
 
+def fetch_commands(root: Path) -> list[str]:
+    """
+    Готовые команды «скачать лог сервера в logs/»: ssh-подключение из документации + пути /var/log/… оттуда же.
+    Модель не собирает их сама из «ssh …» и «tail …» и решает, что доступа к серверу нет.
+    """
+    root = Path(root)
+    ssh = next((c for c in server_commands(root) if re.match(r"ssh\s+-i\s", c)), "")
+    if not ssh:
+        return []
+    paths: list[str] = []
+    for q in sorted(list(root.glob("*.md")) + list(root.glob("docs/**/*.md"))):
+        try:
+            text = q.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for path in re.findall(r"/var/log/[\w./-]+?\.log\b", text):
+            if path not in paths:
+                paths.append(path)
+    base = re.sub(r"^ssh\s", "ssh -o BatchMode=yes -o ConnectTimeout=15 ", ssh)
+    # zcat -f с маской: вместе с текущим логом — ротированные .1 и .gz (сбои обычно уже там)
+    return [f'{base} "zcat -f {p}*" > logs/server_{Path(p).stem}.log' for p in paths[:4]]
+
+
 def evidence_hint(root: Path) -> str:
     """Где искать факты: логи в проекте и документы, где сказано, как добраться до логов на сервере."""
     root = Path(root)
@@ -220,6 +243,10 @@ def evidence_hint(root: Path) -> str:
                 + "; ".join(f"`{c}`" for c in commands[:6])
                 + "\nЛог с сервера разбирай так: run `ssh … \"cat /путь/к/логу\" > logs/server_<имя>.log` "
                   "(через ssh из этих команд, без sudo, если лог читается и так), затем logstats path=logs/server_<имя>.log.")
+    fetch = fetch_commands(root)
+    if fetch:
+        out += ("\nДоступ к серверу есть, читать его логи можно и нужно. Готовые команды (выполни через run): "
+                + "; ".join(f"`{c}`" for c in fetch))
     return out
 
 
@@ -700,7 +727,7 @@ class Agent:
         if name == "decide":
             return await asyncio.to_thread(self._decide, s, ctx, args, st)
         if (name in MUTATING and len(st.get("reqs", [])) >= 2 and str(s.focus) not in s.decisions
-                and st.get("decide_rejects", 0) < 2):
+                and st.get("decide_rejects", 0) < (4 if INVESTIGATE.search((st.get("reqs") or [""])[min(s.focus, len(st.get("reqs") or [""]) - 1)]) else 2)):
             # проектные пункты маленькая модель решает наугад: сначала — решение, привязанное к коду
             st["decide_rejects"] = st.get("decide_rejects", 0) + 1
             s.add({"type": "tool", "id": call_id, "name": name, "args": _ui_args(name, args),
@@ -828,11 +855,13 @@ class Agent:
                        "by=message; для JSON-логов by=status|ip, bucket=hour), а логи сервера — командами из "
                        "документов о развёртывании")
             elif has_logs and not st.get("fresh_logs") and server_commands(ctx.root):
+                fetch = fetch_commands(ctx.root)
                 why = ("логи, которые ты смотрел, устарели (последние записи — несколько дней назад), а сервис по "
-                       "документации работает на сервере. Возьми его актуальные логи командами (только чтение): "
-                       + "; ".join(f"`{c}`" for c in server_commands(ctx.root)[:4])
-                       + " — например run `ssh … \"cat /var/log/…/access.log\" > logs/server_access.log`, "
-                         "затем logstats path=logs/server_access.log")
+                       "документации работает на сервере. Доступ к нему есть, читать логи можно. "
+                       + ("Выполни через run (только чтение): " + "; ".join(f"`{c}`" for c in fetch)
+                          if fetch else "Возьми его логи командами из документации: "
+                          + "; ".join(f"`{c}`" for c in server_commands(ctx.root)[:4]))
+                       + " — затем logstats path=logs/server_<имя>.log (bucket=hour, by=ip, match=503|429)")
             elif not st.get("evidence"):
                 why = ("ты ещё не смотрел факты: логи (logstats), конфиги, документы о развёртывании (где логи "
                        "сервера и как их прочитать)")

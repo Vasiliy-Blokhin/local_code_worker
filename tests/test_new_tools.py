@@ -132,3 +132,13 @@ def test_server_commands_from_docs(tmp_path):
         "`sudo journalctl -u guard -n 50`, `sudo tail -f /var/log/nginx/access.log`, `sudo systemctl restart x`\n",
         encoding="utf-8")
     assert server_commands(tmp_path) == ["sudo journalctl -u guard -n 50"]
+
+
+def test_fetch_commands_build_ready_ssh(tmp_path):
+    from lcw.agent import fetch_commands
+    (tmp_path / "docs").mkdir()
+    (tmp_path / "docs" / "vm.md").write_text(
+        "Войти: `ssh -i ~/.ssh/admin me@10.0.0.5`, лог: `sudo tail /var/log/nginx/access.log`\n", encoding="utf-8")
+    assert fetch_commands(tmp_path) == [
+        'ssh -o BatchMode=yes -o ConnectTimeout=15 -i ~/.ssh/admin me@10.0.0.5 "zcat -f /var/log/nginx/access.log*"'
+        ' > logs/server_access.log']

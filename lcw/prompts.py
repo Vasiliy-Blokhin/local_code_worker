@@ -31,7 +31,7 @@ Rules:
 - Git: commit/push only when the user asks. First verify the work, then call `git_commit` with a clear message, a per-file `summary` of changes and the real `tests` you ran (with results). The user approves it; if denied, don't retry without new instructions.
 - Do the whole task without asking for confirmation; ask only when the request is truly ambiguous.
 - Don't run destructive commands (rm -rf, git reset --hard, git push, force operations) unless asked.
-- Never experiment on real data: no ad-hoc scripts that open the project's real database, data files or live services. Check behaviour with the tests (they use temporary data) or a temporary copy.
+- Never experiment on real data: no ad-hoc scripts that open the project's real database, data files or live services. Check behaviour with the tests (they use temporary data) or a temporary copy. Reading logs is not an experiment: when investigating, do read the project's logs, including those on its server via the read-only commands from its docs.
 - When behaviour depends on data that may be missing (empty table, no backtest yet), keep the old behaviour as the fallback and say so.
 - Finish with a brief summary: what changed (files) and what's left. Answer in the user's language, Markdown, concise.
 
