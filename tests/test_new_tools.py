@@ -176,3 +176,11 @@ def test_removed_tests_detected(tmp_path):
     (tmp_path / "tests" / "test_a.py").write_text("def test_new():\n    pass\n", encoding="utf-8")
     orig = "def test_old():\n    pass\n\n\ndef test_new():\n    pass\n"
     assert removed_tests(tmp_path, {"tests/test_a.py": orig}) == ["tests/test_a.py: test_old"]
+
+
+def test_spoofable_exemption_patterns():
+    from lcw.agent import EXEMPT, SPOOFABLE
+    d = "Add UA-based bot ignore in is_suspicious and pass UA from parse_line"
+    assert SPOOFABLE.search(d) and EXEMPT.search(d)
+    d2 = "DDoS closes the site only if requests come from at least 20 addresses"
+    assert not (SPOOFABLE.search(d2) and EXEMPT.search(d2))

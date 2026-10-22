@@ -98,6 +98,11 @@ EVIDENCE_CMD = re.compile(r"\b(ssh|scp|journalctl|tail|zcat|Get-Content|Select-S
                           re.IGNORECASE)
 EVIDENCE_PATH = re.compile(r"(^|/)(logs?|deploy|nginx|docs|etc)/|\.(log|conf|inc|service|md|ya?ml)$",
                            re.IGNORECASE)
+# решение доверяет данным, которые задаёт клиент, — и делает по ним исключение из проверки
+SPOOFABLE = re.compile(r"user[- ]?agent|\bUA\b|referr?er|googlebot|yandexbot|bingbot|\bbots?\b|бот\w*|"
+                       r"заголов\w* запрос|request header", re.IGNORECASE)
+EXEMPT = re.compile(r"ignor|skip|whitelist|allow|exclud|exempt|bypass|filter|игнор|пропуск|исключ|не счита|"
+                    r"не учитыв|белый список|доверен|фильтр", re.IGNORECASE)
 # в ответе на сверку есть несделанные пункты
 UNDONE = re.compile(r"не\s+сделан|не\s+выполнен|частично|not\s+done|partial", re.IGNORECASE)
 # до плана разрешены проверки, которые ничего не меняют в коде: тесты, компиляция, импорт
@@ -1002,6 +1007,16 @@ class Agent:
                      for n, sim in missing.items()]
             return ToolResult("Ошибка: решение опирается на несуществующие сущности:\n" + "\n".join(lines)
                               + "\nНайди реальные через symbols/grep и пришли decide заново.", ok=False)
+        if SPOOFABLE.search(decision) and EXEMPT.search(decision) and not st.get("spoof_warned"):
+            # «не считать запросы Googlebot» — атакующему достаточно подставить этот User-Agent
+            st["spoof_warned"] = True
+            return ToolResult(
+                "Внимание: решение делает исключение по данным, которые задаёт сам клиент (User-Agent, Referer, "
+                "заголовки, параметры запроса). Их подделывают: сканеры часто представляются Googlebot/YandexBot. "
+                "Так защиту обойдёт любой, кто подставит это значение. Проверь в логах, с каких адресов шли такие "
+                "запросы (logstats match=<значение> by=ip). Исключения строй на том, что клиент не подделает: "
+                "адрес и подсеть, поведение (число запросов и адресов, статусы), или на проверке (обратный DNS). "
+                "Пришли decide заново.", ok=False)
         if DISABLING.search(fallback) and not st.get("fallback_warned"):
             # «нет данных — ничего не делаем» молча выключает работающую функцию (сигналы, отчёты)
             st["fallback_warned"] = True
