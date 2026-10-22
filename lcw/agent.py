@@ -103,6 +103,14 @@ SYMPTOM = re.compile(r"whitelist|allow[- ]?list|ignore[_ ]?(ips?|list|addresses)
                      r"белый список|игнорир\w* (адрес|ip)|исключ\w* (адрес|ip)|"
                      r"(increase|raise|bump|double)\w* (the )?(\w+_)?(limit|threshold)|(limit|threshold) (to|from) \d|"
                      r"(повыс|подн[яи]|увелич)\w* (порог|лимит)", re.IGNORECASE)
+_RAISE = re.compile(r"(limit|threshold|порог|лимит)\w*\D{0,40}?(\d+)\s*(?:на|to|→|->|до)\s*(\d+)", re.IGNORECASE)
+
+
+def is_symptomatic(decision: str) -> bool:
+    """Список исключений или подъём числового порога («guard_total_limit с 6000 на 12000»)."""
+    return bool(SYMPTOM.search(decision)) or any(int(b) > int(a) for _, a, b in _RAISE.findall(decision))
+
+
 # решение доверяет данным, которые задаёт клиент, — и делает по ним исключение из проверки
 SPOOFABLE = re.compile(r"user[- ]?agent|\bUA\b|referr?er|googlebot|yandexbot|bingbot|\bbots?\b|бот\w*|"
                        r"заголов\w* запрос|request header", re.IGNORECASE)
@@ -298,6 +306,8 @@ def peak_digest(ctx: ToolContext, limit: int = 2) -> str:
     from .tools import t_logstats
     logs = ctx.root / "logs"
     files = sorted(logs.glob("server_*.log")) if logs.is_dir() else []
+    if not files and logs.is_dir():  # лог сервера не скачан — самый большой лог проекта
+        files = sorted(logs.glob("*.log"), key=lambda q: -q.stat().st_size)
     for q in files[:1]:
         text = t_logstats(ctx, f"logs/{q.name}", bucket="hour").output
         peaks = re.search(r"пики по hour: (.+)", text)
@@ -1032,7 +1042,10 @@ class Agent:
                 why = ("в проекте есть логи (logs/), а ты их не смотрел: logstats path=logs (match=ERROR|WARNING, "
                        "by=message; для JSON-логов by=status|ip, bucket=hour), а логи сервера — командами из "
                        "документов о развёртывании")
-            elif has_logs and not st.get("fresh_logs") and server_commands(ctx.root):
+            elif has_logs and server_commands(ctx.root) and (
+                    not st.get("fresh_logs")
+                    # сервис работает на сервере — свежий домашний лог планировщика его не заменяет
+                    or fetch_commands(ctx.root) and not list((ctx.root / "logs").glob("server_*.log"))):
                 fetch = fetch_commands(ctx.root)
                 if fetch and st.get("cause_rejects", 0) >= 1:
                     # модель второй раз не идёт за логами сервера — harness собирает их сам (только чтение)
@@ -1083,7 +1096,7 @@ class Agent:
                         "какие статусы. Если цифры подтверждают причину — пришли тот же decide ещё раз; если нет — "
                         "исправь cause и decision по ним.", ok=False)
             effect = str(args.get("effect", "")).strip()
-            if not why and SYMPTOM.search(decision) and st.get("symptom_rejects", 0) < 2:
+            if not why and is_symptomatic(decision) and st.get("symptom_rejects", 0) < 2:
                 # белый список / подъём порога: инцидент пройдёт, пока его цифры ниже порога и адрес в списке, —
                 # следующий такой же с другого адреса или чуть сильнее повторит сбой
                 weak = not effect or not grounded(effect, st.get("evidence_text", "") + "\n" + cause) \

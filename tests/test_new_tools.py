@@ -251,3 +251,11 @@ def test_tests_pass_on_old_code(tmp_path):
                                                   "def test_new_rule():\n    assert f() == 2\n"}
     assert tests_pass_on_old_code(tmp_path, only) == ["tests/test_g.py::test_toothless"]
     assert (tmp_path / "g.py").read_text(encoding="utf-8") == "def f():\n    return 2\n"  # восстановлен
+
+
+def test_threshold_raise_is_symptomatic():
+    from lcw.agent import is_symptomatic
+    assert is_symptomatic("Изменить порог guard_total_limit с 6000 на 12000, чтобы уменьшить ложные срабатывания")
+    assert is_symptomatic("set guard_429_limit from 1500 to 3000")
+    assert not is_symptomatic("Снизить порог guard_429_limit с 1500 на 300")
+    assert not is_symptomatic("DDoS только при запросах минимум с 20 адресов")
