@@ -173,7 +173,9 @@ _FACT = re.compile(r"\d{4}-\d{2}-\d{2}[T ]\d{2}(?::\d{2})?|\d{1,3}(?:\.\d{1,3}){
 def grounded(cause: str, seen: str) -> bool:
     """В причине есть факт (дата-время, адрес, число от 3 цифр), который встречался в собранных логах/выводе."""
     seen_norm = seen.replace("T", " ")
-    return any(f.replace("T", " ") in seen_norm for f in _FACT.findall(cause))
+    # код статуса HTTP (404, 503) есть в любом логе — фактом о причине он не является
+    facts = [f for f in _FACT.findall(cause) if not (f.isdigit() and len(f) == 3 and 100 <= int(f) <= 599)]
+    return any(f.replace("T", " ") in seen_norm for f in facts)
 
 
 def _server_docs(root: Path) -> tuple[list[str], list[str]]:

@@ -184,3 +184,10 @@ def test_spoofable_exemption_patterns():
     assert SPOOFABLE.search(d) and EXEMPT.search(d)
     d2 = "DDoS closes the site only if requests come from at least 20 addresses"
     assert not (SPOOFABLE.search(d2) and EXEMPT.search(d2))
+
+
+def test_status_codes_are_not_facts():
+    from lcw.agent import grounded
+    seen = "по status: 404 ×1618, 429 ×858"
+    assert not grounded("guard закрывал сайт из-за большого числа 404 на статику", seen)
+    assert grounded("1618 ответов 404", seen)
