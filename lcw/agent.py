@@ -1060,6 +1060,13 @@ class Agent:
         reqs = st.get("reqs") or []
         item = reqs[s.focus] if 0 <= s.focus < len(reqs) else ""
         cause = str(args.get("cause", "")).strip()
+        if INVESTIGATE.search(item) and not st.get("server_seen") and \
+                (ctx.root / "logs").is_dir() and list((ctx.root / "logs").glob("server_*.log")):
+            # логи сервера скачал harness и их сводку модель уже получила в задании пункта — это факты
+            st["server_seen"] = True
+            st["fresh_logs"] = st.get("fresh_logs", 0) + 1
+            st["log_evidence"] = st.get("log_evidence", 0) + 1
+            st["evidence_text"] = (st.get("evidence_text", "") + "\n" + peak_digest(ctx))[-200_000:]
         if INVESTIGATE.search(item) and st.get("cause_rejects", 0) < 4:
             why = ""
             main = main_checkout(ctx.root)
