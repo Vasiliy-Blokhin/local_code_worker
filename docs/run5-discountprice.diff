@@ -1,0 +1,33 @@
+diff --git a/app/guard/watch.py b/app/guard/watch.py
+index 7e69b7c..5c91052 100644
+--- a/app/guard/watch.py
++++ b/app/guard/watch.py
+@@ -28,6 +28,13 @@ from pathlib import Path
+ 
+ from app.config import settings
+ 
++# Helper to detect local IP addresses
++def is_local_ip(ip: str) -> bool:
++    """Return True if ip is a private or loopback address.
++    Handles IPv4 127.*, 192.168.*, 10.* and IPv6 ::1.
++    """
++    return ip.startswith("127.") or ip.startswith("192.168.") or ip.startswith("10.") or ip == "::1"
++
+ log = logging.getLogger(__name__)
+ 
+ MAINTENANCE_FILE = ".maintenance"
+@@ -165,11 +172,13 @@ class Guard:
+             v.by_status[h.status] += 1
+             if h.suspicious:
+                 scan_ip[h.ip] += 1
++        local_429 = sum(1 for h in self.hits if h.status == 429 and is_local_ip(h.ip))
++        effective_429 = v.by_status[429] - local_429
+         v.suspicious = sum(scan_ip.values())
+         v.top_ips = per_ip.most_common(5)
+         v.scanners = [(ip, n) for ip, n in scan_ip.most_common() if n >= settings.guard_scan_ip_limit]
+         v.flooders = [(ip, n) for ip, n in per_ip.most_common() if n >= settings.guard_ip_limit]
+-        if v.total >= settings.guard_total_limit or v.by_status[429] >= settings.guard_429_limit:
++        if v.total >= settings.guard_total_limit or effective_429 >= settings.guard_429_limit:
+             v.kinds.append("ddos")
+             v.close = True
+         # Один-два сканера сайт не закрывают: nginx и так отвечает им 444/404, достаточно сообщения

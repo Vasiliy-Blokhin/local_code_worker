@@ -1,0 +1,57 @@
+diff --git a/app/config.py b/app/config.py
+index 4452cc7..ec708b4 100644
+--- a/app/config.py
++++ b/app/config.py
+@@ -29,12 +29,12 @@ class Settings(BaseSettings):
+     guard_log: str = "logs/access.log"  # дома — app.web.server, на VPS — лог nginx
+     guard_interval: int = 15          # как часто читать лог, с
+     guard_window: int = 60
+-    guard_total_limit: int = 6000     # всего запросов за окно -> DDoS, сайт закрывается
+-    guard_429_limit: int = 1500       # отбито лимитом nginx за окно -> DDoS, сайт закрывается
++    guard_total_limit: int = 12000     # всего запросов за окно -> DDoS, сайт закрывается
++    guard_429_limit: int = 3000       # отбито лимитом nginx за окно -> DDoS, сайт закрывается
+     guard_ip_limit: int = 800         # один IP за окно -> сообщение (flood)
+     guard_scan_ip_limit: int = 20     # подозрительных запросов одного IP -> сообщение (scan)
+     guard_scan_close: int = 500       # подозрительных всего -> сайт закрывается, если сканеров много:
+-    guard_scan_close_ips: int = 5     # один-два сканера (nginx и так рвёт им 444/404) сайт не закрывают
++    guard_scan_close_ips: int = 10     # один-два сканера (nginx и так рвёт им 444/404) сайт не закрывают
+     guard_alert_cooldown: int = 900   # одинаковые сообщения не чаще, с
+     guard_auto_reopen: int = 30       # открыть сайт после N минут тишины; 0 — только вручную (/open)
+     # Публикация на веб-сервер (ВМ Hyper-V или VPS): адрес сервера; пусто — сайт раздаётся только дома.
+diff --git a/app/guard/watch.py b/app/guard/watch.py
+index 7e69b7c..4f0cd9b 100644
+--- a/app/guard/watch.py
++++ b/app/guard/watch.py
+@@ -25,6 +25,7 @@ from collections import Counter, deque
+ from dataclasses import dataclass, field
+ from datetime import datetime, timezone
+ from pathlib import Path
++import ipaddress
+ 
+ from app.config import settings
+ 
+@@ -48,6 +49,15 @@ def is_suspicious(method: str, uri: str, status: int) -> bool:
+         return True
+     return bool(_SUSPICIOUS.search(uri or ""))
+ 
++def is_whitelisted_ip(ip: str) -> bool:
++    """Return True if IP is private (RFC 1918) or loopback.
++    This is used to ignore local traffic in guard analysis.
++    """
++    try:
++        return ipaddress.ip_address(ip).is_private or ipaddress.ip_address(ip).is_loopback
++    except ValueError:
++        return False
++
+ 
+ @dataclass
+ class Hit:
+@@ -161,6 +171,8 @@ class Guard:
+         v = Verdict(total=len(self.hits))
+         per_ip, scan_ip = Counter(), Counter()
+         for h in self.hits:
++            if is_whitelisted_ip(h.ip):
++                continue
+             per_ip[h.ip] += 1
+             v.by_status[h.status] += 1
+             if h.suspicious:

@@ -1,0 +1,17 @@
+diff --git a/app/config.py b/app/config.py
+index 4452cc7..0363ad3 100644
+--- a/app/config.py
++++ b/app/config.py
+@@ -30,9 +30,9 @@ class Settings(BaseSettings):
+     guard_interval: int = 15          # как часто читать лог, с
+     guard_window: int = 60
+     guard_total_limit: int = 6000     # всего запросов за окно -> DDoS, сайт закрывается
+-    guard_429_limit: int = 1500       # отбито лимитом nginx за окно -> DDoS, сайт закрывается
+-    guard_ip_limit: int = 800         # один IP за окно -> сообщение (flood)
+-    guard_scan_ip_limit: int = 20     # подозрительных запросов одного IP -> сообщение (scan)
++    guard_429_limit: int = 2000       # отбито лимитом nginx за окно -> DDoS, сайт закрывается
++    guard_ip_limit: int = 1200         # один IP за окно -> сообщение (flood)
++    guard_scan_ip_limit: int = 30     # подозрительных запросов одного IP -> сообщение (scan)
+     guard_scan_close: int = 500       # подозрительных всего -> сайт закрывается, если сканеров много:
+     guard_scan_close_ips: int = 5     # один-два сканера (nginx и так рвёт им 444/404) сайт не закрывают
+     guard_alert_cooldown: int = 900   # одинаковые сообщения не чаще, с

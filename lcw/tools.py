@@ -19,7 +19,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import config, entities
-from .workspace import WorkspaceError, find_venv, is_text_file, list_files, relpath, resolve, venv_bin
+from .workspace import WorkspaceError, find_venv, is_text_file, list_files, main_checkout, pytest_env, relpath, resolve, venv_bin
 
 READ_LIMIT = 400        # строк по умолчанию
 LINE_CHARS = 400        # обрезка длинных строк при чтении
@@ -61,8 +61,12 @@ TOOLS = [
         {"decision": {**S, "description": "concrete rule: criterion/metric/threshold or structure, where it plugs in"},
          "uses": {"type": "array", "items": S,
                   "description": "existing functions/classes/settings it relies on (real names from the code)"},
-         "fallback": {**S, "description": "behaviour when data is missing or the check cannot run"}},
-        ["decision", "uses", "fallback"]),
+         "fallback": {**S, "description": "behaviour when data is missing or the check cannot run"},
+         "cause": {**S, "description": "the problem this solves and its cause, with evidence you found (log "
+                                       "times, counts, file:line); '-' only if the item is not about a problem"},
+         "effect": {**S, "description": "what the new rule does in the found case (same times/numbers) and in the "
+                                        "same case from another address or twice as strong"}},
+        ["decision", "uses", "fallback", "cause"]),
     _fn("symbols", "Project entity index (classes/functions with line ranges and docstrings). "
                    "path=file: its outline; query: search names+docstrings (words, `|` = or) in path; "
                    "use it to find code before read/grep.",
@@ -78,6 +82,23 @@ TOOLS = [
         {"pattern": S, "path": {**S, "description": "file or subdir"},
          "glob": {**S, "description": "file filter, e.g. *.py"},
          "ignore_case": {"type": "boolean"}}, ["pattern"]),
+    _fn("refs", "All references of a name (whole word): definition, imports, uses, each with the enclosing "
+                "function; for snake_case settings also NAME_UPPER (.env). Use before renaming or changing "
+                "a function/setting to find every place to update.",
+        {"name": {**S, "description": "identifier, e.g. guard_ip_limit or Guard.analyze"},
+         "path": {**S, "description": "file or subdir"}}, ["name"]),
+    _fn("test", "Run the project's pytest (project venv) and get a SHORT report: each failure's test, "
+                "location and `E` lines. path = test file/dir, or a source module to run the tests that "
+                "import it; keyword = -k filter. Use it to verify each step.",
+        {"path": S, "keyword": S, "timeout": {**I, "description": "seconds"}}, []),
+    _fn("logstats", "Summarize a log file or folder instead of reading it: line count, time range, top values, "
+                    "peaks over time. Works with JSON lines (nginx) and text logs. Use it to find evidence "
+                    "of a problem (errors, attacks, outages) before changing code.",
+        {"path": {**S, "description": "log file or folder (e.g. logs)"},
+         "match": {**S, "description": "regex filter of lines, e.g. ERROR|503"},
+         "by": {**S, "description": "JSON field (status, ip, uri…) or level | message: top values"},
+         "bucket": {"type": "string", "enum": ["minute", "hour", "day"], "description": "histogram over time"},
+         "show": {**I, "description": "also show the last N matching lines (<=30)"}}, ["path"]),
     _fn("edit", "Replace an exact unique snippet in a file. `old` must match the file "
                 "exactly (copy from read output without line numbers, keep trailing \\ etc.); "
                 "include enough lines to be unique. Plain text, NOT patch/diff format. "
@@ -208,6 +229,12 @@ def t_read(ctx: ToolContext, path: str, offset: int = 1, limit: int = READ_LIMIT
     if p.is_dir():
         return t_glob(ctx, "*", path)
     if not p.is_file():
+        alt = _in_main(ctx, path)
+        if alt is not None:  # worktree: файл из .gitignore (логи, данные) есть только в основной копии
+            if alt.is_dir() or LOG_FILE.search(alt.name):
+                return ToolResult(f"{path} есть только в основной копии проекта ({alt}). Логи смотри через "
+                                  f"logstats path={path} (сводка, match=, by=, bucket=, show=).")
+            raise ToolError(f"Файл не найден: {path} (есть только в основной копии проекта, не в этой ветке)")
         raise ToolError(f"Файл не найден: {path}")
     if not is_text_file(p):
         raise ToolError(f"Бинарный файл: {path}")
@@ -249,10 +276,28 @@ def t_read(ctx: ToolContext, path: str, offset: int = 1, limit: int = READ_LIMIT
     return ToolResult(_trunc("\n".join(out)) + tail, path=rel)
 
 
+LOG_FILE = re.compile(r"\.(log|out|err)(\.\d+)?(\.gz)?$|^access|^error", re.IGNORECASE)
+
+
+def _in_main(ctx: ToolContext, path: str) -> Path | None:
+    """Путь, которого нет в worktree, но есть в основной копии проекта (папки из .gitignore: logs/, data/)."""
+    main = main_checkout(ctx.root)
+    if not main or not path or resolve(ctx.root, path).exists():
+        return None
+    alt = resolve(main, path)
+    return alt if alt.exists() else None
+
+
 def t_glob(ctx: ToolContext, pattern: str, path: str = "") -> ToolResult:
+    alt = _in_main(ctx, path)
+    if alt is not None and alt.is_dir():
+        names = sorted(q.relative_to(alt).as_posix() for q in alt.rglob("*") if q.is_file())[:200]
+        return ToolResult(f"{path} есть только в основной копии проекта ({alt}); файлы:\n"
+                          + "\n".join(f"{path.rstrip('/')}/{n}" for n in names)
+                          + "\nЛоги смотри через logstats (сводка без чтения целиком).")
     base = relpath(ctx.root, resolve(ctx.root, path or "."))
     base = "" if base == "." else base.rstrip("/") + "/"
-    pat = pattern.strip().replace("\\", "/").removeprefix("./")
+    pat = pattern.strip().replace("\\", "/").removeprefix("./") or "*"  # пустой шаблон — всё в path
     files = [f for f in list_files(ctx.root) if f.startswith(base)]
     hits = []
     for f in files:
@@ -274,18 +319,26 @@ def t_grep(ctx: ToolContext, pattern: str, path: str = "", glob: str = "",
         rx = re.compile(pattern, flags)
     except re.error:  # «Rotation(» и т.п. — модель имела в виду буквальную строку
         rx = re.compile(re.escape(pattern), flags)
-    target = resolve(ctx.root, path or ".")
-    if target.is_file():
-        files = [relpath(ctx.root, target)]
+    root, note = ctx.root, ""
+    alt = _in_main(ctx, path)
+    if alt is not None:  # worktree: логи и данные из .gitignore есть только в основной копии
+        root = main_checkout(ctx.root)
+        note = f"(основная копия проекта {root})\n"
+        files = ([relpath(root, alt)] if alt.is_file() else
+                 [relpath(root, q) for q in sorted(alt.rglob("*")) if q.is_file()])
     else:
-        base = relpath(ctx.root, target)
-        base = "" if base == "." else base + "/"
-        files = [f for f in list_files(ctx.root) if f.startswith(base)]
+        target = resolve(ctx.root, path or ".")
+        if target.is_file():
+            files = [relpath(ctx.root, target)]
+        else:
+            base = relpath(ctx.root, target)
+            base = "" if base == "." else base + "/"
+            files = [f for f in list_files(ctx.root) if f.startswith(base)]
     if glob:
         files = [f for f in files if fnmatch.fnmatch(f.rsplit("/", 1)[-1], glob) or fnmatch.fnmatch(f, glob)]
     out, n = [], 0
     for f in files:
-        p = ctx.root / f
+        p = root / f
         if not is_text_file(p) or p.stat().st_size > 2_000_000:
             continue
         try:
@@ -298,8 +351,450 @@ def t_grep(ctx: ToolContext, pattern: str, path: str = "", glob: str = "",
                 n += 1
                 if n >= GREP_MAX:
                     out.append(f"…лимит {GREP_MAX} совпадений, уточните запрос")
-                    return ToolResult("\n".join(out))
-    return ToolResult("\n".join(out) if out else "Нет совпадений.")
+                    return ToolResult(note + "\n".join(out))
+    return ToolResult(note + ("\n".join(out) if out else "Нет совпадений."))
+
+
+
+REFS_MAX = 80
+_IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _enclosing(root: Path, rel: str, line: int) -> str:
+    """Самая вложенная сущность (функция/метод/класс), в которую попадает строка; '' — уровень модуля."""
+    if not entities.supported(rel):
+        return ""
+    best = None
+    for e in entities.file_entities(root, rel)[1]:
+        if e.line <= line <= e.end and (best is None or e.end - e.line < best.end - best.line):
+            best = e
+    return best.name if best else ""
+
+
+def _scope_files(root: Path, path: str) -> list[str]:
+    target = resolve(root, path or ".")
+    if target.is_file():
+        return [relpath(root, target)]
+    base = relpath(root, target)
+    base = "" if base == "." else base + "/"
+    return [f for f in list_files(root) if f.startswith(base)]
+
+
+def t_refs(ctx: ToolContext, name: str, path: str = "") -> ToolResult:
+    """
+    Все упоминания имени (целым словом) с охватывающей функцией: где определено, где импортируется,
+    где используется. Для snake_case-настроек ищется и ИМЯ_В_ВЕРХНЕМ_РЕГИСТРЕ (.env, документация).
+    """
+    name = name.strip().rsplit(".", 1)[-1]  # settings.guard_ip_limit -> guard_ip_limit
+    if not _IDENT.match(name):
+        return ToolResult("Ошибка: name — один идентификатор (функция, класс, переменная, настройка).", ok=False)
+    variants = {name}
+    if name.lower() == name and "_" in name:
+        variants.add(name.upper())
+    rx = re.compile(r"(?<![A-Za-z0-9_])(?:" + "|".join(map(re.escape, sorted(variants))) + r")(?![A-Za-z0-9_])")
+    defn = re.compile(r"^\s*(?:async\s+def|def|class)\s+" + re.escape(name) + r"\b|^\s*" + re.escape(name)
+                      + r"\s*(?::[^=]*)?=(?!=)")
+    groups: dict[str, list[str]] = {}
+    n = 0
+    for f in _scope_files(ctx.root, path):
+        p = ctx.root / f
+        if not is_text_file(p) or p.stat().st_size > 2_000_000:
+            continue
+        try:
+            text = p.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for i, line in enumerate(text.splitlines(), 1):
+            if not rx.search(line):
+                continue
+            kind = ("def" if defn.match(line) else
+                    "import" if re.match(r"\s*(from\s+\S+\s+)?import\b", line) else "use")
+            where = _enclosing(ctx.root, f, i)
+            groups.setdefault(f, []).append(f"  {i} [{kind}{' in ' + where if where else ''}] {line.strip()[:160]}")
+            n += 1
+            if n >= REFS_MAX:
+                break
+        if n >= REFS_MAX:
+            break
+    if not groups:
+        return ToolResult(f"«{name}» нигде не упоминается" + (f" в {path}" if path else "") + ".")
+    tests = [f for f in groups if re.search(r"(^|/)(tests?/|test_)", f)]
+    head = (f"{n} упоминаний «{'/'.join(sorted(variants))}» в {len(groups)} файлах"
+            + (f" (лимит {REFS_MAX}, уточните path)" if n >= REFS_MAX else "")
+            + (f"; тесты: {', '.join(tests)}" if tests else "; в тестах не упоминается") + ":")
+    return ToolResult(head + "\n" + "\n".join(f"{f}\n" + "\n".join(lines) for f, lines in groups.items()))
+
+
+def _pytest_python(root: Path) -> str:
+    venv = find_venv(root)
+    if not venv:
+        return sys.executable
+    exe = venv_bin(venv) / ("python.exe" if (venv_bin(venv) / "python.exe").is_file() else "python")
+    return str(exe)
+
+
+def _is_test_file(rel: str) -> bool:
+    name = rel.rsplit("/", 1)[-1]
+    return rel.endswith(".py") and (name.startswith("test_") or name.endswith("_test.py"))
+
+
+def covering_tests(root: Path, rel: str) -> list[str]:
+    """Тестовые файлы, которые импортируют модуль rel (app/guard/watch.py -> app.guard.watch)."""
+    if not rel.endswith(".py"):
+        return []
+    mod = rel[:-3].replace("/", ".")
+    if mod.endswith(".__init__"):
+        mod = mod[: -len(".__init__")]
+    last = mod.rsplit(".", 1)[-1]
+    parent = mod.rsplit(".", 1)[0] if "." in mod else ""
+    pats = [re.compile(r"\b(from|import)\s+" + re.escape(mod) + r"\b")]
+    if parent:
+        pats.append(re.compile(r"\bfrom\s+" + re.escape(parent) + r"\s+import\s+[^\n]*\b" + re.escape(last) + r"\b"))
+    out = []
+    for f in list_files(root):
+        if not _is_test_file(f):
+            continue
+        try:
+            text = (root / f).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        if any(p.search(text) for p in pats):
+            out.append(f)
+    return out
+
+
+def _norm(text: str) -> str:
+    return text.replace(chr(13) + chr(10), chr(10))
+
+
+def revert_whitespace_only(root: Path, originals: dict) -> list[str]:
+    """
+    Файлы, отличающиеся от исходных только пробелами и пустыми строками, — вернуть как были.
+    Модель удаляет свои неудачные вставки и оставляет хвосты пустых строк в чужих файлах.
+    """
+    out = []
+    for rel, orig in originals.items():
+        p = root / rel
+        if orig is None or not p.is_file():
+            continue
+        try:
+            now = p.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        if _norm(now) != _norm(orig) and re.sub(r"\s+", "", now) == re.sub(r"\s+", "", orig):
+            p.write_bytes(orig.encode("utf-8"))
+            out.append(rel)
+    return out
+
+
+def _test_names(text: str) -> set[str]:
+    try:
+        tree = ast.parse(text)
+    except (SyntaxError, ValueError):
+        return set()
+    return {n.name for n in tree.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and n.name.startswith("test")}
+
+
+def tests_pass_on_old_code(root: Path, originals: dict, timeout: int = 300) -> list[str] | None:
+    """
+    Новые тесты сессии, которые проходят и на коде ДО правок, — изменение они не проверяют.
+    Рабочие файлы на время прогона возвращаются к исходным и затем восстанавливаются.
+    None — проверить нельзя (нет новых тестов, pytest недоступен); [] — все новые тесты ловят изменение.
+    """
+    new_ids = []
+    for rel, orig in originals.items():
+        if _is_test_file(rel) and (root / rel).is_file():
+            now = (root / rel).read_text(encoding="utf-8", errors="replace")
+            new_ids += [f"{rel}::{n}" for n in sorted(_test_names(now) - _test_names(orig or ""))]
+    sources = {rel: orig for rel, orig in originals.items() if not _is_test_file(rel) and rel.endswith(".py")}
+    if not new_ids or not sources:
+        return None
+    current = {}
+    try:
+        for rel, orig in sources.items():
+            p = root / rel
+            current[rel] = p.read_bytes() if p.is_file() else None
+            if orig is None:
+                p.unlink(missing_ok=True)  # файл создан в сессии — до правок его не было
+            else:
+                p.write_bytes(orig.encode("utf-8"))
+        res = subprocess.run([_pytest_python(root), "-m", "pytest", "-q", "-rA", "--tb=no", "-p", "no:cacheprovider",
+                              *new_ids], cwd=str(root), capture_output=True, text=True, encoding="utf-8",
+                             errors="replace", timeout=timeout,
+                             env=pytest_env({**os.environ, "PYTHONIOENCODING": "utf-8", "CI": "1"}))
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    finally:
+        for rel, data in current.items():
+            p = root / rel
+            if data is None:
+                p.unlink(missing_ok=True)
+            else:
+                p.write_bytes(data)
+    passed = set(re.findall(r"^PASSED (\S+)", res.stdout, re.M))
+    failed = set(re.findall(r"^(?:FAILED|ERROR) (\S+)", res.stdout, re.M))
+    # параметризованные тесты: test_x[a], test_x[b] — тест «не ловит изменение», если ни один вариант не упал
+    old_ok = [t for t in new_ids if any(p == t or p.startswith(t + "[") for p in passed)
+              and not any(f == t or f.startswith(t + "[") for f in failed)]
+    # тест «прежнее поведение сохранилось» и должен проходить на старом коде; плохо, когда так ведут себя ВСЕ новые
+    return old_ok if len(old_ok) == len(new_ids) else []
+
+
+def removed_tests(root: Path, originals: dict) -> list[str]:
+    """Тестовые функции, которые были в тестовых файлах до правок сессии и исчезли (write целиком и т.п.)."""
+    out = []
+    for rel, orig in originals.items():
+        if orig is None or not _is_test_file(rel):
+            continue
+        try:
+            before = {n.name for n in ast.walk(ast.parse(orig))
+                      if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name.startswith("test")}
+            now = (root / rel).read_text(encoding="utf-8", errors="replace") if (root / rel).is_file() else ""
+            after = {n.name for n in ast.walk(ast.parse(now))
+                     if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name.startswith("test")}
+        except (SyntaxError, ValueError, OSError):
+            continue  # синтаксис проверяется отдельно
+        out += [f"{rel}: {name}" for name in sorted(before - after)]
+    return out
+
+
+def untested_changes(root: Path, originals: dict) -> list[str]:
+    """Изменённые рабочие модули с тестами, когда ни один тестовый файл в сессии не менялся."""
+    if any(_is_test_file(rel) for rel in originals):
+        return []
+    out = []
+    for rel, orig in originals.items():
+        if not rel.endswith(".py") or orig is None or not (root / rel).is_file():
+            continue
+        try:
+            if _norm((root / rel).read_text(encoding="utf-8", errors="replace")) == _norm(orig):
+                continue
+        except OSError:
+            continue
+        tests = covering_tests(root, rel)
+        if len(tests) > 2:
+            # общий модуль (настройки, утилиты) импортируют многие тесты — это не его тесты;
+            # иначе модель дописывает бессмысленные проверки в чужие тестовые файлы
+            stem = rel.rsplit("/", 1)[-1][:-3]
+            tests = [t for t in tests if stem in t.rsplit("/", 1)[-1]]
+        if tests:
+            out.append(f"{rel} (тесты: {', '.join(tests[:3])})")
+    return out
+
+
+_FAIL_HEAD = re.compile(r"^_{3,} (.+?) _{3,}$")
+_TB_PLACE = re.compile(r"^[\w./\\:-]+\.py:\d+:")
+
+
+def condense_pytest(out: str, max_fail: int = 6) -> str:
+    """
+    Вывод pytest -> коротко: по каждому падению — имя теста, место (файл:строка) и строки `E`,
+    затем итоговая строка. Полные трейсбеки маленькой модели только мешают.
+    """
+    lines = out.splitlines()
+    summary = next((l.strip("= ").strip() for l in reversed(lines)
+                    if re.search(r"\b(passed|failed|errors?|no tests ran)\b", l)), "")
+    fails, cur = [], None
+    for l in lines:
+        st = l.strip()
+        m = _FAIL_HEAD.match(st)
+        if m:
+            cur = {"name": m.group(1), "where": "", "e": []}
+            fails.append(cur)
+            continue
+        if l.startswith("="):
+            cur = None  # секция кончилась (short test summary, warnings…)
+            continue
+        if cur is None:
+            continue
+        if _TB_PLACE.match(st):
+            cur["where"] = st[:200]  # последнее место в трейсбеке — ближе всего к причине
+        elif l.startswith("E ") and len(cur["e"]) < 10:
+            cur["e"].append(l[:220])
+    if not fails:
+        errs = [l for l in lines if l.startswith(("E ", "ERROR", "ImportError", "ModuleNotFoundError"))][:15]
+        return "\n".join(errs + [summary or "\n".join(lines[-15:])])
+    parts = [f"✗ {f['name']}" + (f"\n  at {f['where']}" if f["where"] else "")
+             + ("\n" + "\n".join(f["e"]) if f["e"] else "") for f in fails[:max_fail]]
+    if len(fails) > max_fail:
+        parts.append(f"…ещё {len(fails) - max_fail} падений")
+    return "\n".join(parts + [summary])
+
+
+def t_test(ctx: ToolContext, path: str = "", keyword: str = "", timeout: int | None = None) -> ToolResult:
+    """
+    pytest проекта (через его venv) с кратким отчётом. path — тестовый файл/папка или исходный модуль:
+    для модуля запускаются тесты, которые его импортируют. keyword — фильтр -k.
+    """
+    root = ctx.root
+    args: list[str] = []
+    note = ""
+    if path:
+        target = resolve(root, path)
+        rel = relpath(root, target)
+        if target.is_file() and rel.endswith(".py") and not _is_test_file(rel):
+            found = covering_tests(root, rel)
+            if not found:
+                return ToolResult(f"Ни один тест не импортирует {rel}. Напиши тест (tests/test_<модуль>.py) "
+                                  "или запусти test без path — все тесты.", ok=False)
+            args += found
+            note = f"Тесты, импортирующие {rel}: {', '.join(found)}\n"
+        else:
+            args.append(rel)
+    if keyword:
+        args += ["-k", keyword]
+    timeout = max(10, min(int(timeout or config.COMMAND_TIMEOUT), 1800))
+    cmd = [_pytest_python(root), "-m", "pytest", "-q", "--tb=short", "-p", "no:cacheprovider", *args]
+    try:
+        p = subprocess.run(cmd, cwd=str(root), capture_output=True, text=True, encoding="utf-8",
+                           errors="replace", timeout=timeout,
+                           env=pytest_env({**os.environ, "PYTHONIOENCODING": "utf-8", "CI": "1"}))
+    except subprocess.TimeoutExpired:
+        return ToolResult(f"Тесты не уложились в {timeout} с.", ok=False)
+    except OSError as e:
+        return ToolResult(f"Не удалось запустить pytest: {e}", ok=False)
+    out = (p.stdout + p.stderr).strip()
+    if p.returncode == 5:
+        return ToolResult(note + "Тесты не найдены (" + (" ".join(args) or "весь проект") + ").", ok=False)
+    if "No module named pytest" in out:
+        return ToolResult("pytest не установлен в окружении проекта.", ok=False)
+    return ToolResult(note + _trunc(condense_pytest(out), 4000), ok=p.returncode == 0)
+
+
+_TS = re.compile(r"(\d{4}-\d{2}-\d{2})[T ](\d{2}):(\d{2})")
+_LEVEL = re.compile(r"\b(CRITICAL|ERROR|WARNING|WARN|INFO|DEBUG)\b")
+_NUMS = re.compile(r"\d+(?:[.:]\d+)*")
+
+
+STALE_DAYS = 2
+
+
+def log_age_days(stamp: str) -> int | None:
+    """Сколько полных дней прошло с отметки «YYYY-MM-DD HH:MM» (локальное время)."""
+    import datetime as _dt
+    try:
+        t = _dt.datetime.strptime(stamp[:16], "%Y-%m-%d %H:%M")
+    except ValueError:
+        return None
+    return (_dt.datetime.now() - t).days
+
+
+def _log_lines(p: Path, limit: int = 50 * 1024 * 1024) -> list[str]:
+    """Строки лога (и .gz); не больше limit байт с конца файла."""
+    import gzip
+    if p.suffix == ".gz":
+        with gzip.open(p, "rb") as f:
+            data = f.read(limit * 4)
+    else:
+        with p.open("rb") as f:
+            size = p.stat().st_size
+            f.seek(max(0, size - limit))
+            data = f.read()
+    return data.decode("utf-8", "replace").splitlines()
+
+
+def t_logstats(ctx: ToolContext, path: str, match: str = "", by: str = "", bucket: str = "",
+               show: int = 0) -> ToolResult:
+    """
+    Сводка по логу вместо чтения его целиком: строки JSON (nginx log_format json и т.п.) или текст.
+    match — regex-фильтр строк; by — поле JSON (status, ip, uri…) или `level`/`message` для текста:
+    топ значений; bucket — minute|hour|day: гистограмма по времени; show — показать N последних строк.
+    """
+    base, note = ctx.root, ""
+    target = resolve(base, path)
+    main = main_checkout(ctx.root)
+    if not target.exists() and main and resolve(main, path).exists():
+        # изолированный worktree: логи (.gitignore) есть только в основной копии проекта
+        base, target = main, resolve(main, path)
+        note = f"(логи основной копии проекта {main})\n"
+    every = ([relpath(base, q) for q in sorted(target.rglob("*")) if q.is_file()]
+             if target.is_dir() else [])  # логи обычно в .gitignore — list_files их не видит
+    files = [f for f in every
+             if re.search(r"\.(log|jsonl|json|txt|out|err)(\.\d+)?(\.gz)?$", f) or "log" in f.rsplit("/", 1)[-1]]
+    if target.is_file():
+        files = [relpath(base, target)]
+    if not files:
+        return ToolResult(f"В {path} нет файлов логов.", ok=False)
+    try:
+        rx = re.compile(match, re.IGNORECASE) if match else None
+    except re.error:
+        rx = re.compile(re.escape(match), re.IGNORECASE)
+    rows: list[tuple[str, dict | None]] = []
+    for f in files[:30]:
+        try:
+            lines = _log_lines(base / f)
+        except OSError:
+            continue
+        for line in lines:
+            if not line.strip() or (rx and not rx.search(line)):
+                continue
+            d = None
+            if line.lstrip().startswith("{"):
+                try:
+                    d = json.loads(line)
+                except ValueError:
+                    d = None
+            rows.append((line, d if isinstance(d, dict) else None))
+    out = [f"{len(rows)} строк" + (f" по «{match}»" if match else "") + f" в {len(files)} файлах"
+           + (f" ({', '.join(files[:5])}{'…' if len(files) > 5 else ''})" if len(files) > 1 else "")]
+    if not rows:
+        return ToolResult(out[0] + ".")
+    times = []
+    for line, d in rows:
+        m = _TS.search(str(d.get("time") or d.get("ts") or d.get("timestamp") or "") if d else line) or _TS.search(line)
+        times.append(m)
+    found = [m for m in times if m]
+    if found:
+        stamps = sorted(f"{m.group(1)} {m.group(2)}:{m.group(3)}" for m in found)
+        out.append(f"время: {stamps[0]} … {stamps[-1]}")
+        age = log_age_days(stamps[-1])
+        if age is not None and age >= STALE_DAYS:
+            out.append(f"ВНИМАНИЕ: лог устарел — последняя запись {age} дн. назад. Если сервис сейчас работает "
+                       "в другом месте (сервер, ВМ — см. документацию о развёртывании), актуальные логи там.")
+    keys = {}
+    for _, d in rows:
+        if d:
+            for k in d:
+                keys[k] = keys.get(k, 0) + 1
+    if keys:
+        out.append("поля JSON: " + ", ".join(sorted(keys, key=lambda k: -keys[k])[:20]))
+
+    def top(values, n=12):
+        c: dict[str, int] = {}
+        for v in values:
+            c[v] = c.get(v, 0) + 1
+        items = sorted(c.items(), key=lambda kv: -kv[1])
+        return f"{len(c)} разных: " + ", ".join(f"{k[:80]} ×{v}" for k, v in items[:n])
+
+    if by:
+        if by == "level":
+            vals = [(m.group(1) if (m := _LEVEL.search(line)) else "-") for line, _ in rows]
+        elif by == "message":  # текст без чисел: одинаковые сообщения с разными временем/адресами склеиваются
+            vals = [_NUMS.sub("#", _TS.sub("", line))[:120].strip() for line, _ in rows]
+        else:
+            vals = [str(d.get(by, "-")) if d else "-" for _, d in rows]
+            if all(v == "-" for v in vals):
+                out.append(f"поля «{by}» нет ни в одной строке")
+                vals = []
+        if vals:
+            out.append(f"по {by}: " + top(vals))
+    elif keys:  # без by — самые полезные поля для разбора
+        for k in [k for k in ("status", "ip", "method", "level") if k in keys]:
+            out.append(f"по {k}: " + top([str(d.get(k, "-")) if d else "-" for _, d in rows], 8))
+    else:
+        out.append("по level: " + top([(m.group(1) if (m := _LEVEL.search(line)) else "-") for line, _ in rows], 6))
+    if bucket in ("minute", "hour", "day"):
+        cut = {"minute": 16, "hour": 13, "day": 10}[bucket]
+        c: dict[str, int] = {}
+        for m in found:
+            k = f"{m.group(1)} {m.group(2)}:{m.group(3)}"[:cut]
+            c[k] = c.get(k, 0) + 1
+        peak = sorted(c.items(), key=lambda kv: -kv[1])[:15]
+        out.append(f"пики по {bucket}: " + ", ".join(f"{k} ×{v}" for k, v in sorted(peak)))
+    if show:
+        out.append("последние строки:\n" + "\n".join(line[:300] for line, _ in rows[-min(int(show), 30):]))
+    return ToolResult(note + _trunc("\n".join(out), 5000))
 
 
 def _find_block(text: str, old: str) -> tuple[int, int] | None:
@@ -403,6 +898,23 @@ def _unpatch(old: str, new: str) -> tuple[str, str]:
     return "\n".join(o), "\n".join(n)
 
 
+def _strip_added_marks(old: str, new: str) -> str:
+    """
+    Модель пишет в `new` добавленные строки с «+» в начале (как в диффе), а `old` — без них:
+    в файл попадает «+def test_…» и ломает синтаксис. Если ВСЕ новые строки начинаются с «+»
+    (а в old таких строк нет), это разметка, а не код, — снимаем её.
+    """
+    old_lines = set(old.split("\n"))
+    if any(l.startswith("+") for l in old_lines):
+        return new
+    added = [l for l in new.split("\n") if l.strip() and l not in old_lines]
+    marked = sum(1 for l in added if l.startswith("+"))
+    # «большинство с +»: модель часто пишет первую строку (комментарий) без метки, остальные — с ней
+    if marked < 2 or marked * 3 < len(added) * 2:
+        return new
+    return "\n".join(l[1:] if l.startswith("+") and l not in old_lines else l for l in new.split("\n"))
+
+
 def _plan_edit(ctx: ToolContext, path: str, old: str, new: str, replace_all: bool = False):
     """Вычисляет правку без записи. Возвращает (p, rel, text, after, nl, start, new, summary)."""
     p = resolve(ctx.root, path)
@@ -413,6 +925,8 @@ def _plan_edit(ctx: ToolContext, path: str, old: str, new: str, replace_all: boo
     old, new = _unpatch(old.replace("\r\n", "\n"), new.replace("\r\n", "\n"))
     # модель копирует номера строк из вывода read («129│код») — маркер «│» наш, срезаем его
     old, new = _LINE_NO.sub("", old), _LINE_NO.sub("", new)
+    if not rel.endswith((".diff", ".patch", ".md")):
+        new = _strip_added_marks(old, new)
     if old == new:
         raise ToolError("old и new совпадают.")
     if not old:  # дописать в конец файла
@@ -446,7 +960,16 @@ def _plan_edit(ctx: ToolContext, path: str, old: str, new: str, replace_all: boo
 
 
 def t_edit(ctx: ToolContext, path: str, old: str, new: str, replace_all: bool = False) -> ToolResult:
-    p, rel, text, after, nl, start, new, summary = _plan_edit(ctx, path, old, new, replace_all)
+    try:
+        p, rel, text, after, nl, start, new, summary = _plan_edit(ctx, path, old, new, replace_all)
+    except ToolError:
+        # после неудачной правки модель перечитывает место, чтобы скопировать точный текст, —
+        # заглушка «не изменился с прошлого чтения» тут только зацикливает её
+        try:
+            _forget(ctx, relpath(ctx.root, resolve(ctx.root, path)))
+        except (WorkspaceError, ValueError):
+            pass
+        raise
     return _finish_edit(ctx, p, rel, text, after, nl, start, new, summary)
 
 
@@ -912,7 +1435,7 @@ def project_tests(root: Path, timeout: int = 600) -> tuple[bool, str] | None:
     try:
         p = subprocess.run([py, "-m", "pytest", "-q", "-x", "-p", "no:cacheprovider"], cwd=str(root),
                            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout,
-                           env={**os.environ, "PYTHONIOENCODING": "utf-8", "CI": "1"})
+                           env=pytest_env({**os.environ, "PYTHONIOENCODING": "utf-8", "CI": "1"}))
     except (OSError, subprocess.TimeoutExpired):
         return None
     out = (p.stdout + p.stderr).strip()
@@ -1076,6 +1599,8 @@ async def t_run(ctx: ToolContext, command: str, timeout: int | None = None) -> T
     timeout = max(1, min(int(timeout or config.COMMAND_TIMEOUT), 1800))
     env = {**os.environ, "PYTHONIOENCODING": "utf-8", "PYTHONUTF8": "1", "GIT_PAGER": "cat",
            "PAGER": "cat", "GIT_TERMINAL_PROMPT": "0", "CI": "1"}
+    if "pytest" in command:
+        env = pytest_env(env)
     venv = find_venv(ctx.root)
     if venv:  # python/pytest проекта, а не системные
         env["VIRTUAL_ENV"] = str(venv)
@@ -1209,7 +1734,8 @@ def t_git_commit(ctx: ToolContext, **args) -> ToolResult:
     return ToolResult("OK: " + " ".join(steps))
 
 
-SYNC = {"git_commit": t_git_commit, "symbols": t_symbols, "read": t_read, "glob": t_glob, "grep": t_grep, "edit": t_edit, "write": t_write}
+SYNC = {"git_commit": t_git_commit, "symbols": t_symbols, "refs": t_refs, "test": t_test,
+        "logstats": t_logstats, "read": t_read, "glob": t_glob, "grep": t_grep, "edit": t_edit, "write": t_write}
 
 
 async def execute(ctx: ToolContext, name: str, args: dict) -> ToolResult:

@@ -1,0 +1,51 @@
+diff --git a/app/guard/watch.py b/app/guard/watch.py
+index 7e69b7c..81cbd45 100644
+--- a/app/guard/watch.py
++++ b/app/guard/watch.py
+@@ -17,6 +17,7 @@ python -m app.guard.watch --log logs/nginx/access.log --once
+ import argparse
+ import json
+ import logging
++import ipaddress
+ import os
+ import re
+ import threading
+@@ -163,7 +164,7 @@ class Guard:
+         for h in self.hits:
+             per_ip[h.ip] += 1
+             v.by_status[h.status] += 1
+-            if h.suspicious:
++            if h.suspicious and not ipaddress.ip_address(h.ip).is_private:
+                 scan_ip[h.ip] += 1
+         v.suspicious = sum(scan_ip.values())
+         v.top_ips = per_ip.most_common(5)
+diff --git a/tests/test_guard.py b/tests/test_guard.py
+index 6678613..d54adba 100644
+--- a/tests/test_guard.py
++++ b/tests/test_guard.py
+@@ -161,3 +161,25 @@ def test_bot_commands(tmp_path, monkeypatch):
+     assert "открыт" in commands.handle("/guard")
+     assert "закрыт" in commands.handle("/close") and g.is_closed()
+     assert "снята" in commands.handle("/open") and not g.is_closed()
++
++
++def test_private_ip_suspicious_does_not_close(guard, no_db, monkeypatch):
++    # set low thresholds for quick test
++    monkeypatch.setattr(watch.settings, "guard_scan_close", 10)
++    monkeypatch.setattr(watch.settings, "guard_scan_close_ips", 3)
++    # 10 suspicious requests from private IP
++    lines = [line(T0 + i, ip="10.0.0.1", uri=f"/x{i}.php", status=404) for i in range(10)]
++    append(guard, lines)
++    guard.tick(now=T0 + 30)
++    assert not guard.is_closed()
++
++
++def test_private_and_public_ip_suspicious_close(guard, no_db, monkeypatch):
++    # set thresholds to trigger close with public IPs only
++    monkeypatch.setattr(watch.settings, "guard_scan_close", 2)
++    monkeypatch.setattr(watch.settings, "guard_scan_close_ips", 1)
++    # 2 suspicious requests from public IP
++    lines = [line(T0 + i, ip="8.8.8.8", uri=f"/x{i}.php", status=404) for i in range(2)]
++    append(guard, lines)
++    guard.tick(now=T0 + 30)
++    assert guard.is_closed()

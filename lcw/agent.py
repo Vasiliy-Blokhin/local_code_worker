@@ -22,9 +22,9 @@ from .llm import LLM, Completion, LLMError
 from .sessions import Session
 from .tools import (MUTATING, TOOLS, ToolContext, ToolError, ToolResult, execute, normalize_plan,
                     GIT_WRITE, git_preview, preview, render_plan, syntax_errors, unused_modules, import_errors,
-                    unused_new_imports, new_stubs, project_tests, find_merges, undefined_names,
-                    sql_column_errors, dropped_dependencies)
-from .workspace import WorkspaceError, get_project, is_text_file, relpath, resolve
+                    unused_new_imports, new_stubs, project_tests, untested_changes, removed_tests, revert_whitespace_only, tests_pass_on_old_code, find_merges, undefined_names,
+                    sql_column_errors, dropped_dependencies, SHELL_NAME)
+from .workspace import WorkspaceError, get_project, is_text_file, main_checkout, relpath, resolve
 
 UI_OUTPUT = 6000           # сколько вывода инструмента показывать в UI
 CHARS_PER_TOKEN = 3.2      # грубая оценка для бюджета контекста
@@ -37,6 +37,46 @@ REFUSAL = re.compile(r"I'?m sorry|I can(no|')t|cannot (help|do|complete)|beyond 
                      r"выходит за рамки|предостав\w* (специфика|подробн|пример)", re.IGNORECASE)
 # сбой разбора вызова инструмента в llama.cpp и подсказка для повтора
 PARSE_ERROR = re.compile(r"does not match the expected|Failed to parse|unparsed", re.IGNORECASE)
+_SHELL_TOOLS = ("logstats", "refs", "symbols", "test")  # имена, которых нет среди программ оболочки
+
+
+def tool_from_shell(command: str) -> tuple[str, dict] | None:
+    """
+    `logstats --path=logs/a.log --match=ERROR` / `refs name=foo` → (инструмент, аргументы).
+    Маленькая модель путает инструменты с командами оболочки; ответ «команда не найдена» её только сбивает.
+    """
+    import shlex
+    try:
+        parts = shlex.split(command.strip())
+    except ValueError:
+        return None
+    if not parts or parts[0] not in _SHELL_TOOLS:
+        return None
+    name = parts[0]
+    spec = next(t["function"]["parameters"]["properties"] for t in TOOLS if t["function"]["name"] == name)
+    args: dict = {}
+    rest = parts[1:]
+    k = 0
+    while k < len(rest):
+        tok = rest[k].lstrip("-")
+        key, eq, val = tok.partition("=")
+        if not eq and key in spec and k + 1 < len(rest) and not rest[k + 1].startswith("-"):
+            val, k = rest[k + 1], k + 1
+        elif not eq:  # позиционный аргумент — первый обязательный параметр
+            key, val = next(iter(spec)), tok
+        if key in spec:
+            args[key] = int(val) if spec[key].get("type") == "integer" and val.isdigit() else val
+        k += 1
+    return name, args
+
+
+FORMAT_VARIANTS = (
+    "",
+    " Сначала одной фразой напиши, что делаешь, затем вызов.",
+    " Сделай самый простой следующий шаг: один вызов read или logstats с короткими аргументами.",
+    " Аргументы — короткие: без длинных многострочных строк; большую правку раздели на несколько edit.",
+    " Если не уверен в вызове — ответь обычным текстом, что собираешься сделать дальше.",
+)
 TOOL_FORMAT_HINT = ("[Система] Предыдущий вызов инструмента не распознан: неверный формат заголовка. Вызывай "
                     "ровно один инструмент обычным способом (канал commentary, получатель functions.<имя>, "
                     "аргументы — JSON-объект) — или ответь текстом. Продолжай с того же места.")
@@ -49,6 +89,37 @@ SETTING = re.compile(r": [A-Z][A-Z0-9]*_[A-Z0-9_]+ использовался")
 DISABLING = re.compile(r"не генерир|не созда|не (будут|будет) (генерир|создав|работ|участв)|ничего не|"
                        r"пуст\w* (список|множеств|результат)|отключ|сигнал\w* нет|не выдава|"
                        r"no signals|nothing|disabled?|empty (set|list)", re.IGNORECASE)
+# пункт-расследование: причину надо найти по фактам, а не угадать
+INVESTIGATE = re.compile(r"причин|проблем|почему|периодическ|отключ|пада[ею]т|лома[ею]т|сбо[ий]|не работа|"
+                         r"изуч|исследу|проанализ|investigat|root cause|\bwhy\b|outage|crash|analy[sz]",
+                         re.IGNORECASE)
+# вызовы, которые собирают факты: логи, конфиги, документы о развёртывании
+EVIDENCE_CMD = re.compile(r"\b(ssh|scp|journalctl|tail|zcat|Get-Content|Select-String|grep|wc)\b|/var/log",
+                          re.IGNORECASE)
+EVIDENCE_PATH = re.compile(r"(^|/)(logs?|deploy|nginx|docs|etc)/|\.(log|conf|inc|service|md|ya?ml)$",
+                           re.IGNORECASE)
+# решение лечит симптом: список исключений или подъём порога вместо правила, меняющего причину
+SYMPTOM = re.compile(r"whitelist|allow[- ]?list|ignore[_ ]?(ips?|list|addresses)|guard_ignore|skip (ips?|hits from)|"
+                     r"белый список|игнорир\w* (адрес|ip)|исключ\w* (адрес|ip)|"
+                     r"(increase|raise|bump|double)\w* (the )?(\w+_)?(limit|threshold)|(limit|threshold) (to|from) \d|"
+                     r"(повыс|подн[яи]|увелич)\w* (порог|лимит)", re.IGNORECASE)
+_RAISE = re.compile(r"(limit|threshold|порог|лимит)\w*\D{0,40}?(\d+)\s*(?:на|to|→|->|до)\s*(\d+)", re.IGNORECASE)
+
+
+_MULT = re.compile(r"(limit|threshold|порог|лимит)\w*\s*[*×x]\s*[2-9]\b", re.IGNORECASE)  # «guard_scan_ip_limit * 2»
+
+
+def is_symptomatic(decision: str) -> bool:
+    """Список исключений или подъём числового порога («guard_total_limit с 6000 на 12000»)."""
+    return bool(SYMPTOM.search(decision)) or any(int(b) > int(a) for _, a, b in _RAISE.findall(decision)) \
+        or bool(_MULT.search(decision))
+
+
+# решение доверяет данным, которые задаёт клиент, — и делает по ним исключение из проверки
+SPOOFABLE = re.compile(r"user[- ]?agent|\bUA\b|referr?er|googlebot|yandexbot|bingbot|\bbots?\b|бот\w*|"
+                       r"заголов\w* запрос|request header", re.IGNORECASE)
+EXEMPT = re.compile(r"ignor|skip|whitelist|allow|exclud|exempt|bypass|filter|игнор|пропуск|исключ|не счита|"
+                    r"не учитыв|белый список|доверен|фильтр", re.IGNORECASE)
 # в ответе на сверку есть несделанные пункты
 UNDONE = re.compile(r"не\s+сделан|не\s+выполнен|частично|not\s+done|partial", re.IGNORECASE)
 # до плана разрешены проверки, которые ничего не меняют в коде: тесты, компиляция, импорт
@@ -113,6 +184,273 @@ def requirements(text: str) -> list[str]:
     return [m.group(1).strip()[:300] for m in _REQ.finditer(text.split("\n\n<file ")[0])][:12]
 
 
+_FACT = re.compile(r"\d{4}-\d{2}-\d{2}[T ]\d{2}(?::\d{2})?|\d{1,3}(?:\.\d{1,3}){3}|\d{2}:\d{2}|\d{3,}")
+
+
+def grounded(cause: str, seen: str) -> bool:
+    """В причине есть факт (дата-время, адрес, число от 3 цифр), который встречался в собранных логах/выводе."""
+    seen_norm = seen.replace("T", " ")
+    # код статуса HTTP (404, 503) есть в любом логе — фактом о причине он не является
+    facts = [f for f in _FACT.findall(cause) if not (f.isdigit() and len(f) == 3 and 100 <= int(f) <= 599)]
+    return any(f.replace("T", " ") in seen_norm for f in facts)
+
+
+def _server_docs(root: Path) -> tuple[list[str], list[str]]:
+    """
+    Документы, где описаны логи/сервер («файл (строки …)»), и готовые команды оттуда: ssh-подключение
+    и чтение логов на сервере (без правок: rm/nano/restart… и бесконечный tail -f отброшены).
+    """
+    docs, commands = [], []
+    for q in sorted(list(root.glob("*.md")) + list(root.glob("docs/**/*.md")) + list(root.glob("deploy/**/*"))):
+        if not q.is_file() or q.stat().st_size > 500_000:
+            continue
+        try:
+            text = q.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        hits = []
+        for n, line in enumerate(text.splitlines(), 1):
+            if re.search(r"journalctl|/var/log|access\.log|ssh -i", line):
+                hits.append(n)
+                for cmd in re.findall(r"`([^`]*(?:ssh -i|journalctl|tail [^`]*log)[^`]*)`", line):
+                    if SHELL_NAME != "PowerShell":  # %USERPROFILE%\.ssh\key из инструкции для cmd → ~/.ssh/key
+                        cmd = re.sub(r"%USERPROFILE%\\?", "~/", cmd).replace("\\", "/")
+                    if cmd not in commands and not re.search(r"\b(rm|nano|vi|restart|stop|start|reboot)\b|tail -f", cmd):
+                        commands.append(cmd)
+        if hits:
+            docs.append(f"{q.relative_to(root).as_posix()} (строки {', '.join(map(str, hits[:5]))})")
+    return docs, commands
+
+
+def server_commands(root: Path) -> list[str]:
+    return _server_docs(Path(root))[1]
+
+
+def fetch_commands(root: Path) -> list[str]:
+    """
+    Готовые команды «скачать лог сервера в logs/»: ssh-подключение из документации + пути /var/log/… оттуда же.
+    Модель не собирает их сама из «ssh …» и «tail …» и решает, что доступа к серверу нет.
+    """
+    root = Path(root)
+    ssh = next((c for c in server_commands(root) if re.match(r"ssh\s+-i\s", c)), "")
+    if not ssh:
+        return []
+    paths: list[str] = []
+    for q in sorted(list(root.glob("*.md")) + list(root.glob("docs/**/*.md"))):
+        try:
+            text = q.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for path in re.findall(r"/var/log/[\w./-]+?\.log\b", text):
+            if path not in paths:
+                paths.append(path)
+    base = re.sub(r"^ssh\s", "ssh -o BatchMode=yes -o ConnectTimeout=15 ", ssh)
+    # zcat -f с маской: вместе с текущим логом — ротированные .1 и .gz (сбои обычно уже там)
+    # mkdir: в worktree папки logs/ нет (.gitignore) — без неё перенаправление падает
+    return [f'mkdir -p logs && {base} "zcat -f {p}*" > logs/server_{Path(p).stem}.log' for p in paths[:4]]
+
+
+_HOUR = re.compile(r"(\d{4}-\d{2}-\d{2})[T ](\d{2})")
+
+
+def hour_digest(ctx: ToolContext, cause: str, limit: int = 2) -> str:
+    """Сводка логов проекта за часы, названные в cause: топ адресов и статусов."""
+    from .tools import t_logstats
+    hours = list(dict.fromkeys(f"{d}[T ]{h}:" for d, h in _HOUR.findall(cause)))[:limit]
+    out = []
+    for h in hours:
+        for by in ("ip", "status"):
+            try:
+                text = t_logstats(ctx, "logs", match=h, by=by).output
+            except (ToolError, WorkspaceError, OSError):
+                continue
+            lines = [l for l in text.splitlines() if l.startswith(("по ", "время:")) or "строк" in l]
+            if lines and not lines[0].startswith("0 строк"):
+                out.append(f"[{h.replace('[T ]', ' ').rstrip(':')} ч, by={by}] " + " | ".join(lines[:3]))
+                total = re.match(r"(\d+) строк", lines[0])
+                top = re.search(r"по ip: (\d+) разных: (\S+) ×(\d+)", text)
+                if by == "ip" and total and top and int(top.group(3)) * 2 >= int(total.group(1)):
+                    # маленькая модель цифры видит, а вывод из них не делает — формулируем его сами
+                    out.append(f"→ {int(top.group(3)) * 100 // int(total.group(1))}% запросов этого часа — "
+                               f"с ОДНОГО адреса {top.group(2)} (из {top.group(1)} адресов).")
+    return "\n".join(out)[:3000]
+
+
+_BOT = re.compile(r"\b(Googlebot|YandexBot|bingbot|Bingbot|DuckDuckBot|Baiduspider|AhrefsBot|SemrushBot)\b")
+
+
+def spoof_check(ctx: ToolContext, text: str) -> str:
+    """С каких адресов в свежих логах шли запросы с названными в тексте ботами (подделка видна сразу)."""
+    names = list(dict.fromkeys(_BOT.findall(text))) or ["Googlebot"]
+    logs = ctx.root / "logs"
+    files = sorted(logs.glob("server_*.log")) if logs.is_dir() else []
+    out = []
+    for q in files[:1]:
+        try:
+            lines = q.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            continue
+        for name in names[:3]:
+            ips: dict[str, int] = {}
+            for l in lines:
+                if name in l:
+                    m = re.search(r'"ip":\s*"([^"]+)"', l)
+                    if m:
+                        ips[m.group(1)] = ips.get(m.group(1), 0) + 1
+            if ips:
+                top = sorted(ips.items(), key=lambda kv: -kv[1])[:3]
+                out.append(f"Запросы с «{name}» в {q.name}: {sum(ips.values())} с {len(ips)} адресов ("
+                           + ", ".join(f"{ip} ×{n}" for ip, n in top) + ")"
+                           + (" — один адрес: это подделка под бота, а не настоящий поисковик." if len(ips) == 1 else ""))
+    return "\n".join(out)
+
+
+def peak_digest(ctx: ToolContext, limit: int = 2) -> str:
+    """Самые нагруженные часы свежего лога (сначала скачанные с сервера) и кто давал в них запросы."""
+    from .tools import t_logstats
+    logs = ctx.root / "logs"
+    # самый полный лог сервера: модель иногда перекачивает только текущий файл без ротированных
+    files = sorted(logs.glob("server_*.log"), key=lambda q: -q.stat().st_size) if logs.is_dir() else []
+    if not files and logs.is_dir():  # лог сервера не скачан — самый большой лог проекта
+        files = sorted(logs.glob("*.log"), key=lambda q: -q.stat().st_size)
+    for q in files[:1]:
+        text = t_logstats(ctx, f"logs/{q.name}", bucket="hour").output
+        peaks = re.search(r"пики по hour: (.+)", text)
+        if not peaks:
+            continue
+        top = sorted(re.findall(r"(\d{4}-\d{2}-\d{2} \d{2}) ×(\d+)", peaks.group(1)), key=lambda x: -int(x[1]))[:limit]
+        return hour_digest(ctx, " ".join(h for h, _ in top))
+    return ""
+
+
+_HOUR_MIN = re.compile(r"\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}")
+_ADDR = re.compile(r"(?<![\d.])\d{1,3}(?:\.(?:\d{1,3}|\*)){1,3}(?![\d])")
+
+
+def address_counts(ctx: ToolContext, cause: str, limit: int = 4) -> str:
+    """Сколько строк каждого лога приходится на адреса/маски из cause («127.0.0.1», «192.168.0.*»)."""
+    from .tools import STALE_DAYS, log_age_days, main_checkout
+    addrs = [a for a in dict.fromkeys(_ADDR.findall(cause)) if a.count(".") >= 2][:limit]
+    if not addrs:
+        return ""
+    dirs = [d for d in (ctx.root / "logs", (main_checkout(ctx.root) or ctx.root) / "logs") if d.is_dir()]
+    files = list(dict.fromkeys(q for d in dirs for q in sorted(d.glob("*.log")) if q.stat().st_size < 200_000_000))
+    out = []
+    for q in files[:8]:
+        try:
+            lines = q.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            continue
+        if not lines:
+            continue
+        counts = []
+        for a in addrs:
+            prefix = a.rstrip("*")
+            n = sum(1 for l in lines if re.search(r'(?<![\d.])' + re.escape(prefix) + (r"" if a.endswith("*") else r"(?![\d])"), l))
+            counts.append(f"{a}: {n}")
+        # самая поздняя отметка, а не последняя строка: в склеенном логе ротированные части идут после текущей
+        newest = max((m.group(0).replace("T", " ") for l in lines[:200_000] if (m := _HOUR_MIN.search(l))),
+                     default="")
+        age = log_age_days(newest) if newest else None
+        stale = f", последняя запись {newest[:10]} — УСТАРЕЛ" if age is not None and age >= STALE_DAYS else ""
+        out.append(f"{q.parent.name}/{q.name} ({len(lines)} строк{stale}): " + ", ".join(counts))
+    return "\n".join(out)[:2000]
+
+
+def code_refs(ctx: ToolContext, cause: str, limit: int = 3) -> str:
+    """
+    Где в коде используются имена из cause (настройки, функции): модель приписывает сбой правилу,
+    которое к нему не ведёт («guard_scan_ip_limit закрывает сайт», а он только даёт сообщение).
+    """
+    from .tools import t_refs
+    names = [n for n in dict.fromkeys(re.findall(r"\b[a-z][a-z0-9]*(?:_[a-z0-9]+)+\b", cause))][:limit]
+    out = []
+    for n in names:
+        try:
+            text = t_refs(ctx, n, "app" if (ctx.root / "app").is_dir() else "").output
+        except (ToolError, WorkspaceError, OSError):
+            continue
+        lines = [l for l in text.splitlines()[1:] if "[use" in l][:6]
+        if lines:
+            out.append(f"Где используется {n}:\n" + "\n".join(lines))
+    return ("\nКак названное в cause работает в коде (проверь, ведёт ли это к сбою):\n" + "\n".join(out)) if out else ""
+
+
+def server_evidence(root: Path) -> str:
+    """
+    Для пункта-расследования harness сразу скачивает логи сервера (только чтение, с ротированными) и даёт
+    сводку пиков: модель то не идёт за ними, то берёт только текущий файл без сбоев. Повторно не качает.
+    """
+    root = Path(root)
+    fetch = fetch_commands(root)
+    if not fetch:
+        return ""
+    ctx = ToolContext(root=root)
+    have = list((root / "logs").glob("server_*.log")) if (root / "logs").is_dir() else []
+    digest = "" if have else collect_server_logs(ctx, fetch)
+    peaks = peak_digest(ctx)
+    if not peaks:
+        return ("\nЛоги сервера скачать не удалось:\n" + digest[:800]) if digest else ""
+    return ("\nHarness скачал логи сервера (с ротированными) в logs/server_*.log. Пики нагрузки и кто их дал:\n"
+            + peaks + "\nНачни с них: сравни эти часы и адреса с правилами в коде.")
+
+
+def collect_server_logs(ctx: ToolContext, fetch: list[str], timeout: int = 120) -> str:
+    """Выполнить команды «скачать лог сервера» (только чтение) и вернуть сводки logstats по скачанному."""
+    import subprocess
+    from .tools import SHELL_CMD, t_logstats
+    (ctx.root / "logs").mkdir(exist_ok=True)
+    parts = []
+    for cmd in fetch:
+        target = re.search(r">\s*(\S+)$", cmd)
+        try:
+            p = subprocess.run([*SHELL_CMD, cmd], cwd=str(ctx.root), capture_output=True, text=True,
+                               encoding="utf-8", errors="replace", timeout=timeout, stdin=subprocess.DEVNULL)
+        except (OSError, subprocess.TimeoutExpired) as e:
+            parts.append(f"`{cmd}`: не выполнилось ({e})")
+            continue
+        if p.returncode != 0 or not target or not (ctx.root / target.group(1)).is_file():
+            parts.append(f"`{cmd}`: ошибка {p.returncode}: {(p.stderr or p.stdout).strip()[:300]}")
+            continue
+        rel = target.group(1)
+        parts.append(f"== {rel} ==\n" + t_logstats(ctx, rel, bucket="hour").output
+                     + "\n-- ответы 503/429 (заглушка, лимит):\n"
+                     + t_logstats(ctx, rel, match=r'"status":"?(503|429)', by="ip", bucket="hour").output)
+    return "\n".join(parts)[:6000]
+
+
+def evidence_hint(root: Path) -> str:
+    """Где искать факты: логи в проекте и документы, где сказано, как добраться до логов на сервере."""
+    root = Path(root)
+    logs = []
+    main = main_checkout(root)
+    for d in ("logs", "log"):
+        where = root / d if (root / d).is_dir() else main / d if main and (main / d).is_dir() else None
+        if where:
+            files = [q for q in where.rglob("*") if q.is_file()]
+            if files:
+                logs.append(f"{d}/ ({len(files)} файлов: " + ", ".join(q.name for q in files[:6])
+                            + ("…" if len(files) > 6 else "") + ")")
+    docs, commands = _server_docs(root)
+    out = ("\nЭто расследование: сначала найди причину по фактам, потом правь. `logstats` даёт сводку лога "
+           "(пики по времени, топ адресов/статусов/сообщений); сравни время сбоев с тем, что делает код. "
+           "В decide укажи cause — причину с фактами.")
+    if logs:
+        out += "\nЛоги в проекте: " + "; ".join(logs)
+    if docs:
+        out += "\nГде описаны логи/сервер (команды — только чтение): " + "; ".join(docs[:6])
+    if commands:
+        out += ("\nКоманды из документации (сервер — только читать, ничего не менять): "
+                + "; ".join(f"`{c}`" for c in commands[:6])
+                + "\nЛог с сервера разбирай так: run `ssh … \"cat /путь/к/логу\" > logs/server_<имя>.log` "
+                  "(через ssh из этих команд, без sudo, если лог читается и так), затем logstats path=logs/server_<имя>.log.")
+    fetch = fetch_commands(root)
+    if fetch:
+        out += ("\nДоступ к серверу есть, читать его логи можно и нужно. Готовые команды (выполни через run): "
+                + "; ".join(f"`{c}`" for c in fetch))
+    return out
+
+
 def focus_message(root: Path, reqs: list[str], k: int, first: bool = False) -> str:
     """
     Задание на один пункт многопунктного запроса + связанный код из индекса сущностей.
@@ -129,6 +467,7 @@ def focus_message(root: Path, reqs: list[str], k: int, first: bool = False) -> s
             "проверкой. Не подменяй работу пустыми методами, заглушками и новыми неиспользуемыми файлами."
             + ("\nКандидаты на объединение (найдены автоматически; сравни реализации через read, объединяй "
                "только действительно одинаковое, вызовы обнови через grep):\n" + "\n".join(dups) if dups else "")
+            + (evidence_hint(root) + server_evidence(root) if INVESTIGATE.search(reqs[k]) else "")
             + ("\nСвязанный код (имена и докстринги из индекса):\n" + "\n".join(rel) if rel else ""))
 
 
@@ -227,7 +566,7 @@ class Agent:
         nudged = False
         fixes = 0
         plan_nudges = 0
-        orphan_nudges = import_nudges = stub_nudges = test_runs = dep_nudges = 0
+        orphan_nudges = import_nudges = stub_nudges = test_runs = dep_nudges = untested_nudges = removed_nudges = old_pass_nudges = 0
         dropped_seen: set[str] = set()
         tested_sig = None
         merge_sig, merge_nudges = None, 0  # дифференциальная проверка объединений: по чему и сколько раз
@@ -270,6 +609,11 @@ class Agent:
                     continue
                 # автопроверка: не даём закончить ход со сломанным синтаксисом в изменённых файлах
                 originals = _session_originals(s)  # все правки сессии, не только этого хода
+                # файлы, где от правок остались одни пустые строки/пробелы (удалённый код), — возвращаем как было
+                reverted = await asyncio.to_thread(revert_whitespace_only, ctx.root, originals)
+                if reverted:
+                    s.add({"type": "notice", "level": "info",
+                           "text": "Возвращены без изменений (правка свелась к пробелам): " + ", ".join(reverted)})
                 changed = originals.keys()
                 errors = await asyncio.to_thread(syntax_errors, ctx.root, changed)
                 if not errors:  # синтаксис цел — проверяем, что изменённые модули реально импортируются
@@ -384,6 +728,43 @@ class Agent:
                               "отсекает всё; сохрани прежнее поведение как запасной вариант), исправь код, а "
                               "не тесты, и прогони тесты снова.")})
                         continue
+                # тесты проекта исчезли (файл переписан целиком) — «тесты проходят», потому что их меньше
+                gone = await asyncio.to_thread(removed_tests, ctx.root, originals)
+                if gone and removed_nudges < 2:
+                    removed_nudges += 1
+                    s.add({"type": "notice", "level": "warn",
+                           "text": "Автопроверка: удалены существующие тесты:\n" + "\n".join(gone)})
+                    s.messages.append({"role": "user", "content": (
+                        "Автопроверка: после твоих правок пропали тесты, которые были в проекте:\n" + "\n".join(gone)
+                        + "\nВерни их (исходный текст — в git: run `git show HEAD:<файл>`), новые тесты добавляй "
+                          "рядом, не переписывая файл целиком. Затем test path=<файл>.")})
+                    continue
+                # поведение изменено, а тесты модуля не тронуты — новое поведение ничем не закреплено
+                untested = await asyncio.to_thread(untested_changes, ctx.root, originals)
+                if untested and untested_nudges < 1:
+                    untested_nudges += 1
+                    s.add({"type": "notice", "level": "warn",
+                           "text": "Автопроверка: изменения без тестов:\n" + "\n".join(untested)})
+                    s.messages.append({"role": "user", "content": (
+                        "Автопроверка: ты изменил поведение модулей, у которых есть тесты, но ни одного теста "
+                        "не добавил и не изменил:\n" + "\n".join(untested) + "\nДобавь в эти тестовые файлы "
+                        "тест на каждое новое правило (случай, который раньше работал иначе, и граничный случай), "
+                        "запусти test path=<модуль> и исправь, если упадёт. Затем дай итоговый ответ.")})
+                    continue
+                # новые тесты проходят и на старом коде — они не проверяют то, что изменено
+                if not untested and old_pass_nudges < 1:
+                    toothless = await asyncio.to_thread(tests_pass_on_old_code, ctx.root, originals)
+                    if toothless:
+                        old_pass_nudges += 1
+                        s.add({"type": "notice", "level": "warn",
+                               "text": "Автопроверка: новые тесты проходят и до правок:\n" + "\n".join(toothless)})
+                        s.messages.append({"role": "user", "content": (
+                            "Автопроверка: эти новые тесты проходят и на коде ДО твоих правок — значит, они не "
+                            "проверяют изменение:\n" + "\n".join(toothless) + "\nТест должен воспроизводить случай, "
+                            "ради которого правка (для расследования — найденный сбой с его числами): до правки он "
+                            "падает, после — проходит. Перепиши эти тесты так. Если правка не меняет поведение "
+                            "(рефакторинг), так и напиши в итоге.")})
+                        continue
                 # не даём закончить, пока в плане есть незакрытые шаги
                 open_steps = [x for x in s.plan if x["status"] in ("todo", "doing")]
                 if st["planned"] and open_steps and plan_nudges >= 1:
@@ -466,7 +847,11 @@ class Agent:
                     # проектные решения — на проверку человеку, даже если модель забыла их перечислить
                     s.add({"type": "notice", "level": "warn", "text": "Проектные решения агента — проверьте:\n"
                            + "\n".join(f"Пункт {int(k) + 1}: {v['decision']}\n  опирается на: {', '.join(v['uses'])}"
-                                       f"\n  если данных нет: {v['fallback']}" for k, v in sorted(s.decisions.items()))})
+                                       f"\n  если данных нет: {v['fallback']}"
+                                       + (f"\n  причина: {v['cause']}" if v.get("cause") else "")
+                                       + (f"\n  эффект: {v['effect']}" if v.get("effect") else "")
+                                       + ("\n  ⚠ причина не подтверждена фактами из логов" if v.get("unverified") else "")
+                                       for k, v in sorted(s.decisions.items()))})
                 return
             for n, tc in enumerate(comp.tool_calls):
                 call_id = tc["id"] or f"call_{uuid.uuid4().hex[:8]}"
@@ -532,13 +917,15 @@ class Agent:
             if retry_overflow and ("context" in msg and ("exceed" in msg or "size" in msg)):
                 await self.compact(s)
                 return await self._call(s, retry_overflow=False)
-            if PARSE_ERROR.search(str(e)) and recover < config.RECOVER_TRIES:
+            if PARSE_ERROR.search(str(e)) and recover < config.RECOVER_TRIES + 3:
                 # llama.cpp не разобрал вызов инструмента (gpt-oss путает заголовок harmony, чаще на
                 # длинном контексте). Тот же запрос даёт тот же сбой — повторяем сразу, с подсказкой
-                # о формате: она меняет контекст, но в историю сессии не пишется
+                # о формате: она меняет контекст, но в историю сессии не пишется. Подсказка каждый раз
+                # другая: одинаковый контекст снова даёт тот же сбой, и ход обрывался после 5 повторов
                 s.add({"type": "notice", "level": "warn",
                        "text": "Вызов инструмента в неверном формате — повторяю шаг с подсказкой."})
-                return await self._call(s, retry_overflow, recover + 1, hint=TOOL_FORMAT_HINT)
+                return await self._call(s, retry_overflow, recover + 1,
+                                        hint=TOOL_FORMAT_HINT + FORMAT_VARIANTS[recover % len(FORMAT_VARIANTS)])
             if e.transient and recover < config.RECOVER_TRIES:
                 # модель занята/переключается/упала: ждём освобождения GPU и повторяем шаг
                 s.add({"type": "notice", "level": "warn",
@@ -577,7 +964,7 @@ class Agent:
         if name == "decide":
             return await asyncio.to_thread(self._decide, s, ctx, args, st)
         if (name in MUTATING and len(st.get("reqs", [])) >= 2 and str(s.focus) not in s.decisions
-                and st.get("decide_rejects", 0) < 2):
+                and st.get("decide_rejects", 0) < (4 if INVESTIGATE.search((st.get("reqs") or [""])[min(s.focus, len(st.get("reqs") or [""]) - 1)]) else 2)):
             # проектные пункты маленькая модель решает наугад: сначала — решение, привязанное к коду
             st["decide_rejects"] = st.get("decide_rejects", 0) + 1
             s.add({"type": "tool", "id": call_id, "name": name, "args": _ui_args(name, args),
@@ -594,6 +981,9 @@ class Agent:
             return ToolResult("Не выполнено: изменять историю git через run нельзя. Для add/commit/push "
                               "используй git_commit (с описанием изменений и проведённых тестов) — "
                               "пользователь подтвердит его.", ok=False)
+        routed = tool_from_shell(args.get("command", "")) if name == "run" else None
+        if routed:  # «run logstats --path=…»: модель вызвала инструмент как программу — выполняем как инструмент
+            name, args = routed
         if name == "run" and FILE_VIEW.match(args.get("command", "")):
             # чтение файлов через shell обходит read (номера строк, оглавление, дедупликацию)
             s.add({"type": "tool", "id": call_id, "name": name, "args": _ui_args(name, args),
@@ -659,6 +1049,17 @@ class Agent:
                 s.settings.setdefault("always", []).append(name)
             s.set(i, status="running")
         result = await execute(ctx, name, args)
+        if result.ok and (name == "logstats"
+                          or name == "run" and EVIDENCE_CMD.search(args.get("command", ""))
+                          or name in ("read", "grep") and EVIDENCE_PATH.search(str(args.get("path", "")))):
+            st["evidence"] = st.get("evidence", 0) + 1
+            if name != "read" and name != "grep" or re.search(r"(^|/)logs?/|\.log$", str(args.get("path", ""))):
+                st["log_evidence"] = st.get("log_evidence", 0) + 1
+                # факты для cause — только из логов и вывода команд, не из кода и документации
+                st["evidence_text"] = (st.get("evidence_text", "") + "\n" + result.output)[-200_000:]
+            # свежие факты: сводка лога с записями последних дней (скачанный лог сервера — тоже через logstats)
+            if name == "logstats" and "время:" in result.output and "лог устарел" not in result.output:
+                st["fresh_logs"] = st.get("fresh_logs", 0) + 1
         if name in MUTATING and result.ok:
             st["edits"] = st.get("edits", 0) + 1
         if st["planned"] and (name in MUTATING or name == "run"):
@@ -679,12 +1080,115 @@ class Agent:
         if len(decision) < 20 or not uses or not fallback:
             return ToolResult("Ошибка: нужны decision (конкретное правило, не общие слова), uses (непустой "
                               "список существующих сущностей) и fallback.", ok=False)
+        reqs = st.get("reqs") or []
+        item = reqs[s.focus] if 0 <= s.focus < len(reqs) else ""
+        cause = str(args.get("cause", "")).strip()
+        if INVESTIGATE.search(item) and not st.get("server_seen") and \
+                (ctx.root / "logs").is_dir() and list((ctx.root / "logs").glob("server_*.log")):
+            # логи сервера скачал harness и их сводку модель уже получила в задании пункта — это факты
+            st["server_seen"] = True
+            st["evidence"] = st.get("evidence", 0) + 1
+            st["fresh_logs"] = st.get("fresh_logs", 0) + 1
+            st["log_evidence"] = st.get("log_evidence", 0) + 1
+            st["evidence_text"] = (st.get("evidence_text", "") + "\n" + peak_digest(ctx))[-200_000:]
+        if INVESTIGATE.search(item) and st.get("cause_rejects", 0) < 4:
+            why = ""
+            main = main_checkout(ctx.root)
+            has_logs = any((r / d).is_dir() for r in (ctx.root, main) if r for d in ("logs", "log"))
+            if has_logs and not st.get("log_evidence"):
+                why = ("в проекте есть логи (logs/), а ты их не смотрел: logstats path=logs (match=ERROR|WARNING, "
+                       "by=message; для JSON-логов by=status|ip, bucket=hour), а логи сервера — командами из "
+                       "документов о развёртывании")
+            elif has_logs and server_commands(ctx.root) and (
+                    not st.get("fresh_logs")
+                    # сервис работает на сервере — свежий домашний лог планировщика его не заменяет
+                    or fetch_commands(ctx.root) and not list((ctx.root / "logs").glob("server_*.log"))):
+                fetch = fetch_commands(ctx.root)
+                if fetch and st.get("cause_rejects", 0) >= 1:
+                    # модель второй раз не идёт за логами сервера — harness собирает их сам (только чтение)
+                    digest = collect_server_logs(ctx, fetch)
+                    if digest:
+                        st["fresh_logs"] = st.get("fresh_logs", 0) + 1
+                        st["log_evidence"] = st.get("log_evidence", 0) + 1
+                        st["evidence_text"] = (st.get("evidence_text", "") + "\n" + digest)[-200_000:]
+                        st["cause_rejects"] = st.get("cause_rejects", 0) + 1
+                        return ToolResult(
+                            f"Ошибка: пункт {s.focus + 1} — расследование, а смотрел ты устаревшие логи. Harness сам "
+                            "скачал актуальные логи сервера в logs/ и вот их сводка:\n" + digest + "\nНайди в ней "
+                            "время сбоев (пики 503/429) и адреса, сравни с порогами в коде, при необходимости уточни "
+                            "logstats (match=, by=, bucket=minute). Затем decide с cause, где есть эти время и числа.",
+                            ok=False)
+                why = ("логи, которые ты смотрел, устарели (последние записи — несколько дней назад), а сервис по "
+                       "документации работает на сервере. Доступ к нему есть, читать логи можно. "
+                       + ("Выполни через run (только чтение): " + "; ".join(f"`{c}`" for c in fetch)
+                          if fetch else "Возьми его логи командами из документации: "
+                          + "; ".join(f"`{c}`" for c in server_commands(ctx.root)[:4]))
+                       + " — затем logstats path=logs/server_<имя>.log (bucket=hour, by=ip, match=503|429)")
+            elif not st.get("evidence"):
+                why = ("ты ещё не смотрел факты: логи (logstats), конфиги, документы о развёртывании (где логи "
+                       "сервера и как их прочитать)")
+            elif len(cause) < 30 or not re.search(r"\d", cause):
+                why = ("cause должна называть причину с фактами: время сбоев, числа из логов, файл:строка "
+                       "кода, который к этому приводит")
+            elif not grounded(cause, st.get("evidence_text", "")):
+                why = ("в cause нет ни одного факта из того, что ты видел в логах и выводе команд (время, число, "
+                       "адрес): это догадка. Найди в логах подтверждение (logstats match=/by=/bucket=) и процитируй "
+                       "числа оттуда — или опровержение и другую причину")
+            if why:
+                st["cause_rejects"] = st.get("cause_rejects", 0) + 1
+                return ToolResult(f"Ошибка: пункт {s.focus + 1} — расследование, решение без найденной причины "
+                                  f"не принимается: {why}. Затем снова decide, ОБЯЗАТЕЛЬНО с полем cause: "
+                                  '{"decision": "...", "uses": [...], "fallback": "...", "cause": "<что видно в логах: '
+                                  'время, числа, адреса> -> <какой код (файл:строка) к этому приводит>"}', ok=False)
+            if not why and not st.get("cause_checked"):
+                # причина названа со временем: показываем, что на самом деле было в логах в тот час, —
+                # маленькая модель находит время сбоя, но объясняет его первым, что пришло в голову
+                st["cause_checked"] = True
+                window = "\n".join(x for x in (hour_digest(ctx, cause), address_counts(ctx, cause)) if x) \
+                    or peak_digest(ctx)  # ни времени, ни адреса в cause — показываем пики свежего лога
+                window += code_refs(ctx, cause)
+                if window:
+                    return ToolResult(
+                        f"Проверка причины по логам — что было в названное время:\n{window}\n"
+                        "Сверь cause с этими цифрами: кто давал запросы (сколько адресов, доля самого частого), "
+                        "какие статусы. Если цифры подтверждают причину — пришли тот же decide ещё раз; если нет — "
+                        "исправь cause и decision по ним.", ok=False)
+        effect = str(args.get("effect", "")).strip()
+        if INVESTIGATE.search(item) and is_symptomatic(decision) and st.get("symptom_rejects", 0) < 2:
+            # белый список / подъём порога: инцидент пройдёт, пока его цифры ниже порога и адрес в списке, —
+            # следующий такой же с другого адреса или чуть сильнее повторит сбой
+            weak = not effect or not grounded(effect, st.get("evidence_text", "") + "\n" + cause) \
+                or st.get("symptom_rejects", 0) == 0
+            if weak:
+                st["symptom_rejects"] = st.get("symptom_rejects", 0) + 1
+                peak = peak_digest(ctx)
+                return ToolResult(
+                    "Проверка решения: оно похоже на лечение симптома (белый список, исключение адресов, "
+                    "подъём порога). Такое решение снимает этот случай, но не причину: тот же сбой повторится "
+                    "с другого адреса или при чуть большей нагрузке, а список придётся пополнять вручную.\n"
+                    + (f"Что было в пиках логов:\n{peak}\n" if peak else "")
+                    + "Ответь в поле effect: что сделает НОВОЕ правило в найденном случае (те же время и числа) "
+                    "и в таком же случае с другого адреса или вдвое сильнее? Если сбой повторится — выбери "
+                    "правило, которое меняет саму причину (то, что в cause названо источником сбоя), и пришли "
+                    "decide с ним и с effect.", ok=False)
         missing = entities.check_names(ctx.root, uses)
         if missing:
             lines = [f"- {n}: нет в проекте" + (f" (похожие: {', '.join(sim)})" if sim else "")
                      for n, sim in missing.items()]
             return ToolResult("Ошибка: решение опирается на несуществующие сущности:\n" + "\n".join(lines)
                               + "\nНайди реальные через symbols/grep и пришли decide заново.", ok=False)
+        if SPOOFABLE.search(decision) and EXEMPT.search(decision) and st.get("spoof_warned", 0) < 2:
+            # «не считать запросы Googlebot» — атакующему достаточно подставить этот User-Agent
+            st["spoof_warned"] = st.get("spoof_warned", 0) + 1
+            bots = spoof_check(ctx, decision + " " + cause)
+            return ToolResult(
+                (bots + "\n" if bots else "") +
+                "Внимание: решение делает исключение по данным, которые задаёт сам клиент (User-Agent, Referer, "
+                "заголовки, параметры запроса). Их подделывают: сканеры часто представляются Googlebot/YandexBot. "
+                "Так защиту обойдёт любой, кто подставит это значение. Проверь в логах, с каких адресов шли такие "
+                "запросы (logstats match=<значение> by=ip). Исключения строй на том, что клиент не подделает: "
+                "адрес и подсеть, поведение (число запросов и адресов, статусы), или на проверке (обратный DNS). "
+                "Пришли decide заново.", ok=False)
         if DISABLING.search(fallback) and not st.get("fallback_warned"):
             # «нет данных — ничего не делаем» молча выключает работающую функцию (сигналы, отчёты)
             st["fallback_warned"] = True
@@ -693,9 +1197,12 @@ class Agent:
                 "(например, пустая таблица на свежей установке или в тестах). Обычно нужно сохранить прежнее "
                 "поведение. Пришли decide снова: либо с fallback «прежнее поведение», либо с этим же fallback, "
                 "если такое изменение прямо требуется задачей.", ok=False)
-        s.decisions[str(s.focus)] = {"decision": decision, "uses": uses, "fallback": fallback}
+        unverified = bool(INVESTIGATE.search(item)) and not grounded(cause, st.get("evidence_text", ""))
+        s.decisions[str(s.focus)] = {"decision": decision, "uses": uses, "fallback": fallback, "cause": cause,
+                                     "unverified": unverified, "effect": str(args.get("effect", "")).strip()}
         s.add({"type": "notice", "level": "info",
-               "text": f"Решение по пункту {s.focus + 1}: {decision}\nОпирается на: {', '.join(uses)}\n"
+               "text": (f"Причина: {cause}\n" if cause else "")
+                       + f"Решение по пункту {s.focus + 1}: {decision}\nОпирается на: {', '.join(uses)}\n"
                        f"Если данных нет: {fallback}"})
         return ToolResult(f"Решение по пункту {s.focus + 1} принято. Теперь plan и правки по нему.")
 

@@ -1,0 +1,85 @@
+diff --git a/app/guard/watch.py b/app/guard/watch.py
+index 7e69b7c..b1a6e35 100644
+--- a/app/guard/watch.py
++++ b/app/guard/watch.py
+@@ -19,6 +19,7 @@ import json
+ import logging
+ import os
+ import re
++import ipaddress
+ import threading
+ import time
+ from collections import Counter, deque
+@@ -160,7 +161,7 @@ class Guard:
+             self.hits.popleft()
+         v = Verdict(total=len(self.hits))
+         per_ip, scan_ip = Counter(), Counter()
+-        for h in self.hits:
++        for h in [h for h in self.hits if not is_private_ip(h.ip)]:
+             per_ip[h.ip] += 1
+             v.by_status[h.status] += 1
+             if h.suspicious:
+@@ -295,3 +296,9 @@ if __name__ == "__main__":
+     logging.basicConfig(level=settings.log_level)
+     os.environ.setdefault("PYTHONIOENCODING", "utf-8")
+     main()
++def is_private_ip(ip: str) -> bool:
++    try:
++        return ipaddress.ip_address(ip).is_private
++    except ValueError:
++        return False
++
+diff --git a/tests/test_guard.py b/tests/test_guard.py
+index 6678613..a820bff 100644
+--- a/tests/test_guard.py
++++ b/tests/test_guard.py
+@@ -1,10 +1,11 @@
+ import json
+ from datetime import datetime, timezone
++from pathlib import Path
+ 
+ import pytest
+ 
+ from app.guard import watch
+-from app.guard.watch import Guard, LogTail, is_suspicious, parse_line
++from app.guard.watch import Guard, LogTail, is_suspicious, parse_line, is_private_ip
+ 
+ T0 = datetime(2026, 10, 15, 3, 0, tzinfo=timezone.utc).timestamp()
+ 
+@@ -161,3 +162,36 @@ def test_bot_commands(tmp_path, monkeypatch):
+     assert "открыт" in commands.handle("/guard")
+     assert "закрыт" in commands.handle("/close") and g.is_closed()
+     assert "снята" in commands.handle("/open") and not g.is_closed()
++
++# New tests for private IP handling
++
++def test_ignore_private_ips(tmp_path):
++    guard = Guard(Path('dummy.log'), Path(tmp_path), from_end=False)
++    # Feed private IPs
++    for i in range(10):
++        guard.feed([line(0, ip='127.0.0.1', uri=f'/x{i}.php', status=404)])
++    # Feed a public IP
++    guard.feed([line(0, ip='8.8.8.8', uri='/x.php', status=404)])
++    v = guard.analyze()
++    # Only public IP should be counted
++    assert v.total == 1
++    assert v.by_status[404] == 1
++    assert v.suspicious == 1
++    assert v.scanners == [('8.8.8.8', 1)]
++    assert not v.close
++
++
++def test_private_ip_boundary(tmp_path):
++    guard = Guard(Path('dummy.log'), Path(tmp_path), from_end=False)
++    # 172.16.0.1 is private
++    guard.feed([line(0, ip='172.16.0.1', uri='/x.php', status=404)])
++    v = guard.analyze()
++    assert v.total == 0
++
++
++def test_is_private_ip_function():
++    assert is_private_ip('127.0.0.1')
++    assert is_private_ip('10.0.0.5')
++    assert is_private_ip('192.168.1.100')
++    assert not is_private_ip('8.8.8.8')
++    assert not is_private_ip('2001:4860:4860::8888')

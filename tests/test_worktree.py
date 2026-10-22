@@ -92,3 +92,17 @@ def test_api_worktree_requires_git(tmp_path):
     pid = workspace.add_project(str(tmp_path / "plain"))["id"]
     r = TestClient(app).post("/api/sessions", json={"project_id": pid, "settings": {"worktree": True}})
     assert r.status_code == 400 and "git" in r.json()["detail"]
+
+
+def test_tracked_env_example_is_carried_over(tmp_path):
+    root = repo(tmp_path)
+    (root / ".env.example").write_text("A=1\n", encoding="utf-8")
+    git(root, "add", "-A")
+    git(root, "commit", "-qm", "example")
+    wt = worktree.create(root, "s4")
+    try:
+        (Path(wt["path"]) / ".env.example").write_text("A=1\nB=2\n", encoding="utf-8")
+        (Path(wt["path"]) / ".env.local").write_text("SECRET=2\n", encoding="utf-8")  # не в git — не переносим
+        assert worktree.changed_files(wt) == [".env.example"]
+    finally:
+        worktree.remove(root, wt)

@@ -1,0 +1,40 @@
+diff --git a/app/config.py b/app/config.py
+index 4452cc7..eee5af9 100644
+--- a/app/config.py
++++ b/app/config.py
+@@ -37,6 +37,8 @@ class Settings(BaseSettings):
+     guard_scan_close_ips: int = 5     # один-два сканера (nginx и так рвёт им 444/404) сайт не закрывают
+     guard_alert_cooldown: int = 900   # одинаковые сообщения не чаще, с
+     guard_auto_reopen: int = 30       # открыть сайт после N минут тишины; 0 — только вручную (/open)
++    guard_ignore_ips: list[str] = []
++    guard_ignore_status: list[int] = []
+     # Публикация на веб-сервер (ВМ Hyper-V или VPS): адрес сервера; пусто — сайт раздаётся только дома.
+     # Сайт уходит архивом по SSH пользователю deploy, заглушкой управляет пользователь guard
+     # (у обоих ключей на сервере — принудительная команда, см. deploy/vm/setup.sh)
+diff --git a/app/guard/watch.py b/app/guard/watch.py
+index 7e69b7c..9ad011f 100644
+--- a/app/guard/watch.py
++++ b/app/guard/watch.py
+@@ -158,9 +158,12 @@ class Guard:
+         now = time.time() if now is None else now
+         while self.hits and self.hits[0].ts < now - self.window:
+             self.hits.popleft()
+-        v = Verdict(total=len(self.hits))
++        ignore_ips = set(settings.guard_ignore_ips)
++        ignore_status = set(settings.guard_ignore_status)
++        filtered_hits = [h for h in self.hits if h.ip not in ignore_ips and h.status not in ignore_status]
++        v = Verdict(total=len(filtered_hits))
+         per_ip, scan_ip = Counter(), Counter()
+-        for h in self.hits:
++        for h in filtered_hits:
+             per_ip[h.ip] += 1
+             v.by_status[h.status] += 1
+             if h.suspicious:
+@@ -172,7 +175,6 @@ class Guard:
+         if v.total >= settings.guard_total_limit or v.by_status[429] >= settings.guard_429_limit:
+             v.kinds.append("ddos")
+             v.close = True
+-        # Один-два сканера сайт не закрывают: nginx и так отвечает им 444/404, достаточно сообщения
+         if v.suspicious >= settings.guard_scan_close and len(scan_ip) >= settings.guard_scan_close_ips:
+             v.close = True
+             if "scan" not in v.kinds:

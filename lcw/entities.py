@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import ast
 import re
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -325,6 +326,8 @@ def check_names(root: str | Path, names: list[str]) -> dict[str, list[str]]:
         last = re.split(r"[.:/]", name)[-1]
         if not last or name in known or last in known or re.search(rf"\b{re.escape(last)}\b", blob):
             continue
+        if re.fullmatch(r"[A-Za-z_][\w.]*", name) and name.split(".")[0] in sys.stdlib_module_names:
+            continue  # ipaddress, collections.Counter — стандартная библиотека, а не выдумка
         missing[name] = difflib.get_close_matches(last, sorted(known), n=4, cutoff=0.5)
     return missing
 

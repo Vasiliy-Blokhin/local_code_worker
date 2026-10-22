@@ -1,0 +1,29 @@
+diff --git a/app/guard/watch.py b/app/guard/watch.py
+index 7e69b7c..a24454d 100644
+--- a/app/guard/watch.py
++++ b/app/guard/watch.py
+@@ -42,8 +42,14 @@ _SUSPICIOUS = re.compile(
+ )
+ 
+ 
+-def is_suspicious(method: str, uri: str, status: int) -> bool:
++def is_suspicious(method: str, uri: str, status: int, ua: str | None = None) -> bool:
+     """Запрос похож на попытку взлома."""
++    # Игнорируем известные поисковые роботы и сканеры, чтобы снизить ложные срабатывания
++    if ua:
++        ua_lower = ua.lower()
++        for bot in ("yandexbot", "googlebot", "bingbot", "baiduspider", "duckduckbot", "yahoo", "slurp", "facebot", "ia_archiver"):
++            if bot in ua_lower:
++                return False
+     if method not in ("GET", "HEAD") or status == 405:
+         return True
+     return bool(_SUSPICIOUS.search(uri or ""))
+@@ -108,7 +114,7 @@ def parse_line(line: str) -> Hit | None:
+     except (ValueError, KeyError, TypeError):
+         return None
+     method = d.get("method") or ""
+-    return Hit(ts, d.get("ip") or "?", status, is_suspicious(method, d.get("uri") or "", status))
++    return Hit(ts, d.get("ip") or "?", status, is_suspicious(method, d.get("uri") or "", status, d.get("ua")))
+ 
+ 
+ class Guard:

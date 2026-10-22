@@ -6,6 +6,7 @@ import json
 import os
 import re
 import subprocess
+import tempfile
 import uuid
 import zipfile
 from pathlib import Path
@@ -99,16 +100,28 @@ def relpath(root: str | Path, p: Path) -> str:
     return p.resolve().relative_to(Path(root).resolve()).as_posix()
 
 
+def main_checkout(root: str | Path) -> Path | None:
+    """Для git worktree — основная рабочая копия (там venv, логи, .env из .gitignore); иначе None."""
+    dotgit = Path(root) / ".git"
+    if not dotgit.is_file():
+        return None
+    try:
+        line = dotgit.read_text(encoding="utf-8", errors="replace").strip()
+    except OSError:
+        return None
+    if not line.startswith("gitdir:"):
+        return None
+    main = Path(line[7:].strip()).resolve().parents[2]  # <main>/.git/worktrees/<name>
+    return main if main.is_dir() else None
+
+
 def find_venv(root: str | Path) -> Path | None:
     """Виртуальное окружение проекта: в самом проекте или в родительской папке (монорепо)."""
     root = Path(root).resolve()
     bases = [root, root.parent]
-    dotgit = root / ".git"
-    if dotgit.is_file():  # git worktree: venv лежит у основного репозитория
-        line = dotgit.read_text(encoding="utf-8", errors="replace").strip()
-        if line.startswith("gitdir:"):
-            main = Path(line[7:].strip()).resolve().parents[2]  # <main>/.git/worktrees/<name>
-            bases += [main, main.parent]
+    main = main_checkout(root)
+    if main:  # git worktree: venv лежит у основного репозитория
+        bases += [main, main.parent]
     for base in bases:
         for name in (".venv", "venv", "env"):
             d = base / name
@@ -119,6 +132,15 @@ def find_venv(root: str | Path) -> Path | None:
 
 def venv_bin(venv: Path) -> Path:
     return venv / "Scripts" if (venv / "Scripts").is_dir() else venv / "bin"
+
+
+def pytest_env(env: dict) -> dict:
+    """
+    env с отдельным --basetemp для pytest: на Windows общий %TEMP%/pytest-of-<user> ломается
+    (ссылку pytest-current нельзя удалить — WinError 5), и все тесты падают ещё до запуска.
+    """
+    tmp = tempfile.mkdtemp(prefix="lcw-pytest-")
+    return {**env, "PYTEST_ADDOPTS": (env.get("PYTEST_ADDOPTS", "") + f' --basetemp="{tmp}"').strip()}
 
 
 def is_git(root: str | Path) -> bool:
