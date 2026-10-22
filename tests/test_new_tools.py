@@ -140,7 +140,7 @@ def test_fetch_commands_build_ready_ssh(tmp_path):
     (tmp_path / "docs" / "vm.md").write_text(
         "Войти: `ssh -i ~/.ssh/admin me@10.0.0.5`, лог: `sudo tail /var/log/nginx/access.log`\n", encoding="utf-8")
     assert fetch_commands(tmp_path) == [
-        'ssh -o BatchMode=yes -o ConnectTimeout=15 -i ~/.ssh/admin me@10.0.0.5 "zcat -f /var/log/nginx/access.log*"'
+        'mkdir -p logs && ssh -o BatchMode=yes -o ConnectTimeout=15 -i ~/.ssh/admin me@10.0.0.5 "zcat -f /var/log/nginx/access.log*"'
         ' > logs/server_access.log']
 
 

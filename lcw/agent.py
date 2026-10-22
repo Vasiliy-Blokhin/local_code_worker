@@ -222,7 +222,8 @@ def fetch_commands(root: Path) -> list[str]:
                 paths.append(path)
     base = re.sub(r"^ssh\s", "ssh -o BatchMode=yes -o ConnectTimeout=15 ", ssh)
     # zcat -f с маской: вместе с текущим логом — ротированные .1 и .gz (сбои обычно уже там)
-    return [f'{base} "zcat -f {p}*" > logs/server_{Path(p).stem}.log' for p in paths[:4]]
+    # mkdir: в worktree папки logs/ нет (.gitignore) — без неё перенаправление падает
+    return [f'mkdir -p logs && {base} "zcat -f {p}*" > logs/server_{Path(p).stem}.log' for p in paths[:4]]
 
 
 _HOUR = re.compile(r"(\d{4}-\d{2}-\d{2})[T ](\d{2})")
