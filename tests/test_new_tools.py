@@ -168,3 +168,11 @@ def test_edit_strips_mostly_marked_lines(tmp_path):
     (tmp_path / "t.py").write_text("X = 1\n", encoding="utf-8")
     t_edit(_ctx(tmp_path), "t.py", "", "\n# new tests\n+def b():\n+    return 2\n+\n")
     assert "+def" not in (tmp_path / "t.py").read_text(encoding="utf-8")
+
+
+def test_removed_tests_detected(tmp_path):
+    from lcw.tools import removed_tests
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "test_a.py").write_text("def test_new():\n    pass\n", encoding="utf-8")
+    orig = "def test_old():\n    pass\n\n\ndef test_new():\n    pass\n"
+    assert removed_tests(tmp_path, {"tests/test_a.py": orig}) == ["tests/test_a.py: test_old"]

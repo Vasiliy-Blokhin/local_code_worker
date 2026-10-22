@@ -22,7 +22,7 @@ from .llm import LLM, Completion, LLMError
 from .sessions import Session
 from .tools import (MUTATING, TOOLS, ToolContext, ToolError, ToolResult, execute, normalize_plan,
                     GIT_WRITE, git_preview, preview, render_plan, syntax_errors, unused_modules, import_errors,
-                    unused_new_imports, new_stubs, project_tests, untested_changes, find_merges, undefined_names,
+                    unused_new_imports, new_stubs, project_tests, untested_changes, removed_tests, find_merges, undefined_names,
                     sql_column_errors, dropped_dependencies, SHELL_NAME)
 from .workspace import WorkspaceError, get_project, is_text_file, main_checkout, relpath, resolve
 
@@ -445,7 +445,7 @@ class Agent:
         nudged = False
         fixes = 0
         plan_nudges = 0
-        orphan_nudges = import_nudges = stub_nudges = test_runs = dep_nudges = untested_nudges = 0
+        orphan_nudges = import_nudges = stub_nudges = test_runs = dep_nudges = untested_nudges = removed_nudges = 0
         dropped_seen: set[str] = set()
         tested_sig = None
         merge_sig, merge_nudges = None, 0  # дифференциальная проверка объединений: по чему и сколько раз
@@ -602,6 +602,17 @@ class Agent:
                               "отсекает всё; сохрани прежнее поведение как запасной вариант), исправь код, а "
                               "не тесты, и прогони тесты снова.")})
                         continue
+                # тесты проекта исчезли (файл переписан целиком) — «тесты проходят», потому что их меньше
+                gone = await asyncio.to_thread(removed_tests, ctx.root, originals)
+                if gone and removed_nudges < 2:
+                    removed_nudges += 1
+                    s.add({"type": "notice", "level": "warn",
+                           "text": "Автопроверка: удалены существующие тесты:\n" + "\n".join(gone)})
+                    s.messages.append({"role": "user", "content": (
+                        "Автопроверка: после твоих правок пропали тесты, которые были в проекте:\n" + "\n".join(gone)
+                        + "\nВерни их (исходный текст — в git: run `git show HEAD:<файл>`), новые тесты добавляй "
+                          "рядом, не переписывая файл целиком. Затем test path=<файл>.")})
+                    continue
                 # поведение изменено, а тесты модуля не тронуты — новое поведение ничем не закреплено
                 untested = await asyncio.to_thread(untested_changes, ctx.root, originals)
                 if untested and untested_nudges < 1:

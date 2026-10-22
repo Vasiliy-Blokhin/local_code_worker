@@ -465,6 +465,24 @@ def _norm(text: str) -> str:
     return text.replace(chr(13) + chr(10), chr(10))
 
 
+def removed_tests(root: Path, originals: dict) -> list[str]:
+    """Тестовые функции, которые были в тестовых файлах до правок сессии и исчезли (write целиком и т.п.)."""
+    out = []
+    for rel, orig in originals.items():
+        if orig is None or not _is_test_file(rel):
+            continue
+        try:
+            before = {n.name for n in ast.walk(ast.parse(orig))
+                      if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name.startswith("test")}
+            now = (root / rel).read_text(encoding="utf-8", errors="replace") if (root / rel).is_file() else ""
+            after = {n.name for n in ast.walk(ast.parse(now))
+                     if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name.startswith("test")}
+        except (SyntaxError, ValueError, OSError):
+            continue  # синтаксис проверяется отдельно
+        out += [f"{rel}: {name}" for name in sorted(before - after)]
+    return out
+
+
 def untested_changes(root: Path, originals: dict) -> list[str]:
     """Изменённые рабочие модули с тестами, когда ни один тестовый файл в сессии не менялся."""
     if any(_is_test_file(rel) for rel in originals):
