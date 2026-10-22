@@ -1,0 +1,22 @@
+diff --git a/app/guard/watch.py b/app/guard/watch.py
+index 7e69b7c..ea6113b 100644
+--- a/app/guard/watch.py
++++ b/app/guard/watch.py
+@@ -167,7 +167,7 @@ class Guard:
+                 scan_ip[h.ip] += 1
+         v.suspicious = sum(scan_ip.values())
+         v.top_ips = per_ip.most_common(5)
+-        v.scanners = [(ip, n) for ip, n in scan_ip.most_common() if n >= settings.guard_scan_ip_limit]
++        v.scanners = [(ip, n) for ip, n in scan_ip.most_common() if n >= settings.guard_scan_ip_limit * 2]
+         v.flooders = [(ip, n) for ip, n in per_ip.most_common() if n >= settings.guard_ip_limit]
+         if v.total >= settings.guard_total_limit or v.by_status[429] >= settings.guard_429_limit:
+             v.kinds.append("ddos")
+@@ -179,6 +179,8 @@ class Guard:
+                 v.kinds.append("scan")
+         elif v.scanners:
+             v.kinds.append("scan")
++        elif v.suspicious > 0:
++            v.kinds.append("scan")
+         if v.flooders:
+             v.kinds.append("flood")
+         return v
