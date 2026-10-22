@@ -23,7 +23,7 @@ from .sessions import Session
 from .tools import (MUTATING, TOOLS, ToolContext, ToolError, ToolResult, execute, normalize_plan,
                     GIT_WRITE, git_preview, preview, render_plan, syntax_errors, unused_modules, import_errors,
                     unused_new_imports, new_stubs, project_tests, untested_changes, find_merges, undefined_names,
-                    sql_column_errors, dropped_dependencies)
+                    sql_column_errors, dropped_dependencies, SHELL_NAME)
 from .workspace import WorkspaceError, get_project, is_text_file, main_checkout, relpath, resolve
 
 UI_OUTPUT = 6000           # сколько вывода инструмента показывать в UI
@@ -164,18 +164,11 @@ def grounded(cause: str, seen: str) -> bool:
     return any(f.replace("T", " ") in seen_norm for f in _FACT.findall(cause))
 
 
-def evidence_hint(root: Path) -> str:
-    """Где искать факты: логи в проекте и документы, где сказано, как добраться до логов на сервере."""
-    root = Path(root)
-    logs = []
-    main = main_checkout(root)
-    for d in ("logs", "log"):
-        where = root / d if (root / d).is_dir() else main / d if main and (main / d).is_dir() else None
-        if where:
-            files = [q for q in where.rglob("*") if q.is_file()]
-            if files:
-                logs.append(f"{d}/ ({len(files)} файлов: " + ", ".join(q.name for q in files[:6])
-                            + ("…" if len(files) > 6 else "") + ")")
+def _server_docs(root: Path) -> tuple[list[str], list[str]]:
+    """
+    Документы, где описаны логи/сервер («файл (строки …)»), и готовые команды оттуда: ssh-подключение
+    и чтение логов на сервере (без правок: rm/nano/restart… и бесконечный tail -f отброшены).
+    """
     docs, commands = [], []
     for q in sorted(list(root.glob("*.md")) + list(root.glob("docs/**/*.md")) + list(root.glob("deploy/**/*"))):
         if not q.is_file() or q.stat().st_size > 500_000:
@@ -188,12 +181,33 @@ def evidence_hint(root: Path) -> str:
         for n, line in enumerate(text.splitlines(), 1):
             if re.search(r"journalctl|/var/log|access\.log|ssh -i", line):
                 hits.append(n)
-                # готовые команды из документации: ssh-подключение и чтение логов на сервере
                 for cmd in re.findall(r"`([^`]*(?:ssh -i|journalctl|tail [^`]*log)[^`]*)`", line):
+                    if SHELL_NAME != "PowerShell":  # %USERPROFILE%\.ssh\key из инструкции для cmd → ~/.ssh/key
+                        cmd = re.sub(r"%USERPROFILE%\\?", "~/", cmd).replace("\\", "/")
                     if cmd not in commands and not re.search(r"\b(rm|nano|vi|restart|stop|start|reboot)\b|tail -f", cmd):
                         commands.append(cmd)
         if hits:
             docs.append(f"{q.relative_to(root).as_posix()} (строки {', '.join(map(str, hits[:5]))})")
+    return docs, commands
+
+
+def server_commands(root: Path) -> list[str]:
+    return _server_docs(Path(root))[1]
+
+
+def evidence_hint(root: Path) -> str:
+    """Где искать факты: логи в проекте и документы, где сказано, как добраться до логов на сервере."""
+    root = Path(root)
+    logs = []
+    main = main_checkout(root)
+    for d in ("logs", "log"):
+        where = root / d if (root / d).is_dir() else main / d if main and (main / d).is_dir() else None
+        if where:
+            files = [q for q in where.rglob("*") if q.is_file()]
+            if files:
+                logs.append(f"{d}/ ({len(files)} файлов: " + ", ".join(q.name for q in files[:6])
+                            + ("…" if len(files) > 6 else "") + ")")
+    docs, commands = _server_docs(root)
     out = ("\nЭто расследование: сначала найди причину по фактам, потом правь. `logstats` даёт сводку лога "
            "(пики по времени, топ адресов/статусов/сообщений); сравни время сбоев с тем, что делает код. "
            "В decide укажи cause — причину с фактами.")
@@ -778,6 +792,10 @@ class Agent:
             st["evidence_text"] = (st.get("evidence_text", "") + "\n" + result.output)[-200_000:]
             if name != "read" and name != "grep" or re.search(r"(^|/)logs?/|\.log$", str(args.get("path", ""))):
                 st["log_evidence"] = st.get("log_evidence", 0) + 1
+            # свежие факты: лог с записями последних дней или вывод с сервера (ssh/journalctl)
+            if (name == "logstats" and "время:" in result.output and "лог устарел" not in result.output
+                    or name == "run" and re.search(r"\b(ssh|scp|journalctl)\b", args.get("command", ""))):
+                st["fresh_logs"] = st.get("fresh_logs", 0) + 1
         if name in MUTATING and result.ok:
             st["edits"] = st.get("edits", 0) + 1
         if st["planned"] and (name in MUTATING or name == "run"):
@@ -809,6 +827,12 @@ class Agent:
                 why = ("в проекте есть логи (logs/), а ты их не смотрел: logstats path=logs (match=ERROR|WARNING, "
                        "by=message; для JSON-логов by=status|ip, bucket=hour), а логи сервера — командами из "
                        "документов о развёртывании")
+            elif has_logs and not st.get("fresh_logs") and server_commands(ctx.root):
+                why = ("логи, которые ты смотрел, устарели (последние записи — несколько дней назад), а сервис по "
+                       "документации работает на сервере. Возьми его актуальные логи командами (только чтение): "
+                       + "; ".join(f"`{c}`" for c in server_commands(ctx.root)[:4])
+                       + " — например run `ssh … \"cat /var/log/…/access.log\" > logs/server_access.log`, "
+                         "затем logstats path=logs/server_access.log")
             elif not st.get("evidence"):
                 why = ("ты ещё не смотрел факты: логи (logstats), конфиги, документы о развёртывании (где логи "
                        "сервера и как их прочитать)")

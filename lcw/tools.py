@@ -568,6 +568,19 @@ _LEVEL = re.compile(r"\b(CRITICAL|ERROR|WARNING|WARN|INFO|DEBUG)\b")
 _NUMS = re.compile(r"\d+(?:[.:]\d+)*")
 
 
+STALE_DAYS = 2
+
+
+def log_age_days(stamp: str) -> int | None:
+    """Сколько полных дней прошло с отметки «YYYY-MM-DD HH:MM» (локальное время)."""
+    import datetime as _dt
+    try:
+        t = _dt.datetime.strptime(stamp[:16], "%Y-%m-%d %H:%M")
+    except ValueError:
+        return None
+    return (_dt.datetime.now() - t).days
+
+
 def _log_lines(p: Path, limit: int = 50 * 1024 * 1024) -> list[str]:
     """Строки лога (и .gz); не больше limit байт с конца файла."""
     import gzip
@@ -636,6 +649,10 @@ def t_logstats(ctx: ToolContext, path: str, match: str = "", by: str = "", bucke
     if found:
         stamps = sorted(f"{m.group(1)} {m.group(2)}:{m.group(3)}" for m in found)
         out.append(f"время: {stamps[0]} … {stamps[-1]}")
+        age = log_age_days(stamps[-1])
+        if age is not None and age >= STALE_DAYS:
+            out.append(f"ВНИМАНИЕ: лог устарел — последняя запись {age} дн. назад. Если сервис сейчас работает "
+                       "в другом месте (сервер, ВМ — см. документацию о развёртывании), актуальные логи там.")
     keys = {}
     for _, d in rows:
         if d:

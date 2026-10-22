@@ -1,0 +1,73 @@
+diff --git a/app/config.py b/app/config.py
+index 4452cc7..f31c4fc 100644
+--- a/app/config.py
++++ b/app/config.py
+@@ -29,8 +29,9 @@ class Settings(BaseSettings):
+     guard_log: str = "logs/access.log"  # дома — app.web.server, на VPS — лог nginx
+     guard_interval: int = 15          # как часто читать лог, с
+     guard_window: int = 60
+-    guard_total_limit: int = 6000     # всего запросов за окно -> DDoS, сайт закрывается
++    guard_total_limit: int = 20000     # всего запросов за окно -> DDoS, сайт закрывается
+     guard_429_limit: int = 1500       # отбито лимитом nginx за окно -> DDoS, сайт закрывается
++    guard_whitelist_ips: list[str] = ["127.0.0.1"]   # IP-ы, которые не учитываются в guard
+     guard_ip_limit: int = 800         # один IP за окно -> сообщение (flood)
+     guard_scan_ip_limit: int = 20     # подозрительных запросов одного IP -> сообщение (scan)
+     guard_scan_close: int = 500       # подозрительных всего -> сайт закрывается, если сканеров много:
+diff --git a/app/guard/watch.py b/app/guard/watch.py
+index 7e69b7c..21edf68 100644
+--- a/app/guard/watch.py
++++ b/app/guard/watch.py
+@@ -158,9 +158,11 @@ class Guard:
+         now = time.time() if now is None else now
+         while self.hits and self.hits[0].ts < now - self.window:
+             self.hits.popleft()
+-        v = Verdict(total=len(self.hits))
++        # Skip hits from whitelisted IPs
++        hits = [h for h in self.hits if h.ip not in settings.guard_whitelist_ips]
++        v = Verdict(total=len(hits))
+         per_ip, scan_ip = Counter(), Counter()
+-        for h in self.hits:
++        for h in hits:
+             per_ip[h.ip] += 1
+             v.by_status[h.status] += 1
+             if h.suspicious:
+diff --git a/tests/test_guard.py b/tests/test_guard.py
+index 6678613..b88c7b4 100644
+--- a/tests/test_guard.py
++++ b/tests/test_guard.py
+@@ -138,7 +138,34 @@ def test_ddos_closes_site_and_open(guard, no_db, monkeypatch):
+     assert guard.open_site() and not guard.is_closed()
+ 
+ 
+-def test_old_hits_leave_window(guard, monkeypatch):
++def test_whitelist_ignores_hits(tmp_path, monkeypatch):
++    guard = watch.Guard(tmp_path / "access.log", tmp_path / "site")
++    monkeypatch.setattr(watch.settings, "guard_total_limit", 500)
++    monkeypatch.setattr(watch.settings, "guard_whitelist_ips", ["127.0.0.1"])
++    lines = []
++    T0 = 1700000000
++    for i in range(600):
++        lines.append(line(T0 + i * 0.01, ip="127.0.0.1"))
++    for i in range(200):
++        lines.append(line(T0 + 600 * 0.01 + i * 0.01, ip="1.2.3.4"))
++    guard.feed(lines)
++    assert not guard.is_closed()
++
++def test_ddos_without_whitelist(tmp_path, monkeypatch):
++    guard = watch.Guard(tmp_path / "access.log", tmp_path / "site")
++    monkeypatch.setattr(watch.settings, "guard_total_limit", 500)
++    monkeypatch.setattr(watch.settings, "guard_whitelist_ips", [])
++    lines = [line(1700000000 + i * 0.01, ip="127.0.0.1") for i in range(600)]
++    guard.feed(lines)
++    guard.tick(now=1700000000 + 600 * 0.01)
++    assert guard.is_closed()
++
++def test_default_total_limit_not_trigger_ddos(tmp_path, monkeypatch):
++    guard = watch.Guard(tmp_path / "access.log", tmp_path / "site")
++    lines = [line(1700000000 + i * 0.01, ip="1.2.3.4") for i in range(6000)]
++    guard.feed(lines)
++    assert not guard.is_closed()
++
+     monkeypatch.setattr(watch.settings, "guard_total_limit", 100)
+     append(guard, [line(T0 + i * 0.1) for i in range(90)])
+     guard.tick(now=T0 + 10)

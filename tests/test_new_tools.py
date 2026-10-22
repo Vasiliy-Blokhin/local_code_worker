@@ -117,3 +117,18 @@ def test_tool_called_through_shell_is_routed():
     assert tool_from_shell("logstats logs --show 5") == ("logstats", {"path": "logs", "show": 5})
     assert tool_from_shell("refs guard_ip_limit") == ("refs", {"name": "guard_ip_limit"})
     assert tool_from_shell("pytest -q") is None and tool_from_shell("ls logs") is None
+
+
+def test_stale_log_is_flagged(tmp_path):
+    (tmp_path / "logs").mkdir()
+    (tmp_path / "logs" / "old.log").write_text("2020-01-01 10:00:00 ERROR x\n", encoding="utf-8")
+    assert "лог устарел" in t_logstats(_ctx(tmp_path), "logs/old.log").output
+
+
+def test_server_commands_from_docs(tmp_path):
+    from lcw.agent import server_commands
+    (tmp_path / "docs").mkdir()
+    (tmp_path / "docs" / "vm.md").write_text(
+        "`sudo journalctl -u guard -n 50`, `sudo tail -f /var/log/nginx/access.log`, `sudo systemctl restart x`\n",
+        encoding="utf-8")
+    assert server_commands(tmp_path) == ["sudo journalctl -u guard -n 50"]

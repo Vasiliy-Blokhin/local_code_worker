@@ -1,0 +1,93 @@
+diff --git a/app/guard/watch.py b/app/guard/watch.py
+index 7e69b7c..e6e4124 100644
+--- a/app/guard/watch.py
++++ b/app/guard/watch.py
+@@ -17,6 +17,14 @@ python -m app.guard.watch --log logs/nginx/access.log --once
+ import argparse
+ import json
+ import logging
++import ipaddress
++
++def is_private_ip(ip: str) -> bool:
++    """Return True if ip is a private RFC1918 address."""
++    try:
++        return ipaddress.ip_address(ip).is_private
++    except ValueError:
++        return False
+ import os
+ import re
+ import threading
+@@ -158,9 +166,11 @@ class Guard:
+         now = time.time() if now is None else now
+         while self.hits and self.hits[0].ts < now - self.window:
+             self.hits.popleft()
+-        v = Verdict(total=len(self.hits))
++        v = Verdict(total=sum(1 for h in self.hits if not is_private_ip(h.ip)))
+         per_ip, scan_ip = Counter(), Counter()
+         for h in self.hits:
++            if is_private_ip(h.ip):
++                continue
+             per_ip[h.ip] += 1
+             v.by_status[h.status] += 1
+             if h.suspicious:
+diff --git a/tests/test_guard.py b/tests/test_guard.py
+index 6678613..ddfd961 100644
+--- a/tests/test_guard.py
++++ b/tests/test_guard.py
+@@ -80,6 +80,31 @@ def test_normal_traffic_quiet(guard):
+     assert guard.tick(now=T0 + 60) == []
+     assert not guard.is_closed()
+ 
+++def test_private_ips_ignored(guard):
+++    # All hits are private IPs; should not trigger any alert or closure
+++    append(guard, [line(T0 + i, ip="127.0.0.1") for i in range(10)])
+++    append(guard, [line(T0 + i, ip="192.168.0.10") for i in range(10)])
+++    msgs = guard.tick(now=T0 + 60)
+++    assert msgs == []
+++    assert not guard.is_closed()
+++
+++def test_private_ips_excluded_from_counts(guard):
+++    # Set a low total limit and mix private/public IPs
+++    monkeypatch = pytest.MonkeyPatch()
+++    monkeypatch.setattr(watch.settings, "guard_total_limit", 5)
+++    # 3 public IPs, 3 private IPs
+++    append(guard, [line(T0 + i, ip=f"7.7.7.{i}") for i in range(3)])
+++    append(guard, [line(T0 + i, ip="127.0.0.1") for i in range(3)])
+++    msgs = guard.tick(now=T0 + 30)
+++    # Only 3 public hits counted, below limit, so no closure
+++    assert not guard.is_closed()
+++    assert msgs == []
+++    monkeypatch.undo()
++
++    append(guard, [line(T0 + i * 0.5, ip=f"10.0.0.{i % 50}") for i in range(100)])
++    assert guard.tick(now=T0 + 60) == []
++    assert not guard.is_closed()
++
+ 
+ def test_scan_alerts_but_does_not_close(guard, no_db):
+     append(guard, [line(T0 + i, ip="6.6.6.6", uri=f"/wp-admin/{i}.php", status=404) for i in range(25)])
+@@ -161,3 +186,24 @@ def test_bot_commands(tmp_path, monkeypatch):
+     assert "открыт" in commands.handle("/guard")
+     assert "закрыт" in commands.handle("/close") and g.is_closed()
+     assert "снята" in commands.handle("/open") and not g.is_closed()
++
++
++def test_private_ips_ignored(guard):
++    # All hits are private IPs; should not trigger any alert or closure
++    append(guard, [line(T0 + i, ip="127.0.0.1") for i in range(10)])
++    append(guard, [line(T0 + i, ip="192.168.0.10") for i in range(10)])
++    msgs = guard.tick(now=T0 + 60)
++    assert msgs == []
++    assert not guard.is_closed()
++
++
++def test_private_ips_excluded_from_counts(guard, monkeypatch):
++    # Set a low total limit and mix private/public IPs
++    monkeypatch.setattr(watch.settings, "guard_total_limit", 5)
++    # 3 public IPs, 3 private IPs
++    append(guard, [line(T0 + i, ip=f"7.7.7.{i}") for i in range(3)])
++    append(guard, [line(T0 + i, ip="127.0.0.1") for i in range(3)])
++    msgs = guard.tick(now=T0 + 30)
++    # Only 3 public hits counted, below limit, so no closure
++    assert not guard.is_closed()
++    assert msgs == []
