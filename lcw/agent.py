@@ -250,7 +250,42 @@ def hour_digest(ctx: ToolContext, cause: str, limit: int = 2) -> str:
             lines = [l for l in text.splitlines() if l.startswith(("по ", "время:")) or "строк" in l]
             if lines and not lines[0].startswith("0 строк"):
                 out.append(f"[{h.replace('[T ]', ' ').rstrip(':')} ч, by={by}] " + " | ".join(lines[:3]))
+                total = re.match(r"(\d+) строк", lines[0])
+                top = re.search(r"по ip: (\d+) разных: (\S+) ×(\d+)", text)
+                if by == "ip" and total and top and int(top.group(3)) * 2 >= int(total.group(1)):
+                    # маленькая модель цифры видит, а вывод из них не делает — формулируем его сами
+                    out.append(f"→ {int(top.group(3)) * 100 // int(total.group(1))}% запросов этого часа — "
+                               f"с ОДНОГО адреса {top.group(2)} (из {top.group(1)} адресов).")
     return "\n".join(out)[:3000]
+
+
+_BOT = re.compile(r"\b(Googlebot|YandexBot|bingbot|Bingbot|DuckDuckBot|Baiduspider|AhrefsBot|SemrushBot)\b")
+
+
+def spoof_check(ctx: ToolContext, text: str) -> str:
+    """С каких адресов в свежих логах шли запросы с названными в тексте ботами (подделка видна сразу)."""
+    names = list(dict.fromkeys(_BOT.findall(text))) or ["Googlebot"]
+    logs = ctx.root / "logs"
+    files = sorted(logs.glob("server_*.log")) if logs.is_dir() else []
+    out = []
+    for q in files[:1]:
+        try:
+            lines = q.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            continue
+        for name in names[:3]:
+            ips: dict[str, int] = {}
+            for l in lines:
+                if name in l:
+                    m = re.search(r'"ip":\s*"([^"]+)"', l)
+                    if m:
+                        ips[m.group(1)] = ips.get(m.group(1), 0) + 1
+            if ips:
+                top = sorted(ips.items(), key=lambda kv: -kv[1])[:3]
+                out.append(f"Запросы с «{name}» в {q.name}: {sum(ips.values())} с {len(ips)} адресов ("
+                           + ", ".join(f"{ip} ×{n}" for ip, n in top) + ")"
+                           + (" — один адрес: это подделка под бота, а не настоящий поисковик." if len(ips) == 1 else ""))
+    return "\n".join(out)
 
 
 def peak_digest(ctx: ToolContext, limit: int = 2) -> str:
@@ -1028,10 +1063,12 @@ class Agent:
                      for n, sim in missing.items()]
             return ToolResult("Ошибка: решение опирается на несуществующие сущности:\n" + "\n".join(lines)
                               + "\nНайди реальные через symbols/grep и пришли decide заново.", ok=False)
-        if SPOOFABLE.search(decision) and EXEMPT.search(decision) and not st.get("spoof_warned"):
+        if SPOOFABLE.search(decision) and EXEMPT.search(decision) and st.get("spoof_warned", 0) < 2:
             # «не считать запросы Googlebot» — атакующему достаточно подставить этот User-Agent
-            st["spoof_warned"] = True
+            st["spoof_warned"] = st.get("spoof_warned", 0) + 1
+            bots = spoof_check(ctx, decision + " " + cause)
             return ToolResult(
+                (bots + "\n" if bots else "") +
                 "Внимание: решение делает исключение по данным, которые задаёт сам клиент (User-Agent, Referer, "
                 "заголовки, параметры запроса). Их подделывают: сканеры часто представляются Googlebot/YandexBot. "
                 "Так защиту обойдёт любой, кто подставит это значение. Проверь в логах, с каких адресов шли такие "

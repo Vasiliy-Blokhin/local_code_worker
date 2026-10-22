@@ -1,0 +1,75 @@
+diff --git a/app/guard/watch.py b/app/guard/watch.py
+index 7e69b7c..ee36c56 100644
+--- a/app/guard/watch.py
++++ b/app/guard/watch.py
+@@ -46,6 +46,9 @@ def is_suspicious(method: str, uri: str, status: int) -> bool:
+     """Запрос похож на попытку взлома."""
+     if method not in ("GET", "HEAD") or status == 405:
+         return True
++    # ignore 404 for static assets
++    if status == 404 and (uri.startswith("/static/") or uri.endswith(('.js', '.css', '.png', '.jpg', '.svg', '.ico', '.woff', '.ttf')):
++        return False
+     return bool(_SUSPICIOUS.search(uri or ""))
+ 
+ 
+@@ -163,7 +166,7 @@ class Guard:
+         for h in self.hits:
+             per_ip[h.ip] += 1
+             v.by_status[h.status] += 1
+-            if h.suspicious:
++            if h.suspicious and h.status != 200:
+                 scan_ip[h.ip] += 1
+         v.suspicious = sum(scan_ip.values())
+         v.top_ips = per_ip.most_common(5)
+diff --git a/tests/test_guard.py b/tests/test_guard.py
+index 6678613..1a45fd9 100644
+--- a/tests/test_guard.py
++++ b/tests/test_guard.py
+@@ -154,6 +154,47 @@ def test_auto_reopen(guard, monkeypatch):
+     assert not guard.is_closed() and "открыт" in msgs[0]
+ 
+ 
++# New tests for 200 status handling
++def test_suspicious_200_not_counted(guard, no_db):
++    append(guard, [line(T0, uri="/?q=1%20UNION%20SELECT%20password", status=200)])
++    msgs = guard.tick(now=T0 + 1)
++    assert msgs == []
++    assert guard.is_closed() == False
++    assert no_db == []
++
++def test_mixed_status_counts_only_non200(guard, no_db):
++    lines = [line(T0, uri="/?q=1%20UNION%20SELECT%20password", status=200)]
++    lines += [line(T0, uri="/?q=1%20UNION%20SELECT%20password", status=404) for _ in range(25)]
++    append(guard, lines)
++    msgs = guard.tick(now=T0 + 1)
++    assert msgs != []
++    assert guard.is_closed() == False
++    assert [e[0] for e in no_db] == ['scan']
++
++def test_non_suspicious_200_no_alert(guard, no_db):
++    append(guard, [line(T0, uri="/index.html", status=200)])
++    msgs = guard.tick(now=T0 + 1)
++    assert msgs == []
++    assert guard.is_closed() == False
++    assert no_db == []
++
++def test_many_200_suspicious_no_close(guard, no_db):
++    lines = [line(T0 + i*0.1, uri="/?q=1%20UNION%20SELECT%20password", status=200) for i in range(50)]
++    append(guard, lines)
++    msgs = guard.tick(now=T0 + 5)
++    assert msgs == []
++    assert guard.is_closed() == False
++    assert no_db == []
++
++def test_mixed_200_no_alert(guard, no_db):
++    append(guard, [line(T0, uri="/?q=1%20UNION%20SELECT%20password", status=200),
++                  line(T0, uri="/index.html", status=200)])
++    msgs = guard.tick(now=T0 + 1)
++    assert msgs == []
++    assert guard.is_closed() == False
++    assert no_db == []
++
++
+ def test_bot_commands(tmp_path, monkeypatch):
+     from app.bot import commands
+     g = Guard(tmp_path / "none.log", tmp_path / "site")

@@ -1,0 +1,184 @@
+diff --git a/app/config.py b/app/config.py
+index 4452cc7..8b1e5b4 100644
+--- a/app/config.py
++++ b/app/config.py
+@@ -11,6 +11,7 @@ class Settings(BaseSettings):
+     parse_times: str = "07:00,14:00,21:00"
+     report_time: str = "18:00"
+     history_enabled: bool = False
++    guard_ignore_ips: list[str] = []
+     default_city: str = "sergiev_posad"
+     log_level: str = "INFO"
+     site_dir: str = "site"
+diff --git a/app/guard/watch.py b/app/guard/watch.py
+index 7e69b7c..2cdd0d2 100644
+--- a/app/guard/watch.py
++++ b/app/guard/watch.py
+@@ -54,7 +54,9 @@ class Hit:
+     ts: float
+     ip: str
+     status: int
++    uri: str
+     suspicious: bool
++    ua: str = ''
+ 
+ 
+ @dataclass
+@@ -108,7 +110,7 @@ def parse_line(line: str) -> Hit | None:
+     except (ValueError, KeyError, TypeError):
+         return None
+     method = d.get("method") or ""
+-    return Hit(ts, d.get("ip") or "?", status, is_suspicious(method, d.get("uri") or "", status))
++    return Hit(ts, d.get("ip") or "?", status, d.get("uri") or "", is_suspicious(method, d.get("uri") or "", status), d.get("ua") or "")
+ 
+ 
+ class Guard:
+@@ -161,9 +163,12 @@ class Guard:
+         v = Verdict(total=len(self.hits))
+         per_ip, scan_ip = Counter(), Counter()
+         for h in self.hits:
++            if h.ip in settings.guard_ignore_ips or (h.uri and h.uri.startswith("/static/")):
++                continue
+             per_ip[h.ip] += 1
+             v.by_status[h.status] += 1
+-            if h.suspicious:
++            # Ignore suspicious requests from known bots
++            if h.suspicious and not any(bot in h.ua for bot in ["Googlebot", "Bingbot", "YandexBot", "DuckDuckBot", "Baiduspider"]):
+                 scan_ip[h.ip] += 1
+         v.suspicious = sum(scan_ip.values())
+         v.top_ips = per_ip.most_common(5)
+diff --git a/tests/test_guard.py b/tests/test_guard.py
+index 6678613..3376f4b 100644
+--- a/tests/test_guard.py
++++ b/tests/test_guard.py
+@@ -4,24 +4,22 @@ from datetime import datetime, timezone
+ import pytest
+ 
+ from app.guard import watch
++from app.config import settings
+ from app.guard.watch import Guard, LogTail, is_suspicious, parse_line
+ 
+ T0 = datetime(2026, 10, 15, 3, 0, tzinfo=timezone.utc).timestamp()
+ 
+-
+ def line(ts, ip="1.2.3.4", uri="/", status=200, method="GET"):
+     t = datetime.fromtimestamp(ts, timezone.utc).isoformat()
+     return json.dumps({"time": t, "ip": ip, "method": method, "uri": uri, "status": str(status),
+                        "bytes": "100", "ua": "test", "rt": "0.001"})
+ 
+-
+ @pytest.fixture(autouse=True)
+ def no_db(monkeypatch):
+     saved = []
+     monkeypatch.setattr(watch, "save_events", saved.extend)
+     return saved
+ 
+-
+ @pytest.fixture
+ def guard(tmp_path):
+     log = tmp_path / "access.log"
+@@ -35,7 +33,6 @@ def append(g, lines):
+     with g.tail.path.open("a", encoding="utf-8") as f:
+         f.write("\n".join(lines) + "\n")
+ 
+-
+ @pytest.mark.parametrize("method, uri, status, expected", [
+     ("GET", "/", 200, False),
+     ("GET", "/best.html", 200, False),
+@@ -53,13 +50,11 @@ def append(g, lines):
+ def test_is_suspicious(method, uri, status, expected):
+     assert is_suspicious(method, uri, status) is expected
+ 
+-
+ def test_parse_line_bad():
+     assert parse_line("not json") is None
+     assert parse_line('{"ip": "1.1.1.1"}') is None
+     assert parse_line(line(T0)).ip == "1.2.3.4"
+ 
+-
+ def test_tail_skips_old_and_survives_rotation(tmp_path):
+     log = tmp_path / "a.log"
+     log.write_text("old1\nold2\n")
+@@ -74,13 +69,11 @@ def test_tail_skips_old_and_survives_rotation(tmp_path):
+     log.write_text("rot1\n")                       # усечение/ротация
+     assert tail.read() == ["rot1"]
+ 
+-
+ def test_normal_traffic_quiet(guard):
+     append(guard, [line(T0 + i * 0.5, ip=f"10.0.0.{i % 50}") for i in range(100)])
+     assert guard.tick(now=T0 + 60) == []
+     assert not guard.is_closed()
+ 
+-
+ def test_scan_alerts_but_does_not_close(guard, no_db):
+     append(guard, [line(T0 + i, ip="6.6.6.6", uri=f"/wp-admin/{i}.php", status=404) for i in range(25)])
+     msgs = guard.tick(now=T0 + 20)
+@@ -91,7 +84,6 @@ def test_scan_alerts_but_does_not_close(guard, no_db):
+     append(guard, [line(T0 + 21, ip="6.6.6.6", uri="/.git/config", status=404)])
+     assert guard.tick(now=T0 + 22) == []
+ 
+-
+ def test_single_scanner_does_not_close(guard, no_db):
+     # Один сканер с тысячей запросов (как WebSiphon 20.10) — только сообщение, сайт открыт
+     append(guard, [line(T0 + i * 0.04, ip="147.224.220.170", uri=f"/x{i}.php", status=444) for i in range(1300)])
+@@ -99,13 +91,11 @@ def test_single_scanner_does_not_close(guard, no_db):
+     assert not guard.is_closed()
+     assert len(msgs) == 1 and "взлома" in msgs[0]
+ 
+-
+ def test_mass_scan_from_many_ips_closes(guard, no_db):
+     append(guard, [line(T0 + i * 0.05, ip=f"8.8.{i % 6}.1", uri=f"/x{i}.php", status=444) for i in range(600)])
+     guard.tick(now=T0 + 31)
+     assert guard.is_closed()
+ 
+-
+ def test_deliver_keeps_unsent():
+     from collections import deque
+     from app.guard.service import deliver
+@@ -123,7 +113,6 @@ def test_deliver_keeps_unsent():
+     deliver(box, send)
+     assert sent == ["a", "b", "c"] and not box
+ 
+-
+ def test_ddos_closes_site_and_open(guard, no_db, monkeypatch):
+     monkeypatch.setattr(watch.settings, "guard_total_limit", 500)
+     append(guard, [line(T0 + i * 0.05, ip=f"7.7.{i % 200}.1", status=429 if i % 3 else 200) for i in range(600)])
+@@ -137,7 +126,6 @@ def test_ddos_closes_site_and_open(guard, no_db, monkeypatch):
+     assert not any("закрыт" in m for m in guard.tick(now=T0 + 61))
+     assert guard.open_site() and not guard.is_closed()
+ 
+-
+ def test_old_hits_leave_window(guard, monkeypatch):
+     monkeypatch.setattr(watch.settings, "guard_total_limit", 100)
+     append(guard, [line(T0 + i * 0.1) for i in range(90)])
+@@ -145,7 +133,6 @@ def test_old_hits_leave_window(guard, monkeypatch):
+     append(guard, [line(T0 + 200 + i * 0.1) for i in range(90)])
+     assert guard.tick(now=T0 + 210) == [] and not guard.is_closed()
+ 
+-
+ def test_auto_reopen(guard, monkeypatch):
+     monkeypatch.setattr(watch.settings, "guard_auto_reopen", 5)
+     guard.close_site("test")
+@@ -153,7 +140,6 @@ def test_auto_reopen(guard, monkeypatch):
+     msgs = guard.tick(now=T0 + 301)
+     assert not guard.is_closed() and "открыт" in msgs[0]
+ 
+-
+ def test_bot_commands(tmp_path, monkeypatch):
+     from app.bot import commands
+     g = Guard(tmp_path / "none.log", tmp_path / "site")
+@@ -161,3 +147,14 @@ def test_bot_commands(tmp_path, monkeypatch):
+     assert "открыт" in commands.handle("/guard")
+     assert "закрыт" in commands.handle("/close") and g.is_closed()
+     assert "снята" in commands.handle("/open") and not g.is_closed()
++
++# New tests for guard_ignore_ips and static request filtering
++
++def test_guard_ignore_ips_and_static(monkeypatch, guard):
++    monkeypatch.setattr(settings, "guard_ignore_ips", ["10.0.0.1"])
++    append(guard, [line(T0 + i, ip="10.0.0.1") for i in range(2000)])
++    assert guard.tick(now=T0 + 61) == []
++    assert not guard.is_closed()
++    append(guard, [line(T0 + i, ip="10.0.0.2", uri="/static/style.css") for i in range(2000)])
++    assert guard.tick(now=T0 + 61) == []
++    assert not guard.is_closed()

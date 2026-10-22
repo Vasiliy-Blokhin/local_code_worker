@@ -200,3 +200,11 @@ def test_peak_digest_names_the_peak(tmp_path):
            [{"time": "2026-10-18T10:00:00+03:00", "ip": "1.1.1.1", "status": "200"}] * 3
     (tmp_path / "logs" / "server_access.log").write_text("\n".join(json.dumps(r) for r in rows), encoding="utf-8")
     assert "6.6.6.6 ×50" in peak_digest(_ctx(tmp_path))
+
+
+def test_spoof_check_single_address(tmp_path):
+    from lcw.agent import spoof_check
+    (tmp_path / "logs").mkdir()
+    (tmp_path / "logs" / "server_access.log").write_text(
+        '{"ip":"6.6.6.6","ua":"Googlebot/2.1"}\n' * 5, encoding="utf-8")
+    assert "подделка" in spoof_check(_ctx(tmp_path), "ignore Googlebot")

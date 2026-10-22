@@ -1,0 +1,91 @@
+diff --git a/app/guard/watch.py b/app/guard/watch.py
+index 7e69b7c..e568ef5 100644
+--- a/app/guard/watch.py
++++ b/app/guard/watch.py
+@@ -21,11 +21,27 @@ import os
+ import re
+ import threading
+ import time
++import ipaddress
+ from collections import Counter, deque
+ from dataclasses import dataclass, field
+ from datetime import datetime, timezone
+ from pathlib import Path
+ 
++# internal IP ranges to ignore
++_INTERNAL_IPS = (
++    "127.0.0.1",
++    "192.168.0.0/16",
++    "10.0.0.0/8",
++    "172.16.0.0/12",
++)
++
++def _is_internal_ip(ip: str) -> bool:
++    try:
++        addr = ipaddress.ip_address(ip)
++        return any(addr in ipaddress.ip_network(r) for r in _INTERNAL_IPS)
++    except ValueError:
++        return False
++
+ from app.config import settings
+ 
+ log = logging.getLogger(__name__)
+@@ -158,9 +174,11 @@ class Guard:
+         now = time.time() if now is None else now
+         while self.hits and self.hits[0].ts < now - self.window:
+             self.hits.popleft()
+-        v = Verdict(total=len(self.hits))
++        # filter out internal IPs to avoid false positives
++        hits_filtered = [h for h in self.hits if not _is_internal_ip(h.ip)]
++        v = Verdict(total=len(hits_filtered))
+         per_ip, scan_ip = Counter(), Counter()
+-        for h in self.hits:
++        for h in hits_filtered:
+             per_ip[h.ip] += 1
+             v.by_status[h.status] += 1
+             if h.suspicious:
+diff --git a/tests/test_guard.py b/tests/test_guard.py
+index 6678613..212b1df 100644
+--- a/tests/test_guard.py
++++ b/tests/test_guard.py
+@@ -161,3 +161,40 @@ def test_bot_commands(tmp_path, monkeypatch):
+     assert "открыт" in commands.handle("/guard")
+     assert "закрыт" in commands.handle("/close") and g.is_closed()
+     assert "снята" in commands.handle("/open") and not g.is_closed()
++
++# new tests for internal IP filtering
++
++def test_internal_ip_filtering(guard, no_db, monkeypatch):
++    # set low total limit to trigger close if internal counted
++    monkeypatch.setattr(watch.settings, "guard_total_limit", 1)
++    # add internal IP hit
++    append(guard, [line(T0, ip="127.0.0.1")])
++    msgs = guard.tick(now=T0 + 1)
++    assert not guard.is_closed()
++    # add external IP hit
++    append(guard, [line(T0 + 2, ip="8.8.8.8")])
++    msgs = guard.tick(now=T0 + 3)
++    assert guard.is_closed()
++    assert "closed" in [e[0] for e in no_db]
++
++# boundary test: IP at edge of internal range
++
++def test_internal_ip_range_boundary(guard, no_db, monkeypatch):
++    monkeypatch.setattr(watch.settings, "guard_total_limit", 1)
++    # IP exactly 192.168.0.0 should be considered internal
++    append(guard, [line(T0, ip="192.168.0.0")])
++    msgs = guard.tick(now=T0 + 1)
++    assert not guard.is_closed()
++    # IP just outside: 192.168.1.0 should be external
++    append(guard, [line(T0 + 2, ip="192.168.1.0")])
++    msgs = guard.tick(now=T0 + 3)
++    assert guard.is_closed()
++    assert "closed" in [e[0] for e in no_db]
++
++# test internal IP detection
++
++def test_internal_ip_detection():
++    from app.guard.watch import _is_internal_ip
++    assert _is_internal_ip("127.0.0.1")
++    assert _is_internal_ip("192.168.1.1")
++    assert not _is_internal_ip("8.8.8.8")

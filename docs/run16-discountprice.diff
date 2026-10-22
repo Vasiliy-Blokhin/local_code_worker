@@ -1,0 +1,35 @@
+diff --git a/app/guard/watch.py b/app/guard/watch.py
+index 7e69b7c..fba1f0c 100644
+--- a/app/guard/watch.py
++++ b/app/guard/watch.py
+@@ -55,6 +55,7 @@ class Hit:
+     ip: str
+     status: int
+     suspicious: bool
++    ua: str = ""
+ 
+ 
+ @dataclass
+@@ -108,7 +109,7 @@ def parse_line(line: str) -> Hit | None:
+     except (ValueError, KeyError, TypeError):
+         return None
+     method = d.get("method") or ""
+-    return Hit(ts, d.get("ip") or "?", status, is_suspicious(method, d.get("uri") or "", status))
++    return Hit(ts, d.get("ip") or "?", status, is_suspicious(method, d.get("uri") or "", status), d.get("ua") or "")
+ 
+ 
+ class Guard:
+@@ -159,8 +160,13 @@ class Guard:
+         while self.hits and self.hits[0].ts < now - self.window:
+             self.hits.popleft()
+         v = Verdict(total=len(self.hits))
++        # known bot user agents to exclude from suspicious analysis
++        known_bot_ua_substrings = ["bot", "crawl", "spider", "slurp", "bing", "yahoo", "yandex", "duckduckgo"]
+         per_ip, scan_ip = Counter(), Counter()
+         for h in self.hits:
++            # skip known bot UA to avoid false positives
++            if h.ua and any(sub in h.ua.lower() for sub in known_bot_ua_substrings):
++                continue
+             per_ip[h.ip] += 1
+             v.by_status[h.status] += 1
+             if h.suspicious:
