@@ -271,3 +271,27 @@ def test_check_names_accepts_stdlib(tmp_path):
 def test_threshold_multiplied_is_symptomatic():
     from lcw.agent import is_symptomatic
     assert is_symptomatic("require suspicious hits per IP to exceed guard_scan_ip_limit * 2")
+
+
+def test_decide_investigation_flow(tmp_path):
+    """Расследование с логами сервера: сводка засчитана, причина сверяется, белый список не проходит сразу."""
+    from types import SimpleNamespace
+    from lcw.agent import Agent
+    (tmp_path / "logs").mkdir()
+    rows = [{"time": "2026-10-18T08:2%d:00+03:00" % (i % 10), "ip": "6.6.6.6", "status": "429"} for i in range(90)]
+    (tmp_path / "logs" / "server_access.log").write_text("\n".join(json.dumps(r) for r in rows), encoding="utf-8")
+    (tmp_path / "app.py").write_text("guard_ip_limit = 800\n\n\ndef analyze():\n    return guard_ip_limit\n",
+                                     encoding="utf-8")
+    s = SimpleNamespace(focus=0, decisions={}, add=lambda item: None)
+    st = {"reqs": ["Найти причину периодического отключения сайта"]}
+    agent = Agent.__new__(Agent)
+    args = {"decision": "Add guard_ignore_ips whitelist to Settings and skip them in analyze",
+            "uses": ["analyze"], "fallback": "прежнее поведение",
+            "cause": "2026-10-18 08: 6.6.6.6 дал 90 ответов 429, analyze закрывает сайт"}
+    first = agent._decide(s, _ctx(tmp_path), args, st)
+    assert not first.ok and "Проверка причины" in first.output and "6.6.6.6" in first.output
+    second = agent._decide(s, _ctx(tmp_path), args, st)
+    assert not second.ok and "лечение симптома" in second.output
+    good = dict(args, decision="Close the site only when many distinct addresses send requests; one address -> flood",
+                effect="в 2026-10-18 08 один адрес 6.6.6.6 — сайт не закрыт, сообщение flood")
+    assert agent._decide(s, _ctx(tmp_path), good, st).ok
