@@ -253,6 +253,21 @@ def hour_digest(ctx: ToolContext, cause: str, limit: int = 2) -> str:
     return "\n".join(out)[:3000]
 
 
+def peak_digest(ctx: ToolContext, limit: int = 2) -> str:
+    """Самые нагруженные часы свежего лога (сначала скачанные с сервера) и кто давал в них запросы."""
+    from .tools import t_logstats
+    logs = ctx.root / "logs"
+    files = sorted(logs.glob("server_*.log")) if logs.is_dir() else []
+    for q in files[:1]:
+        text = t_logstats(ctx, f"logs/{q.name}", bucket="hour").output
+        peaks = re.search(r"пики по hour: (.+)", text)
+        if not peaks:
+            continue
+        top = sorted(re.findall(r"(\d{4}-\d{2}-\d{2} \d{2}) ×(\d+)", peaks.group(1)), key=lambda x: -int(x[1]))[:limit]
+        return hour_digest(ctx, " ".join(h for h, _ in top))
+    return ""
+
+
 _ADDR = re.compile(r"(?<![\d.])\d{1,3}(?:\.(?:\d{1,3}|\*)){1,3}(?![\d])")
 
 
@@ -999,7 +1014,8 @@ class Agent:
                 # причина названа со временем: показываем, что на самом деле было в логах в тот час, —
                 # маленькая модель находит время сбоя, но объясняет его первым, что пришло в голову
                 st["cause_checked"] = True
-                window = "\n".join(x for x in (hour_digest(ctx, cause), address_counts(ctx, cause)) if x)
+                window = "\n".join(x for x in (hour_digest(ctx, cause), address_counts(ctx, cause)) if x) \
+                    or peak_digest(ctx)  # ни времени, ни адреса в cause — показываем пики свежего лога
                 if window:
                     return ToolResult(
                         f"Проверка причины по логам — что было в названное время:\n{window}\n"

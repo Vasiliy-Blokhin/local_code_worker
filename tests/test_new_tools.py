@@ -191,3 +191,12 @@ def test_status_codes_are_not_facts():
     seen = "по status: 404 ×1618, 429 ×858"
     assert not grounded("guard закрывал сайт из-за большого числа 404 на статику", seen)
     assert grounded("1618 ответов 404", seen)
+
+
+def test_peak_digest_names_the_peak(tmp_path):
+    from lcw.agent import peak_digest
+    (tmp_path / "logs").mkdir()
+    rows = [{"time": "2026-10-18T08:20:00+03:00", "ip": "6.6.6.6", "status": "429"}] * 50 + \
+           [{"time": "2026-10-18T10:00:00+03:00", "ip": "1.1.1.1", "status": "200"}] * 3
+    (tmp_path / "logs" / "server_access.log").write_text("\n".join(json.dumps(r) for r in rows), encoding="utf-8")
+    assert "6.6.6.6 ×50" in peak_digest(_ctx(tmp_path))
