@@ -226,3 +226,11 @@ def test_revert_whitespace_only(tmp_path):
     (tmp_path / "b.py").write_text("X = 2\n", encoding="utf-8")
     assert revert_whitespace_only(tmp_path, {"a.py": "X = 1\n", "b.py": "X = 1\n"}) == ["a.py"]
     assert (tmp_path / "a.py").read_text(encoding="utf-8") == "X = 1\n"
+
+
+def test_symptom_patterns():
+    from lcw.agent import SYMPTOM
+    for d in ("Add guard_whitelist_ips: list[str] to Settings", "Increase guard_total_limit to 12000",
+              "Add guard_ignore_ips setting", "Поднять порог guard_429_limit до 3000"):
+        assert SYMPTOM.search(d), d
+    assert not SYMPTOM.search("DDoS closes the site only when requests come from at least 20 addresses")

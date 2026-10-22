@@ -98,6 +98,11 @@ EVIDENCE_CMD = re.compile(r"\b(ssh|scp|journalctl|tail|zcat|Get-Content|Select-S
                           re.IGNORECASE)
 EVIDENCE_PATH = re.compile(r"(^|/)(logs?|deploy|nginx|docs|etc)/|\.(log|conf|inc|service|md|ya?ml)$",
                            re.IGNORECASE)
+# решение лечит симптом: список исключений или подъём порога вместо правила, меняющего причину
+SYMPTOM = re.compile(r"whitelist|allow[- ]?list|ignore[_ ]?(ips?|list|addresses)|guard_ignore|skip (ips?|hits from)|"
+                     r"белый список|игнорир\w* (адрес|ip)|исключ\w* (адрес|ip)|"
+                     r"(increase|raise|bump|double)\w* (the )?(\w+_)?(limit|threshold)|(limit|threshold) (to|from) \d|"
+                     r"(повыс|подн[яи]|увелич)\w* (порог|лимит)", re.IGNORECASE)
 # решение доверяет данным, которые задаёт клиент, — и делает по ним исключение из проверки
 SPOOFABLE = re.compile(r"user[- ]?agent|\bUA\b|referr?er|googlebot|yandexbot|bingbot|\bbots?\b|бот\w*|"
                        r"заголов\w* запрос|request header", re.IGNORECASE)
@@ -771,6 +776,7 @@ class Agent:
                            + "\n".join(f"Пункт {int(k) + 1}: {v['decision']}\n  опирается на: {', '.join(v['uses'])}"
                                        f"\n  если данных нет: {v['fallback']}"
                                        + (f"\n  причина: {v['cause']}" if v.get("cause") else "")
+                                       + (f"\n  эффект: {v['effect']}" if v.get("effect") else "")
                                        + ("\n  ⚠ причина не подтверждена фактами из логов" if v.get("unverified") else "")
                                        for k, v in sorted(s.decisions.items()))})
                 return
@@ -1062,6 +1068,24 @@ class Agent:
                         "Сверь cause с этими цифрами: кто давал запросы (сколько адресов, доля самого частого), "
                         "какие статусы. Если цифры подтверждают причину — пришли тот же decide ещё раз; если нет — "
                         "исправь cause и decision по ним.", ok=False)
+            effect = str(args.get("effect", "")).strip()
+            if not why and SYMPTOM.search(decision) and st.get("symptom_rejects", 0) < 2:
+                # белый список / подъём порога: инцидент пройдёт, пока его цифры ниже порога и адрес в списке, —
+                # следующий такой же с другого адреса или чуть сильнее повторит сбой
+                weak = not effect or not grounded(effect, st.get("evidence_text", "") + "\n" + cause) \
+                    or st.get("symptom_rejects", 0) == 0
+                if weak:
+                    st["symptom_rejects"] = st.get("symptom_rejects", 0) + 1
+                    peak = peak_digest(ctx)
+                    return ToolResult(
+                        "Проверка решения: оно похоже на лечение симптома (белый список, исключение адресов, "
+                        "подъём порога). Такое решение снимает этот случай, но не причину: тот же сбой повторится "
+                        "с другого адреса или при чуть большей нагрузке, а список придётся пополнять вручную.\n"
+                        + (f"Что было в пиках логов:\n{peak}\n" if peak else "")
+                        + "Ответь в поле effect: что сделает НОВОЕ правило в найденном случае (те же время и числа) "
+                        "и в таком же случае с другого адреса или вдвое сильнее? Если сбой повторится — выбери "
+                        "правило, которое меняет саму причину (то, что в cause названо источником сбоя), и пришли "
+                        "decide с ним и с effect.", ok=False)
         missing = entities.check_names(ctx.root, uses)
         if missing:
             lines = [f"- {n}: нет в проекте" + (f" (похожие: {', '.join(sim)})" if sim else "")
@@ -1090,7 +1114,7 @@ class Agent:
                 "если такое изменение прямо требуется задачей.", ok=False)
         unverified = bool(INVESTIGATE.search(item)) and not grounded(cause, st.get("evidence_text", ""))
         s.decisions[str(s.focus)] = {"decision": decision, "uses": uses, "fallback": fallback, "cause": cause,
-                                     "unverified": unverified}
+                                     "unverified": unverified, "effect": str(args.get("effect", "")).strip()}
         s.add({"type": "notice", "level": "info",
                "text": (f"Причина: {cause}\n" if cause else "")
                        + f"Решение по пункту {s.focus + 1}: {decision}\nОпирается на: {', '.join(uses)}\n"

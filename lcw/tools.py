@@ -63,7 +63,9 @@ TOOLS = [
                   "description": "existing functions/classes/settings it relies on (real names from the code)"},
          "fallback": {**S, "description": "behaviour when data is missing or the check cannot run"},
          "cause": {**S, "description": "the problem this solves and its cause, with evidence you found (log "
-                                       "times, counts, file:line); '-' only if the item is not about a problem"}},
+                                       "times, counts, file:line); '-' only if the item is not about a problem"},
+         "effect": {**S, "description": "what the new rule does in the found case (same times/numbers) and in the "
+                                        "same case from another address or twice as strong"}},
         ["decision", "uses", "fallback", "cause"]),
     _fn("symbols", "Project entity index (classes/functions with line ranges and docstrings). "
                    "path=file: its outline; query: search names+docstrings (words, `|` = or) in path; "
