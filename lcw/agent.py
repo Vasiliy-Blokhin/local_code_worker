@@ -305,7 +305,8 @@ def peak_digest(ctx: ToolContext, limit: int = 2) -> str:
     """Самые нагруженные часы свежего лога (сначала скачанные с сервера) и кто давал в них запросы."""
     from .tools import t_logstats
     logs = ctx.root / "logs"
-    files = sorted(logs.glob("server_*.log")) if logs.is_dir() else []
+    # самый полный лог сервера: модель иногда перекачивает только текущий файл без ротированных
+    files = sorted(logs.glob("server_*.log"), key=lambda q: -q.stat().st_size) if logs.is_dir() else []
     if not files and logs.is_dir():  # лог сервера не скачан — самый большой лог проекта
         files = sorted(logs.glob("*.log"), key=lambda q: -q.stat().st_size)
     for q in files[:1]:
@@ -318,12 +319,13 @@ def peak_digest(ctx: ToolContext, limit: int = 2) -> str:
     return ""
 
 
+_HOUR_MIN = re.compile(r"\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}")
 _ADDR = re.compile(r"(?<![\d.])\d{1,3}(?:\.(?:\d{1,3}|\*)){1,3}(?![\d])")
 
 
 def address_counts(ctx: ToolContext, cause: str, limit: int = 4) -> str:
     """Сколько строк каждого лога приходится на адреса/маски из cause («127.0.0.1», «192.168.0.*»)."""
-    from .tools import main_checkout
+    from .tools import STALE_DAYS, log_age_days, main_checkout
     addrs = [a for a in dict.fromkeys(_ADDR.findall(cause)) if a.count(".") >= 2][:limit]
     if not addrs:
         return ""
@@ -342,8 +344,32 @@ def address_counts(ctx: ToolContext, cause: str, limit: int = 4) -> str:
             prefix = a.rstrip("*")
             n = sum(1 for l in lines if re.search(r'(?<![\d.])' + re.escape(prefix) + (r"" if a.endswith("*") else r"(?![\d])"), l))
             counts.append(f"{a}: {n}")
-        out.append(f"{q.parent.name}/{q.name} ({len(lines)} строк): " + ", ".join(counts))
+        # самая поздняя отметка, а не последняя строка: в склеенном логе ротированные части идут после текущей
+        newest = max((m.group(0).replace("T", " ") for l in lines[:200_000] if (m := _HOUR_MIN.search(l))),
+                     default="")
+        age = log_age_days(newest) if newest else None
+        stale = f", последняя запись {newest[:10]} — УСТАРЕЛ" if age is not None and age >= STALE_DAYS else ""
+        out.append(f"{q.parent.name}/{q.name} ({len(lines)} строк{stale}): " + ", ".join(counts))
     return "\n".join(out)[:2000]
+
+
+def server_evidence(root: Path) -> str:
+    """
+    Для пункта-расследования harness сразу скачивает логи сервера (только чтение, с ротированными) и даёт
+    сводку пиков: модель то не идёт за ними, то берёт только текущий файл без сбоев. Повторно не качает.
+    """
+    root = Path(root)
+    fetch = fetch_commands(root)
+    if not fetch:
+        return ""
+    ctx = ToolContext(root=root)
+    have = list((root / "logs").glob("server_*.log")) if (root / "logs").is_dir() else []
+    digest = "" if have else collect_server_logs(ctx, fetch)
+    peaks = peak_digest(ctx)
+    if not peaks:
+        return ("\nЛоги сервера скачать не удалось:\n" + digest[:800]) if digest else ""
+    return ("\nHarness скачал логи сервера (с ротированными) в logs/server_*.log. Пики нагрузки и кто их дал:\n"
+            + peaks + "\nНачни с них: сравни эти часы и адреса с правилами в коде.")
 
 
 def collect_server_logs(ctx: ToolContext, fetch: list[str], timeout: int = 120) -> str:
@@ -418,7 +444,7 @@ def focus_message(root: Path, reqs: list[str], k: int, first: bool = False) -> s
             "проверкой. Не подменяй работу пустыми методами, заглушками и новыми неиспользуемыми файлами."
             + ("\nКандидаты на объединение (найдены автоматически; сравни реализации через read, объединяй "
                "только действительно одинаковое, вызовы обнови через grep):\n" + "\n".join(dups) if dups else "")
-            + (evidence_hint(root) if INVESTIGATE.search(reqs[k]) else "")
+            + (evidence_hint(root) + server_evidence(root) if INVESTIGATE.search(reqs[k]) else "")
             + ("\nСвязанный код (имена и докстринги из индекса):\n" + "\n".join(rel) if rel else ""))
 
 

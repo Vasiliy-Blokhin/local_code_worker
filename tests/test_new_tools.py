@@ -259,3 +259,10 @@ def test_threshold_raise_is_symptomatic():
     assert is_symptomatic("set guard_429_limit from 1500 to 3000")
     assert not is_symptomatic("Снизить порог guard_429_limit с 1500 на 300")
     assert not is_symptomatic("DDoS только при запросах минимум с 20 адресов")
+
+
+def test_check_names_accepts_stdlib(tmp_path):
+    from lcw.entities import check_names
+    (tmp_path / "a.py").write_text("def f():\n    pass\n", encoding="utf-8")
+    assert check_names(tmp_path, ["ipaddress", "collections.Counter", "f"]) == {}
+    assert "nosuchthing_xyz" in check_names(tmp_path, ["nosuchthing_xyz"])
