@@ -22,7 +22,7 @@ from .llm import LLM, Completion, LLMError
 from .sessions import Session
 from .tools import (MUTATING, TOOLS, ToolContext, ToolError, ToolResult, execute, normalize_plan,
                     GIT_WRITE, git_preview, preview, render_plan, syntax_errors, unused_modules, import_errors,
-                    unused_new_imports, new_stubs, project_tests, untested_changes, removed_tests, find_merges, undefined_names,
+                    unused_new_imports, new_stubs, project_tests, untested_changes, removed_tests, revert_whitespace_only, find_merges, undefined_names,
                     sql_column_errors, dropped_dependencies, SHELL_NAME)
 from .workspace import WorkspaceError, get_project, is_text_file, main_checkout, relpath, resolve
 
