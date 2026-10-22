@@ -245,6 +245,34 @@ def hour_digest(ctx: ToolContext, cause: str, limit: int = 2) -> str:
     return "\n".join(out)[:3000]
 
 
+_ADDR = re.compile(r"(?<![\d.])\d{1,3}(?:\.(?:\d{1,3}|\*)){1,3}(?![\d])")
+
+
+def address_counts(ctx: ToolContext, cause: str, limit: int = 4) -> str:
+    """Сколько строк каждого лога приходится на адреса/маски из cause («127.0.0.1», «192.168.0.*»)."""
+    from .tools import main_checkout
+    addrs = [a for a in dict.fromkeys(_ADDR.findall(cause)) if a.count(".") >= 2][:limit]
+    if not addrs:
+        return ""
+    dirs = [d for d in (ctx.root / "logs", (main_checkout(ctx.root) or ctx.root) / "logs") if d.is_dir()]
+    files = list(dict.fromkeys(q for d in dirs for q in sorted(d.glob("*.log")) if q.stat().st_size < 200_000_000))
+    out = []
+    for q in files[:8]:
+        try:
+            lines = q.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            continue
+        if not lines:
+            continue
+        counts = []
+        for a in addrs:
+            prefix = a.rstrip("*")
+            n = sum(1 for l in lines if re.search(r'(?<![\d.])' + re.escape(prefix) + (r"" if a.endswith("*") else r"(?![\d])"), l))
+            counts.append(f"{a}: {n}")
+        out.append(f"{q.parent.name}/{q.name} ({len(lines)} строк): " + ", ".join(counts))
+    return "\n".join(out)[:2000]
+
+
 def collect_server_logs(ctx: ToolContext, fetch: list[str], timeout: int = 120) -> str:
     """Выполнить команды «скачать лог сервера» (только чтение) и вернуть сводки logstats по скачанному."""
     import subprocess
@@ -949,7 +977,7 @@ class Agent:
                 # причина названа со временем: показываем, что на самом деле было в логах в тот час, —
                 # маленькая модель находит время сбоя, но объясняет его первым, что пришло в голову
                 st["cause_checked"] = True
-                window = hour_digest(ctx, cause)
+                window = "\n".join(x for x in (hour_digest(ctx, cause), address_counts(ctx, cause)) if x)
                 if window:
                     return ToolResult(
                         f"Проверка причины по логам — что было в названное время:\n{window}\n"

@@ -152,3 +152,12 @@ def test_hour_digest_shows_who_was_there(tmp_path):
     (tmp_path / "logs" / "server_access.log").write_text("\n".join(json.dumps(r) for r in rows), encoding="utf-8")
     out = hour_digest(_ctx(tmp_path), "сайт закрыт 2026-10-18 08:25 из-за ботов")
     assert "6.6.6.6 ×90" in out and "429 ×100" in out
+
+
+def test_address_counts_refute_guess(tmp_path):
+    from lcw.agent import address_counts
+    (tmp_path / "logs").mkdir()
+    (tmp_path / "logs" / "server_access.log").write_text(
+        '{"ip":"6.6.6.6"}\n' * 9 + '{"ip":"192.168.0.23"}\n', encoding="utf-8")
+    out = address_counts(_ctx(tmp_path), "много запросов с 127.0.0.1 и 192.168.0.*")
+    assert "logs/server_access.log (10 строк): 127.0.0.1: 0, 192.168.0.*: 1" in out
