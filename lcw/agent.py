@@ -1087,6 +1087,7 @@ class Agent:
                 (ctx.root / "logs").is_dir() and list((ctx.root / "logs").glob("server_*.log")):
             # логи сервера скачал harness и их сводку модель уже получила в задании пункта — это факты
             st["server_seen"] = True
+            st["evidence"] = st.get("evidence", 0) + 1
             st["fresh_logs"] = st.get("fresh_logs", 0) + 1
             st["log_evidence"] = st.get("log_evidence", 0) + 1
             st["evidence_text"] = (st.get("evidence_text", "") + "\n" + peak_digest(ctx))[-200_000:]
@@ -1152,24 +1153,24 @@ class Agent:
                         "Сверь cause с этими цифрами: кто давал запросы (сколько адресов, доля самого частого), "
                         "какие статусы. Если цифры подтверждают причину — пришли тот же decide ещё раз; если нет — "
                         "исправь cause и decision по ним.", ok=False)
-            effect = str(args.get("effect", "")).strip()
-            if not why and is_symptomatic(decision) and st.get("symptom_rejects", 0) < 2:
-                # белый список / подъём порога: инцидент пройдёт, пока его цифры ниже порога и адрес в списке, —
-                # следующий такой же с другого адреса или чуть сильнее повторит сбой
-                weak = not effect or not grounded(effect, st.get("evidence_text", "") + "\n" + cause) \
-                    or st.get("symptom_rejects", 0) == 0
-                if weak:
-                    st["symptom_rejects"] = st.get("symptom_rejects", 0) + 1
-                    peak = peak_digest(ctx)
-                    return ToolResult(
-                        "Проверка решения: оно похоже на лечение симптома (белый список, исключение адресов, "
-                        "подъём порога). Такое решение снимает этот случай, но не причину: тот же сбой повторится "
-                        "с другого адреса или при чуть большей нагрузке, а список придётся пополнять вручную.\n"
-                        + (f"Что было в пиках логов:\n{peak}\n" if peak else "")
-                        + "Ответь в поле effect: что сделает НОВОЕ правило в найденном случае (те же время и числа) "
-                        "и в таком же случае с другого адреса или вдвое сильнее? Если сбой повторится — выбери "
-                        "правило, которое меняет саму причину (то, что в cause названо источником сбоя), и пришли "
-                        "decide с ним и с effect.", ok=False)
+        effect = str(args.get("effect", "")).strip()
+        if INVESTIGATE.search(item) and is_symptomatic(decision) and st.get("symptom_rejects", 0) < 2:
+            # белый список / подъём порога: инцидент пройдёт, пока его цифры ниже порога и адрес в списке, —
+            # следующий такой же с другого адреса или чуть сильнее повторит сбой
+            weak = not effect or not grounded(effect, st.get("evidence_text", "") + "\n" + cause) \
+                or st.get("symptom_rejects", 0) == 0
+            if weak:
+                st["symptom_rejects"] = st.get("symptom_rejects", 0) + 1
+                peak = peak_digest(ctx)
+                return ToolResult(
+                    "Проверка решения: оно похоже на лечение симптома (белый список, исключение адресов, "
+                    "подъём порога). Такое решение снимает этот случай, но не причину: тот же сбой повторится "
+                    "с другого адреса или при чуть большей нагрузке, а список придётся пополнять вручную.\n"
+                    + (f"Что было в пиках логов:\n{peak}\n" if peak else "")
+                    + "Ответь в поле effect: что сделает НОВОЕ правило в найденном случае (те же время и числа) "
+                    "и в таком же случае с другого адреса или вдвое сильнее? Если сбой повторится — выбери "
+                    "правило, которое меняет саму причину (то, что в cause названо источником сбоя), и пришли "
+                    "decide с ним и с effect.", ok=False)
         missing = entities.check_names(ctx.root, uses)
         if missing:
             lines = [f"- {n}: нет в проекте" + (f" (похожие: {', '.join(sim)})" if sim else "")
