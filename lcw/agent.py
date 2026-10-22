@@ -70,6 +70,13 @@ def tool_from_shell(command: str) -> tuple[str, dict] | None:
     return name, args
 
 
+FORMAT_VARIANTS = (
+    "",
+    " Сначала одной фразой напиши, что делаешь, затем вызов.",
+    " Сделай самый простой следующий шаг: один вызов read или logstats с короткими аргументами.",
+    " Аргументы — короткие: без длинных многострочных строк; большую правку раздели на несколько edit.",
+    " Если не уверен в вызове — ответь обычным текстом, что собираешься сделать дальше.",
+)
 TOOL_FORMAT_HINT = ("[Система] Предыдущий вызов инструмента не распознан: неверный формат заголовка. Вызывай "
                     "ровно один инструмент обычным способом (канал commentary, получатель functions.<имя>, "
                     "аргументы — JSON-объект) — или ответь текстом. Продолжай с того же места.")
@@ -682,13 +689,15 @@ class Agent:
             if retry_overflow and ("context" in msg and ("exceed" in msg or "size" in msg)):
                 await self.compact(s)
                 return await self._call(s, retry_overflow=False)
-            if PARSE_ERROR.search(str(e)) and recover < config.RECOVER_TRIES:
+            if PARSE_ERROR.search(str(e)) and recover < config.RECOVER_TRIES + 3:
                 # llama.cpp не разобрал вызов инструмента (gpt-oss путает заголовок harmony, чаще на
                 # длинном контексте). Тот же запрос даёт тот же сбой — повторяем сразу, с подсказкой
-                # о формате: она меняет контекст, но в историю сессии не пишется
+                # о формате: она меняет контекст, но в историю сессии не пишется. Подсказка каждый раз
+                # другая: одинаковый контекст снова даёт тот же сбой, и ход обрывался после 5 повторов
                 s.add({"type": "notice", "level": "warn",
                        "text": "Вызов инструмента в неверном формате — повторяю шаг с подсказкой."})
-                return await self._call(s, retry_overflow, recover + 1, hint=TOOL_FORMAT_HINT)
+                return await self._call(s, retry_overflow, recover + 1,
+                                        hint=TOOL_FORMAT_HINT + FORMAT_VARIANTS[recover % len(FORMAT_VARIANTS)])
             if e.transient and recover < config.RECOVER_TRIES:
                 # модель занята/переключается/упала: ждём освобождения GPU и повторяем шаг
                 s.add({"type": "notice", "level": "warn",
