@@ -21,7 +21,7 @@ from .workspace import WorkspaceError, is_git
 WORKTREES_DIR = config.DATA_DIR / "worktrees"
 BRANCH_PREFIX = "lcw/"
 # скопированные из проекта настройки (.env) — не изменения агента, в патч не попадают
-_PATHSPEC = (".", ":(exclude).env*")
+_PATHSPEC = (".",)  # неотслеживаемые .env* убирает из индекса _stage; .env.example из git переносится
 
 
 def _git(cwd: str | Path, *args: str, input: str | None = None, timeout: int = 120) -> subprocess.CompletedProcess:
@@ -70,6 +70,9 @@ def _stage(path: str) -> None:
     """В индекс — всё, что изменил агент; скопированные .env (если не в .gitignore) — обратно."""
     _check(_git(path, "add", "-A"), "git add")
     envs = [f.name for f in Path(path).iterdir() if f.is_file() and f.name.startswith(".env")]
+    # .env.example и т.п. в git — это часть проекта, их правки переносим; убираем только неотслеживаемые
+    tracked = set(_git(path, "ls-tree", "--name-only", "HEAD", "--", *envs).stdout.split()) if envs else set()
+    envs = [e for e in envs if e not in tracked]
     if envs:
         _git(path, "reset", "-q", "--", *envs)
 
