@@ -22,7 +22,7 @@ from .llm import LLM, Completion, LLMError
 from .sessions import Session
 from .tools import (MUTATING, TOOLS, ToolContext, ToolError, ToolResult, execute, normalize_plan,
                     GIT_WRITE, git_preview, preview, render_plan, syntax_errors, unused_modules, import_errors,
-                    unused_new_imports, new_stubs, project_tests, untested_changes, removed_tests, revert_whitespace_only, find_merges, undefined_names,
+                    unused_new_imports, new_stubs, project_tests, untested_changes, removed_tests, revert_whitespace_only, tests_pass_on_old_code, find_merges, undefined_names,
                     sql_column_errors, dropped_dependencies, SHELL_NAME)
 from .workspace import WorkspaceError, get_project, is_text_file, main_checkout, relpath, resolve
 
@@ -507,7 +507,7 @@ class Agent:
         nudged = False
         fixes = 0
         plan_nudges = 0
-        orphan_nudges = import_nudges = stub_nudges = test_runs = dep_nudges = untested_nudges = removed_nudges = 0
+        orphan_nudges = import_nudges = stub_nudges = test_runs = dep_nudges = untested_nudges = removed_nudges = old_pass_nudges = 0
         dropped_seen: set[str] = set()
         tested_sig = None
         merge_sig, merge_nudges = None, 0  # дифференциальная проверка объединений: по чему и сколько раз
@@ -692,6 +692,20 @@ class Agent:
                         "тест на каждое новое правило (случай, который раньше работал иначе, и граничный случай), "
                         "запусти test path=<модуль> и исправь, если упадёт. Затем дай итоговый ответ.")})
                     continue
+                # новые тесты проходят и на старом коде — они не проверяют то, что изменено
+                if not untested and old_pass_nudges < 1:
+                    toothless = await asyncio.to_thread(tests_pass_on_old_code, ctx.root, originals)
+                    if toothless:
+                        old_pass_nudges += 1
+                        s.add({"type": "notice", "level": "warn",
+                               "text": "Автопроверка: новые тесты проходят и до правок:\n" + "\n".join(toothless)})
+                        s.messages.append({"role": "user", "content": (
+                            "Автопроверка: эти новые тесты проходят и на коде ДО твоих правок — значит, они не "
+                            "проверяют изменение:\n" + "\n".join(toothless) + "\nТест должен воспроизводить случай, "
+                            "ради которого правка (для расследования — найденный сбой с его числами): до правки он "
+                            "падает, после — проходит. Перепиши эти тесты так. Если правка не меняет поведение "
+                            "(рефакторинг), так и напиши в итоге.")})
+                        continue
                 # не даём закончить, пока в плане есть незакрытые шаги
                 open_steps = [x for x in s.plan if x["status"] in ("todo", "doing")]
                 if st["planned"] and open_steps and plan_nudges >= 1:

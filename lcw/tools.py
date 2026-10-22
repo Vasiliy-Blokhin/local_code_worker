@@ -487,6 +487,60 @@ def revert_whitespace_only(root: Path, originals: dict) -> list[str]:
     return out
 
 
+def _test_names(text: str) -> set[str]:
+    try:
+        tree = ast.parse(text)
+    except (SyntaxError, ValueError):
+        return set()
+    return {n.name for n in tree.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and n.name.startswith("test")}
+
+
+def tests_pass_on_old_code(root: Path, originals: dict, timeout: int = 300) -> list[str] | None:
+    """
+    Новые тесты сессии, которые проходят и на коде ДО правок, — изменение они не проверяют.
+    Рабочие файлы на время прогона возвращаются к исходным и затем восстанавливаются.
+    None — проверить нельзя (нет новых тестов, pytest недоступен); [] — все новые тесты ловят изменение.
+    """
+    new_ids = []
+    for rel, orig in originals.items():
+        if _is_test_file(rel) and (root / rel).is_file():
+            now = (root / rel).read_text(encoding="utf-8", errors="replace")
+            new_ids += [f"{rel}::{n}" for n in sorted(_test_names(now) - _test_names(orig or ""))]
+    sources = {rel: orig for rel, orig in originals.items() if not _is_test_file(rel) and rel.endswith(".py")}
+    if not new_ids or not sources:
+        return None
+    current = {}
+    try:
+        for rel, orig in sources.items():
+            p = root / rel
+            current[rel] = p.read_bytes() if p.is_file() else None
+            if orig is None:
+                p.unlink(missing_ok=True)  # файл создан в сессии — до правок его не было
+            else:
+                p.write_bytes(orig.encode("utf-8"))
+        res = subprocess.run([_pytest_python(root), "-m", "pytest", "-q", "-rA", "--tb=no", "-p", "no:cacheprovider",
+                              *new_ids], cwd=str(root), capture_output=True, text=True, encoding="utf-8",
+                             errors="replace", timeout=timeout,
+                             env=pytest_env({**os.environ, "PYTHONIOENCODING": "utf-8", "CI": "1"}))
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    finally:
+        for rel, data in current.items():
+            p = root / rel
+            if data is None:
+                p.unlink(missing_ok=True)
+            else:
+                p.write_bytes(data)
+    passed = set(re.findall(r"^PASSED (\S+)", res.stdout, re.M))
+    failed = set(re.findall(r"^(?:FAILED|ERROR) (\S+)", res.stdout, re.M))
+    # параметризованные тесты: test_x[a], test_x[b] — тест «не ловит изменение», если ни один вариант не упал
+    old_ok = [t for t in new_ids if any(p == t or p.startswith(t + "[") for p in passed)
+              and not any(f == t or f.startswith(t + "[") for f in failed)]
+    # тест «прежнее поведение сохранилось» и должен проходить на старом коде; плохо, когда так ведут себя ВСЕ новые
+    return old_ok if len(old_ok) == len(new_ids) else []
+
+
 def removed_tests(root: Path, originals: dict) -> list[str]:
     """Тестовые функции, которые были в тестовых файлах до правок сессии и исчезли (write целиком и т.п.)."""
     out = []

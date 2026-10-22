@@ -234,3 +234,20 @@ def test_symptom_patterns():
               "Add guard_ignore_ips setting", "Поднять порог guard_429_limit до 3000"):
         assert SYMPTOM.search(d), d
     assert not SYMPTOM.search("DDoS closes the site only when requests come from at least 20 addresses")
+
+
+def test_tests_pass_on_old_code(tmp_path):
+    from lcw.tools import tests_pass_on_old_code
+    (tmp_path / "g.py").write_text("def f():\n    return 2\n", encoding="utf-8")
+    (tmp_path / "tests").mkdir()
+    head = "import sys, pathlib\nsys.path.insert(0, str(pathlib.Path(__file__).parent.parent))\nfrom g import f\n\n\n"
+    (tmp_path / "tests" / "test_g.py").write_text(
+        head + "def test_old():\n    assert f()\n\n\ndef test_new_rule():\n    assert f() == 2\n\n\n"
+               "def test_toothless():\n    assert f() > 0\n", encoding="utf-8")
+    originals = {"g.py": "def f():\n    return 1\n", "tests/test_g.py": head + "def test_old():\n    assert f()\n"}
+    assert tests_pass_on_old_code(tmp_path, originals) == []  # test_new_rule ловит изменение
+    # test_new_rule был и раньше — из новых остался один «беззубый» тест
+    only = originals | {"tests/test_g.py": head + "def test_old():\n    assert f()\n\n\n"
+                                                  "def test_new_rule():\n    assert f() == 2\n"}
+    assert tests_pass_on_old_code(tmp_path, only) == ["tests/test_g.py::test_toothless"]
+    assert (tmp_path / "g.py").read_text(encoding="utf-8") == "def f():\n    return 2\n"  # восстановлен
