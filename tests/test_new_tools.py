@@ -266,3 +266,8 @@ def test_check_names_accepts_stdlib(tmp_path):
     (tmp_path / "a.py").write_text("def f():\n    pass\n", encoding="utf-8")
     assert check_names(tmp_path, ["ipaddress", "collections.Counter", "f"]) == {}
     assert "nosuchthing_xyz" in check_names(tmp_path, ["nosuchthing_xyz"])
+
+
+def test_threshold_multiplied_is_symptomatic():
+    from lcw.agent import is_symptomatic
+    assert is_symptomatic("require suspicious hits per IP to exceed guard_scan_ip_limit * 2")

@@ -106,9 +106,13 @@ SYMPTOM = re.compile(r"whitelist|allow[- ]?list|ignore[_ ]?(ips?|list|addresses)
 _RAISE = re.compile(r"(limit|threshold|порог|лимит)\w*\D{0,40}?(\d+)\s*(?:на|to|→|->|до)\s*(\d+)", re.IGNORECASE)
 
 
+_MULT = re.compile(r"(limit|threshold|порог|лимит)\w*\s*[*×x]\s*[2-9]\b", re.IGNORECASE)  # «guard_scan_ip_limit * 2»
+
+
 def is_symptomatic(decision: str) -> bool:
     """Список исключений или подъём числового порога («guard_total_limit с 6000 на 12000»)."""
-    return bool(SYMPTOM.search(decision)) or any(int(b) > int(a) for _, a, b in _RAISE.findall(decision))
+    return bool(SYMPTOM.search(decision)) or any(int(b) > int(a) for _, a, b in _RAISE.findall(decision)) \
+        or bool(_MULT.search(decision))
 
 
 # решение доверяет данным, которые задаёт клиент, — и делает по ним исключение из проверки
