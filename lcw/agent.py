@@ -357,6 +357,25 @@ def address_counts(ctx: ToolContext, cause: str, limit: int = 4) -> str:
     return "\n".join(out)[:2000]
 
 
+def code_refs(ctx: ToolContext, cause: str, limit: int = 3) -> str:
+    """
+    Где в коде используются имена из cause (настройки, функции): модель приписывает сбой правилу,
+    которое к нему не ведёт («guard_scan_ip_limit закрывает сайт», а он только даёт сообщение).
+    """
+    from .tools import t_refs
+    names = [n for n in dict.fromkeys(re.findall(r"\b[a-z][a-z0-9]*(?:_[a-z0-9]+)+\b", cause))][:limit]
+    out = []
+    for n in names:
+        try:
+            text = t_refs(ctx, n, "app" if (ctx.root / "app").is_dir() else "").output
+        except (ToolError, WorkspaceError, OSError):
+            continue
+        lines = [l for l in text.splitlines()[1:] if "[use" in l][:6]
+        if lines:
+            out.append(f"Где используется {n}:\n" + "\n".join(lines))
+    return ("\nКак названное в cause работает в коде (проверь, ведёт ли это к сбою):\n" + "\n".join(out)) if out else ""
+
+
 def server_evidence(root: Path) -> str:
     """
     Для пункта-расследования harness сразу скачивает логи сервера (только чтение, с ротированными) и даёт
@@ -1126,6 +1145,7 @@ class Agent:
                 st["cause_checked"] = True
                 window = "\n".join(x for x in (hour_digest(ctx, cause), address_counts(ctx, cause)) if x) \
                     or peak_digest(ctx)  # ни времени, ни адреса в cause — показываем пики свежего лога
+                window += code_refs(ctx, cause)
                 if window:
                     return ToolResult(
                         f"Проверка причины по логам — что было в названное время:\n{window}\n"
