@@ -809,7 +809,9 @@ def _strip_added_marks(old: str, new: str) -> str:
     if any(l.startswith("+") for l in old_lines):
         return new
     added = [l for l in new.split("\n") if l.strip() and l not in old_lines]
-    if len(added) < 2 or not all(l.startswith("+") for l in added):
+    marked = sum(1 for l in added if l.startswith("+"))
+    # «большинство с +»: модель часто пишет первую строку (комментарий) без метки, остальные — с ней
+    if marked < 2 or marked * 3 < len(added) * 2:
         return new
     return "\n".join(l[1:] if l.startswith("+") and l not in old_lines else l for l in new.split("\n"))
 

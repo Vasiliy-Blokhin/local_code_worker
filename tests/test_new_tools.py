@@ -161,3 +161,10 @@ def test_address_counts_refute_guess(tmp_path):
         '{"ip":"6.6.6.6"}\n' * 9 + '{"ip":"192.168.0.23"}\n', encoding="utf-8")
     out = address_counts(_ctx(tmp_path), "много запросов с 127.0.0.1 и 192.168.0.*")
     assert "logs/server_access.log (10 строк): 127.0.0.1: 0, 192.168.0.*: 1" in out
+
+
+def test_edit_strips_mostly_marked_lines(tmp_path):
+    from lcw.tools import t_edit
+    (tmp_path / "t.py").write_text("X = 1\n", encoding="utf-8")
+    t_edit(_ctx(tmp_path), "t.py", "", "\n# new tests\n+def b():\n+    return 2\n+\n")
+    assert "+def" not in (tmp_path / "t.py").read_text(encoding="utf-8")
