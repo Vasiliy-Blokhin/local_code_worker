@@ -816,12 +816,12 @@ class Agent:
                           or name == "run" and EVIDENCE_CMD.search(args.get("command", ""))
                           or name in ("read", "grep") and EVIDENCE_PATH.search(str(args.get("path", "")))):
             st["evidence"] = st.get("evidence", 0) + 1
-            st["evidence_text"] = (st.get("evidence_text", "") + "\n" + result.output)[-200_000:]
             if name != "read" and name != "grep" or re.search(r"(^|/)logs?/|\.log$", str(args.get("path", ""))):
                 st["log_evidence"] = st.get("log_evidence", 0) + 1
-            # свежие факты: лог с записями последних дней или вывод с сервера (ssh/journalctl)
-            if (name == "logstats" and "время:" in result.output and "лог устарел" not in result.output
-                    or name == "run" and re.search(r"\b(ssh|scp|journalctl)\b", args.get("command", ""))):
+                # факты для cause — только из логов и вывода команд, не из кода и документации
+                st["evidence_text"] = (st.get("evidence_text", "") + "\n" + result.output)[-200_000:]
+            # свежие факты: сводка лога с записями последних дней (скачанный лог сервера — тоже через logstats)
+            if name == "logstats" and "время:" in result.output and "лог устарел" not in result.output:
                 st["fresh_logs"] = st.get("fresh_logs", 0) + 1
         if name in MUTATING and result.ok:
             st["edits"] = st.get("edits", 0) + 1
