@@ -545,6 +545,11 @@ class Agent:
                     continue
                 # автопроверка: не даём закончить ход со сломанным синтаксисом в изменённых файлах
                 originals = _session_originals(s)  # все правки сессии, не только этого хода
+                # файлы, где от правок остались одни пустые строки/пробелы (удалённый код), — возвращаем как было
+                reverted = await asyncio.to_thread(revert_whitespace_only, ctx.root, originals)
+                if reverted:
+                    s.add({"type": "notice", "level": "info",
+                           "text": "Возвращены без изменений (правка свелась к пробелам): " + ", ".join(reverted)})
                 changed = originals.keys()
                 errors = await asyncio.to_thread(syntax_errors, ctx.root, changed)
                 if not errors:  # синтаксис цел — проверяем, что изменённые модули реально импортируются

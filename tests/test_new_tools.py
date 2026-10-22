@@ -218,3 +218,11 @@ def test_untested_skips_shared_modules(tmp_path):
     for n in ("a", "b", "c"):
         (tmp_path / "tests" / f"test_{n}.py").write_text("from app.config import X\n", encoding="utf-8")
     assert untested_changes(tmp_path, {"app/config.py": "X = 1\n"}) == []
+
+
+def test_revert_whitespace_only(tmp_path):
+    from lcw.tools import revert_whitespace_only
+    (tmp_path / "a.py").write_text("X = 1\n\n\n\n", encoding="utf-8")
+    (tmp_path / "b.py").write_text("X = 2\n", encoding="utf-8")
+    assert revert_whitespace_only(tmp_path, {"a.py": "X = 1\n", "b.py": "X = 1\n"}) == ["a.py"]
+    assert (tmp_path / "a.py").read_text(encoding="utf-8") == "X = 1\n"

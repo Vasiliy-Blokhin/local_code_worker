@@ -465,6 +465,26 @@ def _norm(text: str) -> str:
     return text.replace(chr(13) + chr(10), chr(10))
 
 
+def revert_whitespace_only(root: Path, originals: dict) -> list[str]:
+    """
+    Файлы, отличающиеся от исходных только пробелами и пустыми строками, — вернуть как были.
+    Модель удаляет свои неудачные вставки и оставляет хвосты пустых строк в чужих файлах.
+    """
+    out = []
+    for rel, orig in originals.items():
+        p = root / rel
+        if orig is None or not p.is_file():
+            continue
+        try:
+            now = p.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        if _norm(now) != _norm(orig) and re.sub(r"\s+", "", now) == re.sub(r"\s+", "", orig):
+            p.write_bytes(orig.encode("utf-8"))
+            out.append(rel)
+    return out
+
+
 def removed_tests(root: Path, originals: dict) -> list[str]:
     """Тестовые функции, которые были в тестовых файлах до правок сессии и исчезли (write целиком и т.п.)."""
     out = []
