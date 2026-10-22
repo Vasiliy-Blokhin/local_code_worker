@@ -225,6 +225,30 @@ def fetch_commands(root: Path) -> list[str]:
     return [f'{base} "zcat -f {p}*" > logs/server_{Path(p).stem}.log' for p in paths[:4]]
 
 
+def collect_server_logs(ctx: ToolContext, fetch: list[str], timeout: int = 120) -> str:
+    """Выполнить команды «скачать лог сервера» (только чтение) и вернуть сводки logstats по скачанному."""
+    import subprocess
+    from .tools import SHELL_CMD, t_logstats
+    (ctx.root / "logs").mkdir(exist_ok=True)
+    parts = []
+    for cmd in fetch:
+        target = re.search(r">\s*(\S+)$", cmd)
+        try:
+            p = subprocess.run([*SHELL_CMD, cmd], cwd=str(ctx.root), capture_output=True, text=True,
+                               encoding="utf-8", errors="replace", timeout=timeout, stdin=subprocess.DEVNULL)
+        except (OSError, subprocess.TimeoutExpired) as e:
+            parts.append(f"`{cmd}`: не выполнилось ({e})")
+            continue
+        if p.returncode != 0 or not target or not (ctx.root / target.group(1)).is_file():
+            parts.append(f"`{cmd}`: ошибка {p.returncode}: {(p.stderr or p.stdout).strip()[:300]}")
+            continue
+        rel = target.group(1)
+        parts.append(f"== {rel} ==\n" + t_logstats(ctx, rel, bucket="hour").output
+                     + "\n-- ответы 503/429 (заглушка, лимит):\n"
+                     + t_logstats(ctx, rel, match=r'"status":"?(503|429)', by="ip", bucket="hour").output)
+    return "\n".join(parts)[:6000]
+
+
 def evidence_hint(root: Path) -> str:
     """Где искать факты: логи в проекте и документы, где сказано, как добраться до логов на сервере."""
     root = Path(root)
@@ -865,6 +889,20 @@ class Agent:
                        "документов о развёртывании")
             elif has_logs and not st.get("fresh_logs") and server_commands(ctx.root):
                 fetch = fetch_commands(ctx.root)
+                if fetch and st.get("cause_rejects", 0) >= 1:
+                    # модель второй раз не идёт за логами сервера — harness собирает их сам (только чтение)
+                    digest = collect_server_logs(ctx, fetch)
+                    if digest:
+                        st["fresh_logs"] = st.get("fresh_logs", 0) + 1
+                        st["log_evidence"] = st.get("log_evidence", 0) + 1
+                        st["evidence_text"] = (st.get("evidence_text", "") + "\n" + digest)[-200_000:]
+                        st["cause_rejects"] = st.get("cause_rejects", 0) + 1
+                        return ToolResult(
+                            f"Ошибка: пункт {s.focus + 1} — расследование, а смотрел ты устаревшие логи. Harness сам "
+                            "скачал актуальные логи сервера в logs/ и вот их сводка:\n" + digest + "\nНайди в ней "
+                            "время сбоев (пики 503/429) и адреса, сравни с порогами в коде, при необходимости уточни "
+                            "logstats (match=, by=, bucket=minute). Затем decide с cause, где есть эти время и числа.",
+                            ok=False)
                 why = ("логи, которые ты смотрел, устарели (последние записи — несколько дней назад), а сервис по "
                        "документации работает на сервере. Доступ к нему есть, читать логи можно. "
                        + ("Выполни через run (только чтение): " + "; ".join(f"`{c}`" for c in fetch)
