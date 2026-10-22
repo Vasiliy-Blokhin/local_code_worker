@@ -712,7 +712,10 @@ class Agent:
                     # проектные решения — на проверку человеку, даже если модель забыла их перечислить
                     s.add({"type": "notice", "level": "warn", "text": "Проектные решения агента — проверьте:\n"
                            + "\n".join(f"Пункт {int(k) + 1}: {v['decision']}\n  опирается на: {', '.join(v['uses'])}"
-                                       f"\n  если данных нет: {v['fallback']}" for k, v in sorted(s.decisions.items()))})
+                                       f"\n  если данных нет: {v['fallback']}"
+                                       + (f"\n  причина: {v['cause']}" if v.get("cause") else "")
+                                       + ("\n  ⚠ причина не подтверждена фактами из логов" if v.get("unverified") else "")
+                                       for k, v in sorted(s.decisions.items()))})
                 return
             for n, tc in enumerate(comp.tool_calls):
                 call_id = tc["id"] or f"call_{uuid.uuid4().hex[:8]}"
@@ -944,7 +947,7 @@ class Agent:
         reqs = st.get("reqs") or []
         item = reqs[s.focus] if 0 <= s.focus < len(reqs) else ""
         cause = str(args.get("cause", "")).strip()
-        if INVESTIGATE.search(item) and st.get("cause_rejects", 0) < 3:
+        if INVESTIGATE.search(item) and st.get("cause_rejects", 0) < 4:
             why = ""
             main = main_checkout(ctx.root)
             has_logs = any((r / d).is_dir() for r in (ctx.root, main) if r for d in ("logs", "log"))
@@ -1025,7 +1028,9 @@ class Agent:
                 "(например, пустая таблица на свежей установке или в тестах). Обычно нужно сохранить прежнее "
                 "поведение. Пришли decide снова: либо с fallback «прежнее поведение», либо с этим же fallback, "
                 "если такое изменение прямо требуется задачей.", ok=False)
-        s.decisions[str(s.focus)] = {"decision": decision, "uses": uses, "fallback": fallback, "cause": cause}
+        unverified = bool(INVESTIGATE.search(item)) and not grounded(cause, st.get("evidence_text", ""))
+        s.decisions[str(s.focus)] = {"decision": decision, "uses": uses, "fallback": fallback, "cause": cause,
+                                     "unverified": unverified}
         s.add({"type": "notice", "level": "info",
                "text": (f"Причина: {cause}\n" if cause else "")
                        + f"Решение по пункту {s.focus + 1}: {decision}\nОпирается на: {', '.join(uses)}\n"
