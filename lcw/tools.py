@@ -497,6 +497,11 @@ def untested_changes(root: Path, originals: dict) -> list[str]:
         except OSError:
             continue
         tests = covering_tests(root, rel)
+        if len(tests) > 2:
+            # общий модуль (настройки, утилиты) импортируют многие тесты — это не его тесты;
+            # иначе модель дописывает бессмысленные проверки в чужие тестовые файлы
+            stem = rel.rsplit("/", 1)[-1][:-3]
+            tests = [t for t in tests if stem in t.rsplit("/", 1)[-1]]
         if tests:
             out.append(f"{rel} (тесты: {', '.join(tests[:3])})")
     return out

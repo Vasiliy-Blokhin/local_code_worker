@@ -208,3 +208,13 @@ def test_spoof_check_single_address(tmp_path):
     (tmp_path / "logs" / "server_access.log").write_text(
         '{"ip":"6.6.6.6","ua":"Googlebot/2.1"}\n' * 5, encoding="utf-8")
     assert "подделка" in spoof_check(_ctx(tmp_path), "ignore Googlebot")
+
+
+def test_untested_skips_shared_modules(tmp_path):
+    from lcw.tools import untested_changes
+    (tmp_path / "app").mkdir()
+    (tmp_path / "app" / "config.py").write_text("X = 2\n", encoding="utf-8")
+    (tmp_path / "tests").mkdir()
+    for n in ("a", "b", "c"):
+        (tmp_path / "tests" / f"test_{n}.py").write_text("from app.config import X\n", encoding="utf-8")
+    assert untested_changes(tmp_path, {"app/config.py": "X = 1\n"}) == []
