@@ -225,6 +225,26 @@ def fetch_commands(root: Path) -> list[str]:
     return [f'{base} "zcat -f {p}*" > logs/server_{Path(p).stem}.log' for p in paths[:4]]
 
 
+_HOUR = re.compile(r"(\d{4}-\d{2}-\d{2})[T ](\d{2})")
+
+
+def hour_digest(ctx: ToolContext, cause: str, limit: int = 2) -> str:
+    """Сводка логов проекта за часы, названные в cause: топ адресов и статусов."""
+    from .tools import t_logstats
+    hours = list(dict.fromkeys(f"{d}[T ]{h}:" for d, h in _HOUR.findall(cause)))[:limit]
+    out = []
+    for h in hours:
+        for by in ("ip", "status"):
+            try:
+                text = t_logstats(ctx, "logs", match=h, by=by).output
+            except (ToolError, WorkspaceError, OSError):
+                continue
+            lines = [l for l in text.splitlines() if l.startswith(("по ", "время:")) or "строк" in l]
+            if lines and not lines[0].startswith("0 строк"):
+                out.append(f"[{h.replace('[T ]', ' ').rstrip(':')} ч, by={by}] " + " | ".join(lines[:3]))
+    return "\n".join(out)[:3000]
+
+
 def collect_server_logs(ctx: ToolContext, fetch: list[str], timeout: int = 120) -> str:
     """Выполнить команды «скачать лог сервера» (только чтение) и вернуть сводки logstats по скачанному."""
     import subprocess
@@ -925,6 +945,17 @@ class Agent:
                                   f"не принимается: {why}. Затем снова decide, ОБЯЗАТЕЛЬНО с полем cause: "
                                   '{"decision": "...", "uses": [...], "fallback": "...", "cause": "<что видно в логах: '
                                   'время, числа, адреса> -> <какой код (файл:строка) к этому приводит>"}', ok=False)
+            if not why and not st.get("cause_checked"):
+                # причина названа со временем: показываем, что на самом деле было в логах в тот час, —
+                # маленькая модель находит время сбоя, но объясняет его первым, что пришло в голову
+                st["cause_checked"] = True
+                window = hour_digest(ctx, cause)
+                if window:
+                    return ToolResult(
+                        f"Проверка причины по логам — что было в названное время:\n{window}\n"
+                        "Сверь cause с этими цифрами: кто давал запросы (сколько адресов, доля самого частого), "
+                        "какие статусы. Если цифры подтверждают причину — пришли тот же decide ещё раз; если нет — "
+                        "исправь cause и decision по ним.", ok=False)
         missing = entities.check_names(ctx.root, uses)
         if missing:
             lines = [f"- {n}: нет в проекте" + (f" (похожие: {', '.join(sim)})" if sim else "")

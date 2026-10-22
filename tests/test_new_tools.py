@@ -142,3 +142,13 @@ def test_fetch_commands_build_ready_ssh(tmp_path):
     assert fetch_commands(tmp_path) == [
         'ssh -o BatchMode=yes -o ConnectTimeout=15 -i ~/.ssh/admin me@10.0.0.5 "zcat -f /var/log/nginx/access.log*"'
         ' > logs/server_access.log']
+
+
+def test_hour_digest_shows_who_was_there(tmp_path):
+    from lcw.agent import hour_digest
+    (tmp_path / "logs").mkdir()
+    rows = [{"time": "2026-10-18T08:2%d:00+03:00" % (i % 10), "ip": "6.6.6.6" if i < 90 else "1.1.1.1",
+             "status": "429"} for i in range(100)]
+    (tmp_path / "logs" / "server_access.log").write_text("\n".join(json.dumps(r) for r in rows), encoding="utf-8")
+    out = hour_digest(_ctx(tmp_path), "сайт закрыт 2026-10-18 08:25 из-за ботов")
+    assert "6.6.6.6 ×90" in out and "429 ×100" in out
