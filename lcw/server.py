@@ -12,7 +12,7 @@ from fastapi import Body, FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
-from . import config, entities, prompts, workspace, worktree
+from . import config, documents, entities, prompts, workspace, worktree
 from .agent import Agent, rewind, session_changes
 from .llm import LLM, LLMBusy, LLMError
 from .sessions import store
@@ -36,6 +36,9 @@ app.mount("/static", StaticFiles(directory=STATIC), name="static")
 
 @app.middleware("http")
 async def auth(request: Request, call_next):
+    """Авторизует запросы к API, проверяя токен в cookie; при отсутствии токена или неверном токене возвращает
+    401.
+    """
     path = request.url.path
     if TOKEN and path.startswith("/api/") and path != "/api/login":
         if not hmac.compare_digest(request.cookies.get("lcw_token", ""), TOKEN):
@@ -49,6 +52,7 @@ async def ws_error(request: Request, exc: WorkspaceError):
 
 
 def _session(sid: str):
+    """Получает объект сессии по ID; если сессия не найдена, генерирует 404."""
     try:
         return store.get(sid)
     except KeyError:
@@ -63,6 +67,7 @@ async def index():
 
 @app.post("/api/login")
 async def login(password: str = Body(..., embed=True)):
+    """Проверяет пароль, устанавливает токен в cookie при успехе; при ошибке возвращает 401."""
     if not TOKEN or hmac.compare_digest(password, config.PASSWORD):
         r = JSONResponse({"ok": True})
         if TOKEN:
@@ -79,6 +84,7 @@ async def status():
 
 @app.post("/api/model/start")
 async def model_start():
+    """Запускает модель LLM, обрабатывая ошибки: 409 при занятости, 502 при других ошибках."""
     try:
         return await llm.start_model()
     except LLMBusy as e:
@@ -113,6 +119,9 @@ async def project_files(pid: str):
 
 @app.get("/api/projects/{pid}/file")
 async def project_file(pid: str, path: str):
+    """Возвращает содержимое текстового файла проекта (до 1 МБ) или указывает, что файл бинарный; 404 при
+    отсутствии.
+    """
     p = workspace.get_project(pid)
     f = workspace.resolve(p["path"], path)
     if not f.is_file():
@@ -131,6 +140,7 @@ async def project_git(pid: str):
 
 @app.get("/api/projects/{pid}/zip")
 async def project_zip(pid: str):
+    """Экспортирует проект в ZIP и отправляет как attachment."""
     p = workspace.get_project(pid)
     data = await asyncio.to_thread(workspace.export_zip, p["path"])
     name = Path(p["path"]).name
@@ -146,6 +156,9 @@ async def project_sessions(pid: str):
 # --------------------------------------------------------------- сессии
 @app.post("/api/sessions")
 async def session_create(project_id: str = Body(..., embed=True), settings: dict = Body(None, embed=True)):
+    """Создаёт новую сессию проекта, возможно в изолированном worktree, генерирует системный промпт и
+    сохраняет сессию.
+    """
     p = workspace.get_project(project_id)
     settings = dict(settings or {})
     isolated = bool(settings.pop("worktree", False))
@@ -161,13 +174,15 @@ async def session_create(project_id: str = Body(..., embed=True), settings: dict
     tree = await asyncio.to_thread(workspace.tree_summary, root)
     modules = await asyncio.to_thread(entities.module_map, root)
     name, text = workspace.read_instructions(root)
-    s.system = prompts.build_system(root, tree, text, name, modules)
+    docs = await asyncio.to_thread(documents.docs_project, root)
+    s.system = prompts.build_system(root, tree, text, name, modules, docs)
     s.save()
     return {"id": s.id}
 
 
 @app.get("/api/sessions/{sid}")
 async def session_get(sid: str):
+    """Возвращает данные сессии: id, project_id, items, seq, meta и rewind_floor."""
     s = _session(sid)
     return {"id": s.id, "project_id": s.project_id, "items": s.items, "seq": s.seq,
             "meta": s.meta(), "rewind_floor": s.rewind_floor}
@@ -175,6 +190,7 @@ async def session_get(sid: str):
 
 @app.patch("/api/sessions/{sid}")
 async def session_patch(sid: str, settings: dict = Body(None, embed=True), title: str = Body(None, embed=True)):
+    """Обновляет настройки и/или заголовок сессии, сохраняет и публикует метаданные."""
     s = _session(sid)
     if settings:
         allowed = {"mode": {"ask", "edits", "auto"}, "effort": {"low", "medium", "high"}}
@@ -192,6 +208,7 @@ async def session_patch(sid: str, settings: dict = Body(None, embed=True), title
 
 @app.delete("/api/sessions/{sid}")
 async def session_delete(sid: str):
+    """Удаляет сессию и её worktree, если он существует, возвращая подтверждение."""
     s = _session(sid)
     if s.worktree:
         await asyncio.to_thread(worktree.remove, workspace.get_project(s.project_id)["path"], s.worktree)
@@ -216,6 +233,9 @@ async def session_worktree_apply(sid: str):
 
 @app.post("/api/sessions/{sid}/message")
 async def session_message(sid: str, text: str = Body(..., embed=True)):
+    """Запускает агент для обработки сообщения, предотвращая одновременные вызовы; 409 при активном агенте,
+    400 при пустом тексте.
+    """
     s = _session(sid)
     if s.running:
         raise HTTPException(409, "Агент уже работает в этой сессии")
@@ -228,6 +248,7 @@ async def session_message(sid: str, text: str = Body(..., embed=True)):
 
 @app.post("/api/sessions/{sid}/stop")
 async def session_stop(sid: str):
+    """Отменяет текущую задачу агента, если она запущена, возвращая подтверждение."""
     s = _session(sid)
     if s.task and not s.task.done():
         s.task.cancel()
@@ -237,6 +258,9 @@ async def session_stop(sid: str):
 @app.post("/api/sessions/{sid}/approve")
 async def session_approve(sid: str, id: str = Body(..., embed=True), decision: str = Body(..., embed=True),
                           note: str = Body("", embed=True)):
+    """Обрабатывает подтверждение действия агента, устанавливая результат и заметку; 404 при отсутствии
+    ожидания, 400 при неверном решении.
+    """
     s = _session(sid)
     fut = s.pending.get(id)
     if not fut or fut.done():
@@ -249,6 +273,7 @@ async def session_approve(sid: str, id: str = Body(..., embed=True), decision: s
 
 @app.post("/api/sessions/{sid}/rewind")
 async def session_rewind(sid: str, turn: int = Body(..., embed=True)):
+    """Восстанавливает состояние сессии до указанного шага, публикуя операции; 409 при ошибке."""
     s = _session(sid)
     try:
         files = rewind(s, turn)  # в цикле событий: rewind публикует операции для UI
@@ -265,9 +290,14 @@ async def session_changes_api(sid: str):
 
 @app.get("/api/sessions/{sid}/events")
 async def session_events(sid: str, request: Request, after: int = 0):
+    """Создаёт SSE‑поток событий сессии, отправляя операции после заданного seq; поддерживает
+    ping‑периодичность.
+    """
     s = _session(sid)
 
     async def gen():
+        """Асинхронный генератор для SSE‑потока: отправляет retry, опросы, данные операций и ping‑сообщения.
+        """
         seq = after
         yield "retry: 2000\n\n"
         while not await request.is_disconnected():

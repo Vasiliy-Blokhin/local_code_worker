@@ -54,6 +54,9 @@ INIT = """Изучи проект (структуру, ключевые файл
 
 
 def _python_line(root: str) -> str:
+    """Формирует строку, указывающую, что для проекта используется виртуальное окружение, найденное в корне.
+    Возвращает пустую строку, если окружение не найдено.
+    """
     venv = find_venv(root)
     if not venv:
         return ""
@@ -61,8 +64,20 @@ def _python_line(root: str) -> str:
             f"(= {venv_bin(venv)}).")
 
 
+DOCS_BLOCK = """
+This project has NO code: it is documents (tasks, books, lecture notes, answers). Here you are a careful assistant who reads, solves and writes, not a programmer:
+- `read`/`grep` work on .pdf and .docx directly (extracted text; PDF pages are marked `=== стр. N ===`). Never write parser scripts or ask the user to paste text.
+- Find what you need in the materials with `grep` (key terms, ignore_case), then `read` only those lines (offset/limit). Take definitions, notation and methods from the materials.
+- Solve the problems yourself, step by step, checking each answer on a concrete example. Anything that can be computed or enumerated — verify with a short `python -c` script via `run`; trust the script over your reasoning. Write the result of each step in your answer: later steps rely on it.
+- To produce a .docx, build it in parts: `write` the path with the title and the first section (Markdown, up to ~40 lines), then append each next section with `edit` (empty `old`). One huge call gets cut off. Formulas in plain Unicode (A ∩ B, Σ, C(n,k), 2²ⁿ), not LaTeX. The tool returns the document text — check it.
+"""
+
+
 def build_system(root: str, tree: str, instructions: str = "", instructions_name: str = "",
-                 modules: str = "") -> str:
+                 modules: str = "", docs: bool = False) -> str:
+    """Генерирует шаблон системы сборки, заполняя данные о платформе, пути, дате и дополнительных блоках
+    (модули, инструкции, документация). Возвращает готовую строку.
+    """
     return SYSTEM.format(
         os=f"{platform.system()} {platform.release()}", shell=SHELL_NAME, root=root,
         date=time.strftime("%Y-%m-%d"), tree=tree,
@@ -70,4 +85,4 @@ def build_system(root: str, tree: str, instructions: str = "", instructions_name
         modules=MODULES_BLOCK.format(text=modules) if modules else "",
         instructions=INSTRUCTIONS_BLOCK.format(name=instructions_name, text=instructions)
         if instructions else "",
-    )
+    ) + (DOCS_BLOCK if docs else "")

@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import base64
 import difflib
 import json
 import fnmatch
@@ -18,7 +19,7 @@ import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import config, entities
+from . import config, documents, entities
 from .workspace import WorkspaceError, find_venv, is_text_file, list_files, main_checkout, pytest_env, relpath, resolve, venv_bin
 
 READ_LIMIT = 400        # строк по умолчанию
@@ -27,6 +28,7 @@ BIG_READ = 150          # больше строк кода за раз — сн�
 GREP_MAX = 80           # совпадений
 
 def _shell() -> tuple[list[str], str]:
+    """Определяет команду оболочки для выполнения: bash на Linux/WSL, Git Bash на Windows или PowerShell."""
     if sys.platform != "win32":
         return ["bash", "-lc"], "bash"
     for p in (shutil.which("bash"), r"C:\Program Files\Git\bin\bash.exe"):
@@ -40,6 +42,7 @@ SHELL_CMD, SHELL_NAME = _shell()
 
 
 def _fn(name: str, desc: str, props: dict, required: list[str]) -> dict:
+    """Создаёт словарь описания функции для LLM, включая имя, описание и параметры."""
     return {"type": "function", "function": {
         "name": name, "description": desc,
         "parameters": {"type": "object", "properties": props, "required": required}}}
@@ -71,14 +74,15 @@ TOOLS = [
                    "path=file: its outline; query: search names+docstrings (words, `|` = or) in path; "
                    "use it to find code before read/grep.",
         {"query": S, "path": {**S, "description": "file or subdir"}}, []),
-    _fn("read", "Read a text file. Returns numbered lines. Use offset/limit for big files, "
+    _fn("read", "Read a text file (also .pdf/.docx: their text, PDF pages marked `=== стр. N ===`). "
+                "Returns numbered lines. Use offset/limit for big files, "
                 "or `symbol` (e.g. Class.method) to read just that entity.",
         {"path": S, "symbol": {**S, "description": "class/function name from symbols"},
          "offset": {**I, "description": "1-based start line"},
          "limit": {**I, "description": f"lines, default {READ_LIMIT}"}}, ["path"]),
     _fn("glob", "Find files by glob pattern (e.g. **/*.py, src/**/test_*.js).",
         {"pattern": S, "path": {**S, "description": "subdir to search in"}}, ["pattern"]),
-    _fn("grep", "Search file contents with a regex. Returns path:line: text.",
+    _fn("grep", "Search file contents with a regex (also inside .pdf/.docx text). Returns path:line: text.",
         {"pattern": S, "path": {**S, "description": "file or subdir"},
          "glob": {**S, "description": "file filter, e.g. *.py"},
          "ignore_case": {"type": "boolean"}}, ["pattern"]),
@@ -107,7 +111,10 @@ TOOLS = [
         {"path": S, "old": S, "new": S,
          "replace_all": {"type": "boolean", "description": "only for renames: replace every occurrence"}},
         ["path", "old", "new"]),
-    _fn("write", "Create a new file or fully overwrite one (prefer edit for changes).",
+    _fn("write", "Create a new file or fully overwrite one (prefer edit for changes). For a .docx path "
+                 "give Markdown (# headings, - lists, **bold**; formulas in plain Unicode: ∩ ∪ Σ C(n,k) 2ⁿ): "
+                 "it becomes a Word document. Big document: write the first section, then append each next "
+                 "one with edit (empty old).",
         {"path": S, "content": S}, ["path", "content"]),
     _fn("run", f"Run a shell command ({SHELL_NAME}) in the project root: tests, linters, git, "
                f"installs. Non-interactive only. Timeout {config.COMMAND_TIMEOUT}s.",
@@ -157,11 +164,13 @@ def render_plan(steps: list[dict]) -> str:
 
 
 class ToolError(Exception):
+    """Исключение для ошибок инструментов."""
     pass
 
 
 @dataclass
 class ToolResult:
+    """Результат работы инструмента: вывод, статус, diff и путь."""
     output: str                       # для модели (компактно)
     ok: bool = True
     diff: str = ""                    # для UI
@@ -170,6 +179,7 @@ class ToolResult:
 
 @dataclass
 class ToolContext:
+    """Контекст инструмента: корень проекта, кеш чтений и снимок для отката."""
     root: Path
     # path -> (mtime_ns, offset, limit): что модель уже видела (дедупликация чтений)
     seen: dict = field(default_factory=dict)
@@ -178,6 +188,7 @@ class ToolContext:
 
 
 def _trunc(text: str, limit: int = config.TOOL_OUTPUT_CHARS) -> str:
+    """Обрезает длинный текст до заданного лимита, вставляя информацию об обрезке."""
     if len(text) <= limit:
         return text
     head = text[: int(limit * 0.6)]
@@ -194,6 +205,9 @@ def _read_text(p: Path) -> tuple[str, str]:
 
 
 def _write_text(p: Path, text: str, nl: str = "\n") -> None:
+    """Записывает текст в файл, создавая директорию при необходимости, с поддержкой пользовательского
+    разделителя строк.
+    """
     p.parent.mkdir(parents=True, exist_ok=True)
     data = text.replace("\n", nl) if nl != "\n" else text
     p.write_bytes(data.encode("utf-8"))
@@ -205,6 +219,7 @@ def _diff(path: str, before: str, after: str) -> str:
 
 
 def _diff_stat(diff: str) -> str:
+    """Подсчитывает добавленные и удалённые строки в diff‑строке."""
     add = sum(1 for l in diff.splitlines() if l.startswith("+") and not l.startswith("+++"))
     rem = sum(1 for l in diff.splitlines() if l.startswith("-") and not l.startswith("---"))
     return f"+{add} -{rem}"
@@ -212,6 +227,7 @@ def _diff_stat(diff: str) -> str:
 
 # ---------------- реализация ----------------
 def t_symbols(ctx: ToolContext, query: str = "", path: str = "") -> ToolResult:
+    """Возвращает список символов (функций, классов) в файле или проекте."""
     if path:
         resolve(ctx.root, path)  # проверка выхода за пределы проекта
     return ToolResult(_trunc(entities.outline(ctx.root, path, query)))
@@ -219,6 +235,7 @@ def t_symbols(ctx: ToolContext, query: str = "", path: str = "") -> ToolResult:
 
 def t_read(ctx: ToolContext, path: str, offset: int = 1, limit: int = READ_LIMIT,
            symbol: str = "") -> ToolResult:
+    """Читает часть файла, учитывая символ, offset, limit, и кеширует результаты."""
     p = resolve(ctx.root, path)
     if symbol and p.is_file():
         try:
@@ -236,7 +253,8 @@ def t_read(ctx: ToolContext, path: str, offset: int = 1, limit: int = READ_LIMIT
                                   f"logstats path={path} (сводка, match=, by=, bucket=, show=).")
             raise ToolError(f"Файл не найден: {path} (есть только в основной копии проекта, не в этой ветке)")
         raise ToolError(f"Файл не найден: {path}")
-    if not is_text_file(p):
+    doc = documents.is_document(p)
+    if not doc and not is_text_file(p):
         raise ToolError(f"Бинарный файл: {path}")
     rel = relpath(ctx.root, p)
     offset = max(1, int(offset or 1))
@@ -245,8 +263,15 @@ def t_read(ctx: ToolContext, path: str, offset: int = 1, limit: int = READ_LIMIT
     key = (rel, offset, limit)
     if ctx.seen.get(key) == mtime:
         return ToolResult(f"{rel}: не изменился с прошлого чтения (содержимое выше в диалоге).", path=rel)
-    text, _ = _read_text(p)
-    lines = text.split("\n")
+    if doc:
+        try:
+            # .docx, собранный write: показываем его Markdown — по нему работает edit
+            text = (p.suffix.lower() == ".docx" and documents.docx_source(p)) or documents.document_text(p)
+        except Exception as e:  # битый/зашифрованный документ
+            raise ToolError(f"Не удалось извлечь текст из {path}: {e}")
+    else:
+        text, _ = _read_text(p)
+    lines = text.split("\n") if text else []
     if text.endswith("\n"):
         lines.pop()
     # большой кусок кода без выбора сущности: сначала оглавление (экономия контекста);
@@ -289,6 +314,7 @@ def _in_main(ctx: ToolContext, path: str) -> Path | None:
 
 
 def t_glob(ctx: ToolContext, pattern: str, path: str = "") -> ToolResult:
+    """Ищет файлы по шаблону в проекте, с учётом worktree‑папки."""
     alt = _in_main(ctx, path)
     if alt is not None and alt.is_dir():
         names = sorted(q.relative_to(alt).as_posix() for q in alt.rglob("*") if q.is_file())[:200]
@@ -314,7 +340,9 @@ def t_glob(ctx: ToolContext, pattern: str, path: str = "") -> ToolResult:
 
 def t_grep(ctx: ToolContext, pattern: str, path: str = "", glob: str = "",
            ignore_case: bool = False) -> ToolResult:
+    """Поиск по тексту файлов с поддержкой регулярных выражений и ограничением количества совпадений."""
     flags = re.IGNORECASE if ignore_case else 0
+    # Обрабатываем ошибку компиляции шаблона, чтобы не падать
     try:
         rx = re.compile(pattern, flags)
     except re.error:  # «Rotation(» и т.п. — модель имела в виду буквальную строку
@@ -339,11 +367,14 @@ def t_grep(ctx: ToolContext, pattern: str, path: str = "", glob: str = "",
     out, n = [], 0
     for f in files:
         p = root / f
-        if not is_text_file(p) or p.stat().st_size > 2_000_000:
-            continue
         try:
-            text = p.read_text(encoding="utf-8", errors="replace")
-        except OSError:
+            if documents.is_document(p):  # .docx от write — по Markdown, как его показывает read
+                text = (p.suffix.lower() == ".docx" and documents.docx_source(p)) or documents.document_text(p)
+            elif not is_text_file(p) or p.stat().st_size > 2_000_000:
+                continue
+            else:
+                text = p.read_text(encoding="utf-8", errors="replace")
+        except Exception:
             continue
         for i, line in enumerate(text.splitlines(), 1):
             if rx.search(line):
@@ -372,6 +403,9 @@ def _enclosing(root: Path, rel: str, line: int) -> str:
 
 
 def _scope_files(root: Path, path: str) -> list[str]:
+    """Возвращает список файлов, соответствующих пути относительно корня; если путь указывает на файл,
+    возвращает его относительный путь, иначе – все файлы, начинающиеся с указанного префикса.
+    """
     target = resolve(root, path or ".")
     if target.is_file():
         return [relpath(root, target)]
@@ -391,6 +425,7 @@ def t_refs(ctx: ToolContext, name: str, path: str = "") -> ToolResult:
     variants = {name}
     if name.lower() == name and "_" in name:
         variants.add(name.upper())
+    # Создаём регэксп, чтобы найти точные совпадения имени
     rx = re.compile(r"(?<![A-Za-z0-9_])(?:" + "|".join(map(re.escape, sorted(variants))) + r")(?![A-Za-z0-9_])")
     defn = re.compile(r"^\s*(?:async\s+def|def|class)\s+" + re.escape(name) + r"\b|^\s*" + re.escape(name)
                       + r"\s*(?::[^=]*)?=(?!=)")
@@ -407,11 +442,13 @@ def t_refs(ctx: ToolContext, name: str, path: str = "") -> ToolResult:
         for i, line in enumerate(text.splitlines(), 1):
             if not rx.search(line):
                 continue
+            # Определяем тип упоминания: определение, импорт или обычное использование
             kind = ("def" if defn.match(line) else
                     "import" if re.match(r"\s*(from\s+\S+\s+)?import\b", line) else "use")
             where = _enclosing(ctx.root, f, i)
             groups.setdefault(f, []).append(f"  {i} [{kind}{' in ' + where if where else ''}] {line.strip()[:160]}")
             n += 1
+            # Останавливаем поиск, если достигнут лимит упоминаний
             if n >= REFS_MAX:
                 break
         if n >= REFS_MAX:
@@ -426,6 +463,9 @@ def t_refs(ctx: ToolContext, name: str, path: str = "") -> ToolResult:
 
 
 def _pytest_python(root: Path) -> str:
+    """Определяет исполняемый файл Python для проекта, используя виртуальное окружение, если оно найдено,
+    иначе – системный интерпретатор.
+    """
     venv = find_venv(root)
     if not venv:
         return sys.executable
@@ -488,6 +528,8 @@ def revert_whitespace_only(root: Path, originals: dict) -> list[str]:
 
 
 def _test_names(text: str) -> set[str]:
+    """Извлекает имена функций, начинающихся с «test», из исходного текста, игнорируя синтаксические ошибки.
+    """
     try:
         tree = ast.parse(text)
     except (SyntaxError, ValueError):
@@ -707,6 +749,7 @@ def t_logstats(ctx: ToolContext, path: str, match: str = "", by: str = "", bucke
     if not target.exists() and main and resolve(main, path).exists():
         # изолированный worktree: логи (.gitignore) есть только в основной копии проекта
         base, target = main, resolve(main, path)
+        # Переходим к основной копии, если лог в изолированном worktree
         note = f"(логи основной копии проекта {main})\n"
     every = ([relpath(base, q) for q in sorted(target.rglob("*")) if q.is_file()]
              if target.is_dir() else [])  # логи обычно в .gitignore — list_files их не видит
@@ -729,6 +772,7 @@ def t_logstats(ctx: ToolContext, path: str, match: str = "", by: str = "", bucke
         for line in lines:
             if not line.strip() or (rx and not rx.search(line)):
                 continue
+            # Определяем, является ли строка JSON, иначе None
             d = None
             if line.lstrip().startswith("{"):
                 try:
@@ -741,6 +785,7 @@ def t_logstats(ctx: ToolContext, path: str, match: str = "", by: str = "", bucke
     if not rows:
         return ToolResult(out[0] + ".")
     times = []
+    # Извлекаем временную метку из JSON или строки
     for line, d in rows:
         m = _TS.search(str(d.get("time") or d.get("ts") or d.get("timestamp") or "") if d else line) or _TS.search(line)
         times.append(m)
@@ -761,6 +806,9 @@ def t_logstats(ctx: ToolContext, path: str, match: str = "", by: str = "", bucke
         out.append("поля JSON: " + ", ".join(sorted(keys, key=lambda k: -keys[k])[:20]))
 
     def top(values, n=12):
+        """Подсчитывает частоту появления элементов в последовательности и возвращает строку с топ‑n наиболее
+        частыми значениями.
+        """
         c: dict[str, int] = {}
         for v in values:
             c[v] = c.get(v, 0) + 1
@@ -784,6 +832,7 @@ def t_logstats(ctx: ToolContext, path: str, match: str = "", by: str = "", bucke
             out.append(f"по {k}: " + top([str(d.get(k, "-")) if d else "-" for _, d in rows], 8))
     else:
         out.append("по level: " + top([(m.group(1) if (m := _LEVEL.search(line)) else "-") for line, _ in rows], 6))
+    # Группируем по времени для гистограммы bucket
     if bucket in ("minute", "hour", "day"):
         cut = {"minute": 16, "hour": 13, "day": 10}[bucket]
         c: dict[str, int] = {}
@@ -797,14 +846,18 @@ def t_logstats(ctx: ToolContext, path: str, match: str = "", by: str = "", bucke
     return ToolResult(note + _trunc("\n".join(out), 5000))
 
 
-def _find_block(text: str, old: str) -> tuple[int, int] | None:
-    """Совпадение блока строк без учёта пробелов в конце строк (частая ошибка моделей)."""
+def _find_block(text: str, old: str, indent: bool = True) -> tuple[int, int] | None:
+    """
+    Совпадение блока строк без учёта пробелов в конце строк (частая ошибка моделей); indent=False —
+    и без учёта отступов (в тексте документа они ничего не значат).
+    """
+    norm = (lambda l: l.rstrip()) if indent else (lambda l: l.strip())
     t_lines = text.split("\n")
     o_lines = old.strip("\n").split("\n")
-    o_norm = [l.rstrip() for l in o_lines]
+    o_norm = [norm(l) for l in o_lines]
     hits = []
     for i in range(len(t_lines) - len(o_lines) + 1):
-        if [l.rstrip() for l in t_lines[i:i + len(o_lines)]] == o_norm:
+        if [norm(l) for l in t_lines[i:i + len(o_lines)]] == o_norm:
             hits.append(i)
     if len(hits) != 1:
         return None
@@ -814,6 +867,9 @@ def _find_block(text: str, old: str) -> tuple[int, int] | None:
 
 
 def _closest(text: str, old: str) -> str:
+    """Находит в тексте фрагмент, наиболее похожий на исходный, и возвращает его с номерами строк, если
+    схожесть выше порога 0.5.
+    """
     lines = text.split("\n")
     o_lines = old.strip("\n").split("\n")
     n = len(o_lines)
@@ -925,6 +981,7 @@ def _plan_edit(ctx: ToolContext, path: str, old: str, new: str, replace_all: boo
     old, new = _unpatch(old.replace("\r\n", "\n"), new.replace("\r\n", "\n"))
     # модель копирует номера строк из вывода read («129│код») — маркер «│» наш, срезаем его
     old, new = _LINE_NO.sub("", old), _LINE_NO.sub("", new)
+    # Обрабатываем добавление новых строк, если файл не .diff/.patch/.md
     if not rel.endswith((".diff", ".patch", ".md")):
         new = _strip_added_marks(old, new)
     if old == new:
@@ -937,6 +994,7 @@ def _plan_edit(ctx: ToolContext, path: str, old: str, new: str, replace_all: boo
     while i != -1:
         positions.append(i)
         i = text.find(old, i + len(old))
+    # Проверяем, что старый фрагмент встречается только один раз, иначе ошибка
     if len(positions) > 1 and not replace_all:
         lines = ", ".join(str(_line_at(text, x)) for x in positions[:10])
         raise ToolError(f"old встречается {len(positions)} раз (строки {lines}). Правка не применена. "
@@ -946,6 +1004,7 @@ def _plan_edit(ctx: ToolContext, path: str, old: str, new: str, replace_all: boo
         start = positions[0]
         after = text.replace(old, new) if replace_all else text[:start] + new + text[start + len(old):]
     else:
+        # Если точного совпадения нет, ищем блок по отступам
         span = _find_block(text, old)
         if not span:
             raise ToolError("old не найден в файле (нужно точное совпадение, с отступами; не используй "
@@ -960,6 +1019,11 @@ def _plan_edit(ctx: ToolContext, path: str, old: str, new: str, replace_all: boo
 
 
 def t_edit(ctx: ToolContext, path: str, old: str, new: str, replace_all: bool = False) -> ToolResult:
+    """Редактирует файл, выбирая подходящий механизм (docx или обычный текст) и обрабатывая ошибки, связанные
+    с чтением/записью.
+    """
+    if path.lower().endswith(".docx"):
+        return _edit_docx(ctx, path, old, new, replace_all)
     try:
         p, rel, text, after, nl, start, new, summary = _plan_edit(ctx, path, old, new, replace_all)
     except ToolError:
@@ -979,6 +1043,8 @@ def preview(ctx: ToolContext, name: str, args: dict) -> ToolResult:
     модели с ошибкой (пользователя не спрашиваем), рабочая — даёт настоящий дифф для карточки.
     """
     try:
+        if str(args.get("path", "")).lower().endswith(".docx"):
+            return ToolResult("", path=args.get("path", ""))  # Word: дифф по тексту даст сам инструмент
         if name == "edit":
             _, rel, text, after, *_ = _plan_edit(ctx, **args)
             return ToolResult("", diff=_diff(rel, text, after), path=rel)
@@ -998,6 +1064,9 @@ def preview(ctx: ToolContext, name: str, args: dict) -> ToolResult:
 
 def _finish_edit(ctx: ToolContext, p: Path, rel: str, text: str, after: str, nl: str,
                  start: int, new: str, summary: str = "") -> ToolResult:
+    """Завершает редактирование, сохраняет изменения, формирует diff и сообщение об успехе, включая подсказку
+    по синтаксису.
+    """
     if ctx.snapshot:
         ctx.snapshot(rel, text if nl == "\n" else text.replace("\n", nl))
     _write_text(p, after, nl)
@@ -1056,6 +1125,7 @@ def unused_modules(root: Path, rels) -> list[str]:
 
 
 def _imported_names(tree: ast.AST) -> set[str]:
+    """Собирает имена, импортированные в модуле, исключая wildcard‑импорты."""
     out = set()
     for n in ast.walk(tree):
         if isinstance(n, (ast.Import, ast.ImportFrom)):
@@ -1184,12 +1254,14 @@ def sql_column_errors(root: Path, originals: dict) -> list[str]:
             if not schema:
                 return []
             sql = re.sub(r"'[^']*'", "", n.value)  # строковые литералы
+            # Извлекаем имена таблиц из ключевых слов FROM/JOIN/UPDATE/INTO
             tables = re.findall(r"\b(?:FROM|JOIN|UPDATE|INTO)\s+[\"`]?(\w+)", sql, re.IGNORECASE)
             known = [t for t in tables if t in schema]
             if not known:
                 continue
             cols = set().union(*(schema[t] for t in known))
             aliases = set(re.findall(r"\bAS\s+[\"`]?(\w+)", sql, re.IGNORECASE)) | set(tables)
+            # Находим алиасы после FROM/JOIN, игнорируя ключевые слова
             aliases |= set(re.findall(r"\b(?:FROM|JOIN)\s+\w+\s+(?!WHERE|JOIN|ON|ORDER|GROUP|LIMIT|LEFT|INNER)(\w+)",
                                       sql, re.IGNORECASE))
             for word in dict.fromkeys(re.findall(r"(?<![:@$.\w])[A-Za-z_]\w*", sql)):
@@ -1220,6 +1292,8 @@ def dropped_dependencies(root: Path, originals: dict) -> list[str]:
         moved = {id(fn) for name, fn in old_defs.items() if name not in new_defs}
 
         def used(tree, skip=()):
+            """Определяет набор идентификаторов, загруженных в дереве AST, пропуская узлы, указанные в skip.
+            """
             out, stack = set(), [tree]
             while stack:
                 n = stack.pop()
@@ -1284,9 +1358,11 @@ def _is_stub(fn: ast.AST) -> bool:
 
 
 def _stub_names(tree: ast.AST) -> set[str]:
+    """Находит имена функций‑заглушек в дереве AST, включая вложенные классы, и возвращает их с префиксами."""
     out = set()
 
     def walk(body, prefix=""):
+        """Вспомогательная функция для _stub_names, рекурсивно обходит тело, собирая имена заглушек."""
         for n in body:
             if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 abstract = any(getattr(d, "id", getattr(d, "attr", "")) == "abstractmethod" for d in n.decorator_list)
@@ -1316,6 +1392,7 @@ def new_stubs(root: Path, originals: dict) -> list[str]:
 
 
 def _defs(tree: ast.AST) -> dict[str, ast.AST]:
+    """Создаёт словарь, сопоставляющий имена функций и методов классов с их AST‑узлами."""
     out = {}
     for n in tree.body:
         if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -1508,6 +1585,9 @@ def import_errors(root: Path, rels, timeout: int = 90) -> list[str]:
 
 
 def _module_file(root: Path, mod: str) -> Path | None:
+    """Определяет путь к файлу модуля, учитывая как .py, так и __init__.py, либо возвращает None, если файл не
+    найден.
+    """
     base = root.joinpath(*mod.split("."))
     for p in (base.with_suffix(".py"), base / "__init__.py"):
         if p.is_file():
@@ -1570,10 +1650,15 @@ def _missing_imports(root: Path, rel: str) -> list[str]:
 
 
 def t_write(ctx: ToolContext, path: str, content: str) -> ToolResult:
+    """Записывает содержимое в файл, создавая его при необходимости, и возвращает diff и сообщение об успехе,
+    учитывая форматирование строк.
+    """
     p = resolve(ctx.root, path)
     if p.is_dir():
         raise ToolError(f"{path} — это папка.")
     rel = relpath(ctx.root, p)
+    if p.suffix.lower() == ".docx":
+        return _write_docx(ctx, p, rel, content)
     before, nl = ("", "\n")
     if p.is_file():
         before, nl = _read_text(p)
@@ -1590,12 +1675,75 @@ def t_write(ctx: ToolContext, path: str, content: str) -> ToolResult:
                       + _syntax_warning(rel, content), diff=d, path=rel)
 
 
+def _edit_docx(ctx: ToolContext, path: str, old: str, new: str, replace_all: bool = False) -> ToolResult:
+    """
+    Правка .docx по его Markdown-источнику; пустой old — дописать раздел в конец. Так документ
+    собирается по частям: один огромный write маленькая модель обрывает на лимите ответа (битый JSON).
+    """
+    p = resolve(ctx.root, path)
+    rel = relpath(ctx.root, p)
+    old, new = old.replace("\r\n", "\n"), new.replace("\r\n", "\n")
+    old, new = _LINE_NO.sub("", old), _LINE_NO.sub("", new)
+    src = ""
+    if p.is_file() and p.stat().st_size > 0:
+        src = documents.docx_source(p) or documents.document_text(p)
+    if not old:  # раздел с уже существующим заголовком заменяет прежний — без дублей
+        after = documents.upsert_section(src, new)
+    else:
+        count = src.count(old)
+        if count > 1 and not replace_all:
+            raise ToolError(f"old встречается {count} раз — добавь соседние строки, чтобы он был уникален. "
+                            "Целый раздел проще заменить: edit с пустым old и new, начинающимся с того же "
+                            "заголовка (## …), — он заменит прежний раздел.")
+        if count:
+            after = src.replace(old, new) if replace_all else src.replace(old, new, 1)
+        else:
+            span = _find_block(src, old, indent=False)  # без учёта пробелов в начале/конце строк
+            if not span:
+                raise ToolError("old не найден в документе. Перечитай его через read (там Markdown, по которому "
+                                "работает edit) или замени раздел целиком: edit с пустым old и new с тем же "
+                                "заголовком (## …)." + _closest(src, old))
+            after = src[:span[0]] + new + src[span[1]:]
+    return _write_docx(ctx, p, rel, documents.dedupe_sections(after), shown=new)
+
+
+def _write_docx(ctx: ToolContext, p: Path, rel: str, content: str, shown: str | None = None) -> ToolResult:
+    """Markdown → Word; в ответе — текст получившегося файла, чтобы модель видела результат."""
+    existed = p.is_file() and p.stat().st_size > 0
+    before = documents.document_text(p) if existed else ""
+    if (shown is None and len(before) > 1500 and len(content) < len(before) * 0.5
+            and ctx.seen.get(("shrink", rel)) != content):
+        # «оформить итог» маленькая модель понимает как пересказ: подробные решения теряются
+        ctx.seen[("shrink", rel)] = content
+        raise ToolError(f"write сократил бы {rel} с {len(before)} до {len(content)} символов — содержимое будет "
+                        "потеряно. Меняй документ по частям: edit с old из read (там Markdown) и new. Если "
+                        "сокращение действительно нужно, повтори этот же write.")
+    if ctx.snapshot:
+        ctx.snapshot(rel, documents.BINARY_MARK + base64.b64encode(p.read_bytes()).decode() if existed else None)
+    try:
+        n = documents.write_docx(p, content)
+    except PermissionError:
+        raise ToolError(f"{rel} открыт в другой программе (Word?) — закрой его и повтори write.")
+    after = documents.document_text(p)
+    _forget(ctx, rel)
+    if shown is not None:  # edit: только изменённый кусок — в том виде, как он попал в Word
+        return ToolResult(f"OK: {rel} обновлён (Word, {n} абзацев, {len(after)} символов). Новый текст "
+                          f"в документе:\n{_trunc(documents.latex_to_unicode(shown), 3000)}",
+                          diff=_diff(rel, before, after), path=rel)
+    preview = after if len(after) <= 1500 else after[:1500] + f"\n…(ещё {len(after) - 1500} символов)"
+    return ToolResult(f"OK: {rel} {'перезаписан' if existed else 'создан'} (Word, {n} абзацев). "
+                      f"Текст документа:\n{preview}", diff=_diff(rel, before, after), path=rel)
+
+
 def _forget(ctx: ToolContext, rel: str) -> None:
     for k in [k for k in ctx.seen if k[0] == rel]:
         del ctx.seen[k]
 
 
 async def t_run(ctx: ToolContext, command: str, timeout: int | None = None) -> ToolResult:
+    """Запускает внешнюю команду в окружении проекта, обрабатывая таймауты, виртуальное окружение и вывод,
+    возвращая результат в виде ToolResult.
+    """
     timeout = max(1, min(int(timeout or config.COMMAND_TIMEOUT), 1800))
     env = {**os.environ, "PYTHONIOENCODING": "utf-8", "PYTHONUTF8": "1", "GIT_PAGER": "cat",
            "PAGER": "cat", "GIT_TERMINAL_PROMPT": "0", "CI": "1"}
@@ -1617,7 +1765,11 @@ async def t_run(ctx: ToolContext, command: str, timeout: int | None = None) -> T
     proc = subprocess.Popen([*SHELL_CMD, cmd], cwd=str(ctx.root), env=env, stdin=subprocess.DEVNULL,
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, **kwargs)
 
+    # Функция wait оборачивает Popen.communicate
     def wait() -> tuple[bytes, bool]:
+        """Ожидает завершения процесса с таймаутом, завершая его при истечении времени и возвращая вывод и
+        флаг таймаута.
+        """
         try:
             return proc.communicate(timeout=timeout)[0], False
         except subprocess.TimeoutExpired:
@@ -1627,6 +1779,7 @@ async def t_run(ctx: ToolContext, command: str, timeout: int | None = None) -> T
     try:
         out, timed_out = await asyncio.to_thread(wait)
     except asyncio.CancelledError:
+        # При отмене убиваем все дочерние процессы
         _kill_tree(proc.pid)  # кнопка «Стоп»: убиваем дерево процессов
         raise
     code = proc.returncode
@@ -1640,6 +1793,9 @@ async def t_run(ctx: ToolContext, command: str, timeout: int | None = None) -> T
 
 
 def _kill_tree(pid: int) -> None:
+    """Уничтожает процесс и все его дочерние процессы, используя taskkill на Windows или killpg на Unix,
+    игнорируя ошибки.
+    """
     try:
         if sys.platform == "win32":
             subprocess.run(["taskkill", "/T", "/F", "/PID", str(pid)], capture_output=True, timeout=15)
@@ -1658,6 +1814,7 @@ PROTECTED_BRANCHES = ("main", "master")
 
 
 def _git(root: Path, *args: str, timeout: int = 60) -> subprocess.CompletedProcess:
+    """Выполняет команду git в указанной директории, возвращает CompletedProcess."""
     env = {**os.environ, "GIT_TERMINAL_PROMPT": "0", "GIT_PAGER": "cat", "LC_ALL": "C.UTF-8"}
     return subprocess.run(["git", *args], cwd=str(root), capture_output=True, text=True,
                           encoding="utf-8", errors="replace", timeout=timeout, env=env)
@@ -1697,6 +1854,7 @@ def git_preview(ctx: ToolContext, message: str = "", summary: str = "", tests: s
         changed = {f: changed[f] for f in want}
     if not changed:
         raise ToolError("Нечего коммитить: рабочая копия чистая.")
+    # Ищем файлы, содержащие потенциальные секреты, чтобы не коммитить их.
     secrets = [f for f in changed if SECRET_FILE.search(f)]
     if secrets:
         raise ToolError(f"Похоже на секреты, коммитить нельзя: {', '.join(secrets)}. Укажи files без них.")
@@ -1713,6 +1871,9 @@ def git_preview(ctx: ToolContext, message: str = "", summary: str = "", tests: s
 
 
 def t_git_commit(ctx: ToolContext, **args) -> ToolResult:
+    """Создаёт коммит из данных preview, добавляет файлы, коммитит, возможно пушит, возвращает результат
+    операции.
+    """
     g = git_preview(ctx, **args)
     body = f"{g['message']}\n\nИзменения:\n{g['summary']}\n\nПроверки:\n{g['tests']}\n"
     steps = []
@@ -1739,6 +1900,7 @@ SYNC = {"git_commit": t_git_commit, "symbols": t_symbols, "refs": t_refs, "test"
 
 
 async def execute(ctx: ToolContext, name: str, args: dict) -> ToolResult:
+    """Вызывает нужный инструмент по имени, обрабатывает ошибки и возвращает ToolResult."""
     if name not in TOOL_NAMES:
         return ToolResult(f"Неизвестный инструмент {name}. Доступны: {', '.join(sorted(TOOL_NAMES))}.", ok=False)
     if name in ("plan", "decide"):  # состояние живёт в сессии — обрабатывает агент
