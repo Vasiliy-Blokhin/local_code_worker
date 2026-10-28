@@ -25,12 +25,19 @@ _PATHSPEC = (".",)  # неотслеживаемые .env* убирает из �
 
 
 def _git(cwd: str | Path, *args: str, input: str | None = None, timeout: int = 120) -> subprocess.CompletedProcess:
+    """Выполняет команду git в указанной директории, передавая аргументы *args. Возвращает объект
+    subprocess.CompletedProcess, содержащий stdout и stderr. Устанавливает окружение, отключая
+    интерактивный ввод и переводит вывод в UTF‑8.
+    """
     env = {**os.environ, "GIT_TERMINAL_PROMPT": "0", "GIT_PAGER": "cat", "LC_ALL": "C.UTF-8"}
     return subprocess.run(["git", *args], cwd=str(cwd), input=input, capture_output=True, text=True,
                           encoding="utf-8", errors="replace", timeout=timeout, env=env)
 
 
 def _check(p: subprocess.CompletedProcess, what: str) -> str:
+    """Проверяет код возврата CompletedProcess. Если не ноль, генерирует WorkspaceError с сообщением и частью
+    вывода. Возвращает stdout при успешном выполнении.
+    """
     if p.returncode != 0:
         raise WorkspaceError(f"{what}: {(p.stderr or p.stdout).strip()[-600:]}")
     return p.stdout
@@ -78,6 +85,9 @@ def _stage(path: str) -> None:
 
 
 def changed_files(wt: dict) -> list[str]:
+    """Определяет список файлов, изменённых относительно ветки wt["base"]. Сначала ставит изменения в индекс,
+    затем получает имена файлов из git diff и возвращает их как список строк.
+    """
     _stage(wt["path"])
     out = _check(_git(wt["path"], "diff", "--cached", "--name-only", wt["base"], "--", *_PATHSPEC), "git diff")
     return [l for l in out.splitlines() if l.strip()]

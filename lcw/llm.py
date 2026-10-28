@@ -17,6 +17,7 @@ from . import config
 
 
 class LLMError(Exception):
+    """Исключение для ошибок LLM, содержит сообщение и флаг временной проблемы."""
     def __init__(self, msg: str = "", transient: bool = False):
         super().__init__(msg)
         # временная проблема (модель переключают/упала/занята, обрыв связи) —
@@ -57,6 +58,10 @@ class Completion:
 
 
 class LLM:
+    """Класс LLM управляет взаимодействием с AI Manager: инициализирует клиент, проверяет статус модели,
+    запускает её и осуществляет потоковый чат. Методы возвращают словари с информацией о состоянии модели и
+    генерируют события в виде кортежей (тип, данные).
+    """
     def __init__(self, base_url: str = config.AIM_URL, password: str = config.AIM_PASSWORD,
                  model: str = config.MODEL, transport: httpx.AsyncBaseTransport | None = None):
         self.base_url = base_url
@@ -75,6 +80,9 @@ class LLM:
 
     # ---------- управление моделью ----------
     async def status(self) -> dict:
+        """Получает статус AI‑менеджера: проверяет активную модель, наличие блокировки, очередь задач и
+        обрабатывает таймауты и ошибки.
+        """
         try:
             r = await self._client.get(f"{self.base_url}/api/status", timeout=10)
             if r.status_code == 401:
@@ -98,6 +106,9 @@ class LLM:
                                           f"{type(e).__name__}: {e}"}
 
     async def start_model(self) -> dict:
+        """Запускает модель, обрабатывает конфликт занятости GPU и возвращает JSON‑ответ, выбрасывая
+        исключения при ошибках.
+        """
         r = await self._client.post(f"{self.base_url}/api/models/{self.model}/start", timeout=None)
         if r.status_code == 409 and '"model_busy"' in r.text:
             raise LLMBusy("GPU занята задачами другого проекта. Запрос к модели встанет в очередь "
@@ -136,6 +147,9 @@ class LLM:
                 await asyncio.sleep(2 + attempt * 3)
 
     async def _stream_once(self, payload: dict):
+        """Асинхронный поток ответов от LLM: отправляет запрос, обрабатывает стрим, генерирует события
+        (reasoning, text, tool) и возвращает итоговый объект Completion.
+        """
         comp = Completion()
         calls: dict[int, dict] = {}
         async with self._client.stream("POST", f"{self.base_url}/v1/chat/completions",
@@ -170,6 +184,7 @@ class LLM:
                         comp.content += delta["content"]
                         yield "text", delta["content"]
                     for tc in delta.get("tool_calls") or []:
+                        # Инициализируем slot для tool‑calls
                         slot = calls.setdefault(tc.get("index", len(calls)),
                                                 {"id": "", "name": "", "arguments": ""})
                         if tc.get("id"):
@@ -195,6 +210,8 @@ class LLM:
 
 
 def _error_text(body: str) -> str:
+    """Извлекает читаемый текст ошибки из JSON‑ответа; если не удаётся, возвращает первые 500 символов тела.
+    """
     try:
         err = json.loads(body).get("error")
         if isinstance(err, dict):

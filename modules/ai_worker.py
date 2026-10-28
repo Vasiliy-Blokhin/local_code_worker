@@ -10,6 +10,9 @@ class AIRequestError(Exception):
 
 
 class AIRequestHandler:
+    """Класс для работы с ИИ‑API: хранит URL, пароль, модель и промпты, отправляет запросы и обрабатывает
+    ошибки.
+    """
     def __init__(self, api_url, password, model='qwen25-coder-14b-unc',
                  system_prompt=None, content=None):
         self.api_url = api_url.rstrip('/') + '/'
@@ -21,6 +24,7 @@ class AIRequestHandler:
         self.content = content
 
     def _headers(self):
+        """Возвращает словарь заголовков, необходимых для авторизации и указания типа контента."""
         return {
             'X-API-Password': self.password,
             'X-Project': 'local_code_worker',

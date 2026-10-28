@@ -17,6 +17,7 @@ from params.settings import PROMPT_CODE_REWORK, PROMPT_RECOVERY_JSON, logger
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 class CodeReworker:
+    """Класс, скачивает архив, проверяет ИИ, запрашивает изменения, применяет их и создаёт новый ZIP."""
     def __init__(self, archive_url, api_url, password, prompt, model):
         self.archive_url = archive_url
         self.prompt = prompt
@@ -41,6 +42,7 @@ class CodeReworker:
 
     # ------------------------------------------------------------------
     def _download_and_extract(self):
+        """Скачивает архив по URL, проверяет статус, распаковывает в временную папку с защитой от Zip Slip."""
         logger.info(f'Скачивание архива: {self.archive_url}')
         try:
             response = requests.get(self.archive_url, timeout=120)
@@ -63,6 +65,7 @@ class CodeReworker:
         zip_ref.extractall(target_dir)
 
     def _check_ai(self):
+        """Проверяет доступность ИИ‑агента, отправляя простое сообщение и ожидая корректный ответ."""
         logger.info('Проверка доступности ИИ агента...')
         try:
             self.ai_worker.start_model()
@@ -74,6 +77,7 @@ class CodeReworker:
             raise RuntimeError(f'ИИ агент не работает: {exc}') from exc
 
     def _request_changes(self):
+        """Отправляет содержимое проекта в модель, получает список изменений и преобразует их в словарь."""
         self.ai_worker.system_prompt = PROMPT_CODE_REWORK(prompt=self.prompt)
         # Относительные (к корню проекта) пути файлов — их же вернет модель.
         self.ai_worker.content = str(self._generate_content_context())
@@ -137,6 +141,7 @@ class CodeReworker:
             return recovery if len(recovery) else []
 
     def _create_zip(self, results_dir):
+        """Создаёт ZIP из изменённого проекта, сохраняет в results_dir и возвращает путь к архиву."""
         name = f'rework_{self._generate_random_text()}.zip'
         self.output_zip = os.path.join(results_dir, name)
         with zipfile.ZipFile(self.output_zip, 'w', zipfile.ZIP_DEFLATED) as zipf:

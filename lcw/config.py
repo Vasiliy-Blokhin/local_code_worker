@@ -11,6 +11,9 @@ load_dotenv(ROOT / ".env")
 
 
 def _int(name: str, default: int) -> int:
+    """Функция преобразует значение переменной окружения в целое число, возвращая значение по умолчанию при
+    ошибке.
+    """
     try:
         return int(os.getenv(name, default))
     except ValueError:

@@ -22,6 +22,10 @@ OPS_KEEP = 5000  # операций в памяти для догоняющих 
 
 
 class Session:
+    """Класс Session хранит состояние сессии: идентификатор, проект, заголовок, метки времени, системный
+    префикс, сообщения, элементы, контрольные точки, настройки, использование, план действий, фокус, дерево
+    работы, решения и внутренние структуры для асинхронных операций.
+    """
     def __init__(self, data: dict):
         self.id: str = data["id"]
         self.project_id: str = data["project_id"]
@@ -55,6 +59,9 @@ class Session:
         return config.SESSIONS_DIR / f"{self.id}.json"
 
     def to_json(self) -> dict:
+        """Возвращает словарь, пригодный для сериализации в JSON, содержащий все основные поля сессии, кроме
+        временных и внутренних атрибутов.
+        """
         return {"id": self.id, "project_id": self.project_id, "title": self.title,
                 "created": self.created, "updated": self.updated, "system": self.system,
                 "messages": self.messages, "items": self.items, "checkpoints": self.checkpoints,
@@ -64,6 +71,9 @@ class Session:
                 "decisions": self.decisions}
 
     def save(self) -> None:
+        """Обновляет поле updated, сохраняет сессию в временный файл и атомарно заменяет основной файл, чтобы
+        избежать повреждения данных.
+        """
         self.updated = time.time()
         tmp = self.path.with_suffix(".tmp")
         tmp.write_text(json.dumps(self.to_json(), ensure_ascii=False), encoding="utf-8")
@@ -74,12 +84,18 @@ class Session:
                 "updated": self.updated, "running": self.running}
 
     def meta(self) -> dict:
+        """Возвращает сокращённый словарь с текущим состоянием: работа, использование, настройки, заголовок,
+        контекст и ветка рабочего дерева (если есть).
+        """
         return {"running": self.running, "usage": self.usage, "settings": self.settings,
                 "title": self.title, "context": config.CONTEXT,
                 "worktree": {"branch": self.worktree["branch"]} if self.worktree else None}
 
     # ---------- события ----------
     def _push(self, op: dict) -> None:
+        """Увеличивает счётчик seq, добавляет операцию в список ops, обрезает его до OPS_KEEP, и сигнализирует
+        всем ожидающим событиями, создавая новый Event для последующих ожиданий.
+        """
         self.seq += 1
         op["seq"] = self.seq
         self.ops.append(op)
@@ -90,6 +106,8 @@ class Session:
         self._event = asyncio.Event()
 
     def add(self, item: dict) -> int:
+        """Добавляет элемент в список items, публикует операцию add в ops и возвращает индекс нового элемента.
+        """
         self.items.append(item)
         self._push({"op": "add", "item": item})
         return len(self.items) - 1
@@ -121,10 +139,16 @@ class Session:
 
 
 class Store:
+    """Класс Store управляет кэшем сессий, создаёт, получает, перечисляет и удаляет сессии, обеспечивая
+    загрузку из файлов при необходимости.
+    """
     def __init__(self):
         self._cache: dict[str, Session] = {}
 
     def create(self, project_id: str, system: str, settings: dict | None = None) -> Session:
+        """Создаёт новую Session с уникальным id, сохраняет её в кэш и файл, применяя дополнительные
+        настройки, если они заданы, и возвращает объект.
+        """
         s = Session({"id": uuid.uuid4().hex[:12], "project_id": project_id, "system": system})
         if settings:
             s.settings.update(settings)
@@ -133,6 +157,9 @@ class Store:
         return s
 
     def get(self, sid: str) -> Session:
+        """Возвращает Session из кэша, загружая из файла при первом запросе; при отсутствии файла генерирует
+        KeyError.
+        """
         if sid not in self._cache:
             p = config.SESSIONS_DIR / f"{sid}.json"
             if not p.is_file():
@@ -141,6 +168,10 @@ class Store:
         return self._cache[sid]
 
     def list(self, project_id: str | None = None) -> list[dict]:
+        """Возвращает список словарей‑сессий, отсортированных по дате обновления. Для каждой найденной в
+        каталоге *.json сессии берётся краткая информация (id, project_id, title, updated, running). Если
+        project_id задан, фильтрует только по нему.
+        """
         out = []
         for p in config.SESSIONS_DIR.glob("*.json"):
             sid = p.stem
@@ -158,6 +189,9 @@ class Store:
         return sorted(out, key=lambda x: -x["updated"])
 
     def delete(self, sid: str) -> None:
+        """Удаляет сессию из кэша и, при наличии запущенной задачи, отменяет её. Затем удаляет файл сессии из
+        диска, игнорируя ошибку, если файл отсутствует.
+        """
         s = self._cache.pop(sid, None)
         if s and s.task:
             s.task.cancel()
