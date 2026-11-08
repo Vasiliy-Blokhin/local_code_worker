@@ -72,3 +72,10 @@ def plan_chunks(*texts, status="todo", call_id="p1"):
     """Вызов plan — агент требует план перед изменениями."""
     steps = [{"text": t, "status": status} for t in (texts or ("шаг", "проверка"))]
     return tool_call_chunks("plan", {"steps": steps}, call_id, reasoning="план")
+
+
+@pytest.fixture(autouse=True)
+def _not_small(monkeypatch, request):
+    """Тестовые проекты крошечные, а проверки decide рассчитаны на «существующий» проект."""
+    if "small_project" not in request.keywords:
+        monkeypatch.setattr("lcw.agent.small_project", lambda root, limit=1500: False)

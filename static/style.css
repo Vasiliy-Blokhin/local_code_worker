@@ -164,3 +164,6 @@ dialog .or { text-align: center; color: var(--muted); font-size: 12px; margin: 1
 
 .chk { display: inline-flex; align-items: center; gap: 4px; cursor: pointer; user-select: none; }
 .pill.hidden { display: none; }
+
+.shots { display: flex; flex-wrap: wrap; gap: 6px; margin: 6px 0; }
+.shots img { max-width: 260px; border: 1px solid #444; border-radius: 4px; }

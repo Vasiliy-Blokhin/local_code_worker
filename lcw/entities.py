@@ -23,6 +23,9 @@ JS_EXT = (".js", ".mjs", ".cjs", ".jsx", ".ts", ".tsx")
 
 @dataclass
 class Entity:
+    """Класс описывает сущность кода: класс, функция или метод, с метаданными (тип, имя, сигнатура, диапазон
+    строк, документация).
+    """
     kind: str           # class | def | method
     name: str           # квалифицированное имя: Class.method
     sig: str            # (a, b=…) для функций, (Base) для классов
@@ -31,6 +34,9 @@ class Entity:
     doc: str = ""
 
     def render(self, path: str = "") -> str:
+        """Возвращает строку‑описание сущности, включая путь, диапазон строк, тип, имя, сигнатуру и краткую
+        документацию.
+        """
         where = f"{path}:" if path else ""
         doc = f" — {self.doc}" if self.doc else ""
         return f"{where}{self.line}-{self.end} {self.kind} {self.name}{self.sig}{doc}"
@@ -41,6 +47,8 @@ _CACHE: dict[tuple[str, str], tuple[int, str, list[Entity]]] = {}
 
 
 def _first_line(doc: str | None) -> str:
+    """Извлекает первую непустую строку из docstring, обрезая до DOC_CHARS и добавляя многоточие при усечении.
+    """
     if not doc:
         return ""
     for line in doc.strip().splitlines():
@@ -51,6 +59,9 @@ def _first_line(doc: str | None) -> str:
 
 
 def _args(a: ast.arguments, method: bool = False) -> str:
+    """Формирует строку‑сигнатуру аргументов функции/метода, учитывая позиционные, по умолчанию, *args,
+    **kwargs, с усечением до SIG_CHARS.
+    """
     parts = []
     pos = a.posonlyargs + a.args
     defaults = [None] * (len(pos) - len(a.defaults)) + list(a.defaults)
@@ -74,6 +85,9 @@ def _start(node) -> int:
 
 
 def _py_entities(text: str) -> tuple[str, list[Entity]]:
+    """Парсит Python‑код, возвращая docstring модуля и список Entity для классов и функций, включая вложенные
+    до глубины 2.
+    """
     try:
         tree = ast.parse(text)
     except SyntaxError:
@@ -81,6 +95,9 @@ def _py_entities(text: str) -> tuple[str, list[Entity]]:
     out: list[Entity] = []
 
     def walk(body, prefix: str = "", in_class: bool = False, depth: int = 0):
+        """Вспомогательная рекурсивная функция, проходящая по AST‑узлам, создавая Entity для функций, методов
+        и классов, с учётом асинхронности.
+        """
         for n in body:
             if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 kind = "method" if in_class else "def"
@@ -108,6 +125,9 @@ _JS_DOC = re.compile(r"^\s*(?://+|/\*+|\*)\s?(.*?)\s*(?:\*/)?\s*$")
 
 
 def _js_entities(text: str) -> tuple[str, list[Entity]]:
+    """Анализирует JavaScript‑код, создавая Entity для классов и функций, определяя сигнатуру и документацию
+    из комментариев, с учётом асинхронности.
+    """
     lines = text.split("\n")
     out: list[Entity] = []
     tops: list[int] = []  # первая строка комментария над сущностью
@@ -164,6 +184,7 @@ def file_entities(root: str | Path, rel: str) -> tuple[str, list[Entity]]:
 
 
 def _files(root: str | Path, base: str = "") -> list[str]:
+    """Собирает список файлов из корня, отфильтровывая по поддерживаемым расширениям и базовому пути."""
     base = base.strip("/")
     pre = base + "/" if base and base != "." else ""
     return [f for f in list_files(root) if supported(f) and f.startswith(pre)]
@@ -333,6 +354,9 @@ def check_names(root: str | Path, names: list[str]) -> dict[str, list[str]]:
 
 
 def _dir_map(root: Path, files: list[str]) -> str:
+    """Генерирует строковое представление первых 150 файлов в каталоге, включая краткую документацию и список
+    верхних сущностей; при большем количестве файлов добавляет сообщение о остатке.
+    """
     out = []
     for f in files[:150]:
         doc, ents = file_entities(root, f)

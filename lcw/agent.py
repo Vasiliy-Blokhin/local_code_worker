@@ -12,14 +12,16 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import re
 import uuid
 from pathlib import Path
 
-from . import config, entities, equivalence, prompts
+from . import config, documents, entities, equivalence, prompts
 from .llm import LLM, Completion, LLMError
 from .sessions import Session
+from .tools import (t_launch, gui_entry, small_project)
 from .tools import (MUTATING, TOOLS, ToolContext, ToolError, ToolResult, execute, normalize_plan,
                     GIT_WRITE, git_preview, preview, render_plan, syntax_errors, unused_modules, import_errors,
                     unused_new_imports, new_stubs, project_tests, untested_changes, removed_tests, revert_whitespace_only, tests_pass_on_old_code, find_merges, undefined_names,
@@ -35,6 +37,13 @@ REFUSAL = re.compile(r"I'?m sorry|I can(no|')t|cannot (help|do|complete)|beyond 
                      r"not (feasible|possible) (to|in)|provide (a |more )?(clear )?spec|"
                      r"извин|не могу|не (получится|удастся)|слишком (сложн|больш|объ[её]мн)|"
                      r"выходит за рамки|предостав\w* (специфика|подробн|пример)", re.IGNORECASE)
+# документы: модель просит пользователя прислать текст вместо того, чтобы прочитать файл
+ASK_USER = re.compile(r"пришлите|скопируйте|вставьте (сюда|текст)|предостав\w* (текст|содерж)|"
+                      r"не (могу|удаётся|удается) (распарсить|прочитать|открыть|извлечь)|"
+                      r"please (provide|paste|copy|send)|can'?t (read|parse|open)", re.IGNORECASE)
+# пункт с результатом в файле («сохранить в result.docx», «запиши в отчёт.md»)
+SAVE_ITEM = re.compile(r"сохран|запи[шс]|(save|write)\b.*\.\w+|\b(в|in|to|into) \S+\.(docx|md|txt|xlsx)\b",
+                       re.IGNORECASE)
 # сбой разбора вызова инструмента в llama.cpp и подсказка для повтора
 PARSE_ERROR = re.compile(r"does not match the expected|Failed to parse|unparsed", re.IGNORECASE)
 _SHELL_TOOLS = ("logstats", "refs", "symbols", "test")  # имена, которых нет среди программ оболочки
@@ -80,6 +89,13 @@ FORMAT_VARIANTS = (
 TOOL_FORMAT_HINT = ("[Система] Предыдущий вызов инструмента не распознан: неверный формат заголовка. Вызывай "
                     "ровно один инструмент обычным способом (канал commentary, получатель functions.<имя>, "
                     "аргументы — JSON-объект) — или ответь текстом. Продолжай с того же места.")
+LONG_CALL_HINT = (" Вызов был слишком длинным и оборвался. Пиши по частям: write — только начало файла "
+                  "(заголовок и первый раздел, до ~40 строк), затем каждый следующий раздел — отдельным edit с "
+                  "пустым old (дописать в конец). Формулы — обычным текстом Unicode (∩ ∪ Σ C(n,k) 2ⁿ), без LaTeX.")
+# модель зациклилась внутри аргумента: один и тот же кусок (`\n   `) десятки раз подряд
+LOOPED = re.compile(r"(.{2,40}?)\1{15,}", re.S)
+LOOP_HINT = (" Ты зациклился: в аргументах десятки раз подряд повторялся один и тот же кусок. Напиши вызов "
+             "заново, коротко (до 20 строк), без пустых строк подряд и без блоков ```.")
 # модель просит уточнений вместо работы
 ASKS = re.compile(r"уточни|уточнит|нужн\w* (уточнен|решени|информац)|clarif|could you|please (provide|specify)",
                   re.IGNORECASE)
@@ -131,6 +147,9 @@ FILE_VIEW = re.compile(r"^\s*(cat|head|tail|less|more|type|sed\s+-n|awk)\s+[^|;&
 
 
 def _approval_needed(s: Session, name: str, args: dict) -> bool:
+    """Определяет, требуется ли подтверждение пользователя для выполнения команды. Возвращает True, если
+    команда должна быть подтверждена, иначе False.
+    """
     mode = s.settings.get("mode", "edits")
     if name == "git_commit":  # коммит/пуш — всегда с подтверждением, в любом режиме
         return True
@@ -144,6 +163,9 @@ def _approval_needed(s: Session, name: str, args: dict) -> bool:
 
 
 def _ui_args(name: str, args: dict) -> dict:
+    """Подготавливает аргументы для отображения в пользовательском интерфейсе: сокращает длинные строки,
+    заменяет содержимое write на подсчёт строк и обрезает большие поля old/new.
+    """
     a = dict(args)
     if name == "write" and isinstance(a.get("content"), str):
         a["content"] = f"<{a['content'].count(chr(10)) + 1} строк>"
@@ -177,11 +199,20 @@ def _estimate_tokens(s: Session) -> int:
 _REQ = re.compile(r"^\s*(?:\d+[.)]|[-*•])\s+(.{8,})$", re.M)
 
 
-def requirements(text: str) -> list[str]:
-    """Нумерованные/маркированные пункты запроса пользователя (для сверки результата)."""
+def requirements(text: str, root: Path | None = None) -> list[str]:
+    """
+    Нумерованные/маркированные пункты запроса пользователя (для сверки результата). В проекте-документах
+    (root) пункт «реши задачи из task.pdf» раскрывается в подпункты — по одному на задачу.
+    """
     if not isinstance(text, str) or text.startswith("[Сводка"):
         return []
-    return [m.group(1).strip()[:300] for m in _REQ.finditer(text.split("\n\n<file ")[0])][:12]
+    reqs = [m.group(1).strip()[:300] for m in _REQ.finditer(text.split("\n\n<file ")[0])][:12]
+    if root is None or len(reqs) < 2 or not documents.docs_project(root):
+        return reqs
+    out = []
+    for r in reqs:
+        out.extend(documents.problem_items(root, r) or [r])
+    return out[:24]
 
 
 _FACT = re.compile(r"\d{4}-\d{2}-\d{2}[T ]\d{2}(?::\d{2})?|\d{1,3}(?:\.\d{1,3}){3}|\d{2}:\d{2}|\d{3,}")
@@ -457,10 +488,27 @@ def focus_message(root: Path, reqs: list[str], k: int, first: bool = False) -> s
     Маленькая модель не удерживает несколько крупных требований сразу и не знает, где их
     код, — поэтому harness выдаёт их по одному и сразу показывает, куда смотреть.
     """
-    rel = entities.related(root, reqs[k], 12)
-    dups = entities.duplicates(root, 12) if entities.DUP_WORDS.search(reqs[k]) else []
     head =(f"[Работа по пунктам] В запросе {len(reqs)} пунктов — выполняй их по очереди, по одному. "
             if first else "[Следующий пункт] ")
+    if documents.docs_project(root):  # задания, материалы, ответы — не код
+        m = re.match(r"Задача \S+ из (\S+)", reqs[k])
+        if m:  # подпункт-задача: её текст уже в пункте, рядом — подходящие места материалов
+            ex = documents.related_excerpts(root, reqs[k], {m.group(1)})
+            return (head + f"Сейчас пункт {k + 1} из {len(reqs)}: {reqs[k]}\n"
+                    "Реши ТОЛЬКО эту задачу, все её подпункты. Обозначения и приёмы бери из материалов (ниже "
+                    "найденные места; при нужде — grep по терминам). Рассуждай коротко, по подпунктам. Каждый "
+                    "ответ проверь на конкретном примере или подстановкой. Затем напиши итог задачи текстом: "
+                    "ответ + 1-3 строки обоснования на подпункт (в форме, которую просит запрос), формулы в "
+                    "Unicode. Файл результата пока не трогай — сначала проверка."
+                    + ("\nМеста из материалов:\n" + "\n\n".join(ex) if ex else ""))
+        return (head + f"Сейчас пункт {k + 1}: {reqs[k]}\n"
+                "В проекте нет кода — это документы. read и grep работают с .pdf/.docx (текст, страницы "
+                "«=== стр. N ===»), write в .docx делает документ Word из Markdown. Не пиши скрипты-парсеры "
+                "и не проси прислать текст — прочитай сам. Нужные места материалов ищи через grep (по "
+                "терминам из задания, ignore_case), читай только найденные фрагменты (offset/limit). "
+                "Результат пункта (выводы, решения) пиши в ответе подробно — следующие пункты опираются на него.")
+    rel = entities.related(root, reqs[k], 12)
+    dups = entities.duplicates(root, 12) if entities.DUP_WORDS.search(reqs[k]) else []
     return (head + f"Сейчас пункт {k + 1}: {reqs[k]}\n"
             "Порядок: изучи связанный код (read с symbol=) и как он используется (grep) → реши, что "
             "конкретно меняешь в СУЩЕСТВУЮЩЕМ коде → plan с файлами и функциями → правки по шагам с "
@@ -507,11 +555,17 @@ def expand_mentions(root: Path, text: str, s: Session) -> str:
 
 
 class Agent:
+    """Класс, управляющий взаимодействием с LLM. Содержит методы run_turn и _loop, которые обрабатывают
+    пользовательские запросы, управляют состоянием сессии, выполняют инструменты и обрабатывают ошибки.
+    """
     def __init__(self, llm: LLM):
         self.llm = llm
 
     # ------------------------------------------------------------------ ход
     async def run_turn(self, s: Session, text: str) -> None:
+        """Обрабатывает один ход сессии: обновляет состояние, формирует запрос к LLM, управляет планированием
+        и ошибками, сохраняет историю.
+        """
         s.running = True
         s.push_meta()
         try:
@@ -526,7 +580,7 @@ class Agent:
             s.checkpoints.append(checkpoint)
             s.add({"type": "user", "text": text, "turn": s.turn, "msg_index": len(s.messages)})
             content = expand_mentions(root, text, s)
-            reqs = requirements(text)
+            reqs = await asyncio.to_thread(requirements, text, root)
             if len(reqs) >= 2:  # новое многопунктное задание: ведём модель по пунктам по очереди
                 s.focus, s.decisions = 0, {}
                 content += "\n\n" + await asyncio.to_thread(focus_message, root, reqs, 0, True)
@@ -543,6 +597,7 @@ class Agent:
         except Exception as e:  # не роняем сервер из-за одной сессии
             s.add({"type": "notice", "level": "error", "text": f"Внутренняя ошибка: {e!r}"})
         finally:
+            # Отменяем все ожидающие задачи после завершения
             for f in s.pending.values():
                 f.cancel()
             s.pending.clear()
@@ -562,6 +617,9 @@ class Agent:
             s.push_meta()
 
     async def _loop(self, s: Session, ctx: ToolContext) -> None:
+        """Выполняет итерационный цикл работы агента: обрабатывает ответы LLM, проверяет синтаксис/импорт,
+        корректирует ошибки, управляет планом и нуджами.
+        """
         last_call = None
         nudged = False
         fixes = 0
@@ -580,13 +638,26 @@ class Agent:
         # незакрытый план прошлого хода («продолжай») остаётся в силе — заново не требуем
         carried = any(x["status"] in ("todo", "doing") for x in s.plan)
         st = {"planned": carried, "plan_rejects": 0, "plan_item": None, "since_plan": 0, "tools_used": 0,
-              "edits": 0, "reqs": requirements(task), "decide_rejects": 0}
+              "edits": 0, "reqs": await asyncio.to_thread(requirements, task, ctx.root), "decide_rejects": 0,
+              "docs": await asyncio.to_thread(documents.docs_project, ctx.root),
+              "small": await asyncio.to_thread(small_project, ctx.root)}
+        launch_runs, launch_sig = 0, None
         focus_edits, item_pushed = 0, False  # правок к началу текущего пункта; было ли дожатие пункта
         for _ in range(config.MAX_STEPS):
             if _estimate_tokens(s) > config.COMPACT_AT * config.CONTEXT:
                 await self.compact(s)
             comp = await self._call(s)
             if not comp.tool_calls:
+                if comp.finish_reason == "length" and st.get("cut_nudges", 0) < 3:
+                    # рассуждение съело весь лимит ответа: результата пункта нет — пункт не закрываем
+                    st["cut_nudges"] = st.get("cut_nudges", 0) + 1
+                    s.add({"type": "notice", "level": "warn",
+                           "text": "Ответ оборван по лимиту токенов — агент продолжает короче."})
+                    s.messages.append({"role": "user", "content": (
+                        "Ответ оборвался: рассуждение заняло весь лимит. Рассуждай короче и по частям: сделай "
+                        "одну часть текущего пункта (один подпункт), сразу напиши её результат текстом, затем "
+                        "следующую. Не перебирай варианты в уме — проверяй коротко.")})
+                    continue
                 if not comp.content.strip():
                     if comp.finish_reason == "length":
                         s.add({"type": "notice", "level": "warn",
@@ -728,6 +799,25 @@ class Agent:
                               "отсекает всё; сохрани прежнее поведение как запасной вариант), исправь код, а "
                               "не тесты, и прогони тесты снова.")})
                         continue
+                # GUI-приложение/игра: harness сам запускает его — модель «проверяет» run, который
+                # висит до таймаута или выходит сразу, и отчитывается о неработающей программе
+                entry = await asyncio.to_thread(gui_entry, ctx.root) if originals else None
+                if entry and launch_runs < 3 and sig != launch_sig:
+                    launch_sig = sig
+                    res = await asyncio.to_thread(t_launch, ctx, entry, 8)
+                    st["shots"] = res.shots or st.get("shots", [])
+                    if not res.ok:
+                        launch_runs += 1
+                        s.add({"type": "notice", "level": "warn",
+                               "text": f"Автопроверка: `{entry}` — приложение не работает:\n{res.output[:1500]}"})
+                        s.messages.append({"role": "user", "content": (
+                            f"Автопроверка: harness запустил приложение (`{entry}`, 8 с):\n{res.output}\n"
+                            "Программа должна открыть окно и работать без ошибок. Исправь причину (смотри traceback; "
+                            "нет окна — не создаётся окно или не запущен главный цикл в точке входа), затем проверь "
+                            f"сам: launch command=\"{entry}\".")})
+                        continue
+                    s.add({"type": "notice", "level": "info",
+                           "text": f"Автопроверка: `{entry}` запускается, окно открывается."})
                 # тесты проекта исчезли (файл переписан целиком) — «тесты проходят», потому что их меньше
                 gone = await asyncio.to_thread(removed_tests, ctx.root, originals)
                 if gone and removed_nudges < 2:
@@ -785,8 +875,60 @@ class Agent:
                           "через plan), затем проверь всё вместе и дай итоговый ответ.")})
                     continue
                 # сверка итога с пунктами запроса: маленькая модель отчитывается о части как о целом
-                reqs = requirements(task)
-                if len(reqs) >= 2 and st["edits"] == focus_edits and not item_pushed and not reviewed:
+                reqs = st["reqs"]
+                item = reqs[s.focus] if 0 <= s.focus < len(reqs) else ""
+                out = documents.output_file(reqs) if st["docs"] else ""
+                if st["docs"] and re.match(r"Задача \S+ из ", item) and not st.get(f"checked{s.focus}"):
+                    # задача решена «на глаз»: сверка с независимыми решениями и проверка по определениям
+                    # ловят грубые ошибки
+                    st[f"checked{s.focus}"] = True
+                    s.add({"type": "notice", "level": "info", "text": f"Проверка решения пункта {s.focus + 1}."})
+                    others = await self._independent(s, ctx.root, item)
+                    s.messages.append({"role": "user", "content": (
+                        ("Независимые решения этой же задачи (решены отдельно, без твоего ответа; тоже могут "
+                         "ошибаться):\n" + "\n\n".join(f"[{n}] {o}" for n, o in enumerate(others, 1))
+                         + "\nСравни ответы по каждому подпункту. Где они расходятся с твоим — выясни, кто прав, "
+                           "проверкой скриптом или по определению; большинство не довод.\n\n" if others else "") +
+                        "Проверь своё решение этой задачи по пунктам, как строгий проверяющий: выпиши определения "
+                        "и условия из задачи и проверь КАЖДОЕ на конкретных объектах из задачи, а не «аналогично». "
+                        "Сверь буквы подпунктов с условием: ответ a) — на вопрос a) из условия. Всё, что можно "
+                        "посчитать или перебрать, проверь коротким скриптом: run с `python -c \"...\"` — результат "
+                        "скрипта важнее рассуждения. Найдёшь ошибку — исправь. Затем "
+                        + (f"допиши в {out} краткое решение этой задачи: edit path={out} с пустым old, new — "
+                           "Markdown: «## Задача N», по каждому подпункту ответ и 1-3 строки обоснования; формулы "
+                           "в Unicode." if out else "напиши исправленное краткое решение."))})
+                    continue
+                issues = (documents.doc_issues(resolve(ctx.root, out)) if out and st["edits"] > focus_edits
+                          else [])
+                if issues and st.get("doc_nudges", 0) < 2:
+                    st["doc_nudges"] = st.get("doc_nudges", 0) + 1
+                    s.add({"type": "notice", "level": "warn", "text": f"В {out}: " + "; ".join(issues)})
+                    s.messages.append({"role": "user", "content": (
+                        f"Проверка {out}: " + "; ".join(issues) + ". Прочитай документ (read) и исправь.")})
+                    continue
+                if (st["docs"] and out and re.match(r"Задача \S+ из ", item) and st["edits"] == focus_edits
+                        and not item_pushed):
+                    item_pushed = True
+                    s.messages.append({"role": "user", "content": (
+                        f"Решение задачи ещё не записано в {out}. Допиши его: edit path={out}, old пустой, new — "
+                        "Markdown «## Задача N» с кратким решением по подпунктам.")})
+                    continue
+                if (len(reqs) >= 2 and st["docs"] and st["edits"] == focus_edits and not item_pushed
+                        and not reviewed and (ASK_USER.search(comp.content) or REFUSAL.search(comp.content)
+                                              or SAVE_ITEM.search(item))):
+                    # документы: пункт «изучить/решить» без правок — нормально; а вот «пришлите текст»,
+                    # «не могу прочитать PDF» или несохранённый результат — нет
+                    item_pushed = True
+                    s.add({"type": "notice", "level": "warn",
+                           "text": f"Пункт {s.focus + 1} не выполнен — агент возвращается к нему."})
+                    s.messages.append({"role": "user", "content": (
+                        f"Пункт {s.focus + 1} не выполнен: {item}\nНе проси прислать текст и не откладывай: "
+                        "read читает .pdf/.docx, grep ищет внутри них, write в .docx создаёт документ Word из "
+                        "Markdown. Сделай пункт сам" + (" и сохрани результат в файл, указанный в пункте."
+                                                        if SAVE_ITEM.search(item) else "."))})
+                    continue
+                if (len(reqs) >= 2 and not st["docs"] and st["edits"] == focus_edits and not item_pushed
+                        and not reviewed):
                     # пункт закрыт без единой правки («слишком обширно», «не требует изменений, но можно
                     # было бы…») — один раз просим минимальный рабочий вариант; если модель и после этого
                     # обоснует, что правки не нужны, — принимаем
@@ -804,13 +946,14 @@ class Agent:
                     # пункт отработан — выдаём следующий со связанным кодом
                     s.focus += 1
                     focus_edits, item_pushed = st["edits"], False
+                    st["cut_nudges"] = 0
                     s.add({"type": "notice", "level": "info",
                            "text": f"Переход к пункту {s.focus + 1} из {len(reqs)}."})
                     s.messages.append({"role": "user", "content": await asyncio.to_thread(
                         focus_message, ctx.root, reqs, s.focus)})
                     continue
                 if (reviewed and not pushed and st["edits"] == reviewed_at
-                        and UNDONE.search(comp.content)):
+                        and (UNDONE.search(comp.content) or st.get("unseen"))):
                     # сверка показала несделанное, а модель просто отчиталась — один раз отправляем доделывать
                     pushed = True
                     s.add({"type": "notice", "level": "warn",
@@ -822,7 +965,11 @@ class Agent:
                         if rel:
                             hints.append(f"Пункт {n} — связанный код:\n" + "\n".join(rel))
                     s.messages.append({"role": "user", "content": (
-                        "Ты сам отметил несделанное. Начни с первого несделанного пункта: прочитай связанный "
+                        (f"На реальном скриншоте приложения не видно запрошенного: {st['unseen']}. Отчёт «сделано» "
+                         "по коду не считается — найди, почему этого нет на экране (камера, позиция, размер, цвет, "
+                         "не вызывается update/создание; как это принято в библиотеке — смотри libdoc), исправь и проверь через launch с look.\n\n"
+                         if st.get("unseen") else "")
+                        + "Ты сам отметил несделанное. Начни с первого несделанного пункта: прочитай связанный "
                         "код (read с symbol=), составь plan этой части с конкретными файлами и функциями и "
                         "выполни его по шагам с проверкой. Если пункт правда невыполним без решения "
                         "пользователя — объясни, какое решение нужно, и закончи."
@@ -830,9 +977,26 @@ class Agent:
                     continue
                 if reqs and originals and not reviewed:
                     reviewed, reviewed_at = True, st["edits"]
+                    seen_text = ""
+                    if st.get("shots"):  # что на самом деле на экране — модель склонна отчитываться о намерениях
+                        seen_text = await self._look(s, st["shots"][-1:], (
+                            "Это скриншот только что запущенного приложения. Опиши кратко и по фактам, что на "
+                            "экране: какие элементы, надписи, фигуры, цвета. Ничего не додумывай.\n"
+                            "Затем сверь кадр с пунктами запроса пользователя:\n"
+                            + "\n".join(f"{n}. {r[:400]}" for n, r in enumerate(reqs, 1))
+                            + "\nДля каждого видимого объекта или элемента интерфейса, который требуют пункты "
+                              "(персонаж, враги, мир, полоски, меню, надписи), напиши строку «ВИДНО: ...» или "
+                              "«НЕ ВИДНО: ...». То, что нельзя проверить по одному кадру (поведение во времени, "
+                              "звук), пропусти."))
+                        missing = re.findall(r"НЕ\s+ВИДНО:?\s*(.+)", seen_text, re.IGNORECASE)
+                        st["unseen"] = "; ".join(m.strip()[:120] for m in missing[:8])
                     s.add({"type": "notice", "level": "info", "text": "Сверка результата с пунктами запроса."})
                     s.messages.append({"role": "user", "content": (
-                        "Перед завершением сверь сделанное с КАЖДЫМ пунктом запроса:\n"
+                        (f"Так выглядит приложение сейчас (описание скриншота после запуска):\n{seen_text}\n\n"
+                         if seen_text else "")
+                        + (f"ВНИМАНИЕ: на экране нет запрошенного ({st['unseen']}) — такие пункты НЕ сделаны, "
+                           "пока это не появится на скриншоте.\n\n" if st.get("unseen") else "")
+                        + "Перед завершением сверь сделанное с КАЖДЫМ пунктом запроса:\n"
                         + "\n".join(f"{n}. {r}" for n, r in enumerate(reqs, 1))
                         + ("\nЗафиксированные решения (перечисли их и в итоговом ответе — пользователь должен "
                            "их проверить):\n" + "\n".join(
@@ -886,7 +1050,11 @@ class Agent:
             await asyncio.sleep(config.BUSY_POLL)
 
     async def _call(self, s: Session, retry_overflow: bool = True, recover: int = 0,
-                    hint: str = "") -> Completion:
+                    hint: str = "", sampling: dict | None = None) -> Completion:
+        """Асинхронный метод, выполняющий запрос к LLM, обрабатывающий поток ответов (reasoning, text, done),
+        реализует повторные попытки при ошибках контекста, форматирования инструментов и временной
+        недоступности модели, обновляет сессию и метаданные, возвращает объект Completion.
+        """
         est = _estimate_tokens(s)
         max_tokens = max(512, min(config.MAX_TOKENS, config.CONTEXT - est - 256))
         r_i = t_i = None
@@ -894,7 +1062,7 @@ class Agent:
         try:
             async for kind, val in self.llm.stream(
                     build_request(s) + ([{"role": "user", "content": hint}] if hint else []),
-                    TOOLS, max_tokens=max_tokens, **config.SAMPLING,
+                    TOOLS, max_tokens=max_tokens, **{**config.SAMPLING, **(sampling or {})},
                     reasoning_effort=s.settings.get("effort", config.REASONING),
                     chat_template_kwargs={"reasoning_effort": s.settings.get("effort", config.REASONING)}):
                 if kind == "reasoning":
@@ -924,8 +1092,13 @@ class Agent:
                 # другая: одинаковый контекст снова даёт тот же сбой, и ход обрывался после 5 повторов
                 s.add({"type": "notice", "level": "warn",
                        "text": "Вызов инструмента в неверном формате — повторяю шаг с подсказкой."})
-                return await self._call(s, retry_overflow, recover + 1,
-                                        hint=TOOL_FORMAT_HINT + FORMAT_VARIANTS[recover % len(FORMAT_VARIANTS)])
+                # длинный write/edit почти всегда обрывается на лимите ответа: тот же вызов снова не пройдёт
+                long_call = len(str(e)) > 1500 or re.search(r'\\?"(content|new)\\?"\s*:', str(e))
+                if LOOPED.search(str(e)):  # вырожденный повтор: тот же контекст и температура снова зациклятся
+                    return await self._call(s, retry_overflow, recover + 1, hint=TOOL_FORMAT_HINT + LOOP_HINT,
+                                            sampling={"temperature": 0.8, "repeat_penalty": 1.15})
+                return await self._call(s, retry_overflow, recover + 1, hint=TOOL_FORMAT_HINT + (
+                    LONG_CALL_HINT if long_call else FORMAT_VARIANTS[recover % len(FORMAT_VARIANTS)]))
             if e.transient and recover < config.RECOVER_TRIES:
                 # модель занята/переключается/упала: ждём освобождения GPU и повторяем шаг
                 s.add({"type": "notice", "level": "warn",
@@ -950,6 +1123,9 @@ class Agent:
     # ------------------------------------------------------------- инструмент
     async def _tool(self, s: Session, ctx: ToolContext, call_id: str, name: str, raw: str,
                     st: dict | None = None) -> ToolResult:
+        """Асинхронный обработчик вызовов инструментов: парсит JSON‑аргументы, проверяет корректность,
+        управляет файлами и планом, выдаёт ошибки и результаты в виде ToolResult.
+        """
         st = st if st is not None else {"planned": True, "plan_rejects": 99, "plan_item": None}
         try:
             args = json.loads(raw or "{}")
@@ -961,9 +1137,43 @@ class Agent:
             return ToolResult(f"Ошибка: аргументы не являются корректным JSON ({e}). Повтори вызов.", ok=False)
         if name == "plan":
             return self._plan(s, args, st)
+        out = documents.output_file(st.get("reqs") or []) if st.get("docs") else ""
+        if out and name in MUTATING and str(args.get("path", "")).replace("\\", "/").strip("./") != out:
+            try:
+                new_file = not resolve(ctx.root, str(args.get("path", ""))).exists()
+            except WorkspaceError:
+                new_file = False
+            if new_file:  # черновики и «тестовые» файлы засоряют папку пользователя
+                s.add({"type": "tool", "id": call_id, "name": name, "args": _ui_args(name, args),
+                       "status": "error", "output": f"Новые файлы — только {out}."})
+                return ToolResult(f"Не выполнено: в этой папке создаётся только файл результата {out}. "
+                                  "Проверки и эксперименты — через run (python -c \"…\"), без файлов.", ok=False)
+        reqs_now = st.get("reqs") or []
+        cur = reqs_now[s.focus] if 0 <= s.focus < len(reqs_now) else ""
+        why = ""
+        if out and name in MUTATING and str(args.get("path", "")).replace("\\", "/").strip("./") == out:
+            prob = re.match(r"Задача (\S+) из ", cur)
+            text = str(args.get("content", "")) + str(args.get("new", ""))
+            others = {h for h in re.findall(r"(?im)^#{1,3}\s*Задач\w*\s*№?\s*(\d+)", text)} - {prob.group(1) if prob else ""}
+            if any(re.match(r"Задача \S+ из ", r) for r in reqs_now[s.focus + 1:]) and not prob \
+                    and not any(re.match(r"Задача \S+ из ", r) for r in reqs_now[:s.focus]):
+                why = f"{out} заполняется по ходу решения задач — их выдадут по одной следующими пунктами"
+            elif prob and not st.get(f"checked{s.focus}"):
+                why = f"сначала закончи решение задачи {prob.group(1)} текстом — после проверки его допишешь в {out}"
+            elif prob and others:
+                why = (f"сейчас пункт — задача {prob.group(1)}; разделы задач {', '.join(sorted(others))} допишешь, "
+                       "когда до них дойдёт очередь (с проверкой)")
+        if why:
+            # решения «оптом» без проверки потом дублируются и остаются с ошибками
+            s.add({"type": "tool", "id": call_id, "name": name, "args": _ui_args(name, args),
+                   "status": "error", "output": "Файл результата — по одной задаче."})
+            return ToolResult(f"Не выполнено: {why}.", ok=False)
+        if name == "decide" and st.get("docs"):
+            return ToolResult("decide нужен только для правок кода — здесь документы. Продолжай по плану.")
         if name == "decide":
             return await asyncio.to_thread(self._decide, s, ctx, args, st)
         if (name in MUTATING and len(st.get("reqs", [])) >= 2 and str(s.focus) not in s.decisions
+                and not st.get("docs") and not st.get("small")
                 and st.get("decide_rejects", 0) < (4 if INVESTIGATE.search((st.get("reqs") or [""])[min(s.focus, len(st.get("reqs") or [""]) - 1)]) else 2)):
             # проектные пункты маленькая модель решает наугад: сначала — решение, привязанное к коду
             st["decide_rejects"] = st.get("decide_rejects", 0) + 1
@@ -992,7 +1202,8 @@ class Agent:
                               "и поиск по сущностям), read (с symbol= или offset/limit), grep. Они доступны "
                               "и до составления плана.", ok=False)
         command = args.get("command", "")
-        needs_plan = not st["planned"] and (name in MUTATING or (
+        # документы (не код): заглушек нет, а план для «дописать решение в result.docx» только мешает
+        needs_plan = not st["planned"] and not st.get("docs") and (name in MUTATING or (
             name == "run" and not SAFE_CMD.match(command) and not PRE_PLAN_CMD.match(command)))
         if needs_plan and st["plan_rejects"] >= 2:
             # модель упорно не вызывает plan (после закрытого плана прошлого хода — часто): заводим
@@ -1049,6 +1260,22 @@ class Agent:
                 s.settings.setdefault("always", []).append(name)
             s.set(i, status="running")
         result = await execute(ctx, name, args)
+        if name == "launch" and result.shots:
+            st["shots"] = result.shots
+            import hashlib
+            key = hashlib.md5(b"".join(Path(x["path"]).read_bytes() for x in result.shots
+                                       if Path(x["path"]).is_file())).hexdigest()
+            looks = st.setdefault("looks", {})
+            if str(args.get("look", "")).strip() and key in looks:
+                result.output += f"\nЗрение: кадры те же, что в прошлый раз — {looks[key]}"
+            elif str(args.get("look", "")).strip() and len(looks) >= 1:
+                result.output += ("\n[Зрение: лимит описаний на ход исчерпан (переключение модели дорого). "
+                                  "Проверяй по выводу и по смыслу кода.]")
+            elif str(args.get("look", "")).strip():
+                seen = await self._look(s, result.shots, str(args["look"]))
+                looks[key] = seen
+                if seen:
+                    result.output += f"\nЗрение (описание скриншотов): {seen}"
         if result.ok and (name == "logstats"
                           or name == "run" and EVIDENCE_CMD.search(args.get("command", ""))
                           or name in ("read", "grep") and EVIDENCE_PATH.search(str(args.get("path", "")))):
@@ -1069,8 +1296,71 @@ class Agent:
                                   "следующий doing; делай по одному шагу с проверкой.]")
         out = result.output
         ui_out = out if len(out) <= UI_OUTPUT else out[:UI_OUTPUT] + "\n…"
-        s.set(i, status="ok" if result.ok else "error", output=ui_out, diff=result.diff, path=result.path)
+        s.set(i, status="ok" if result.ok else "error", output=ui_out, diff=result.diff, path=result.path,
+              **({"shots": [Path(x["path"]).name for x in result.shots]} if result.shots else {}))
         return result
+
+    async def _look(self, s: Session, shots: list[dict], question: str) -> str:
+        """
+        Описание скриншотов моделью со зрением (VISION_MODEL). Переключение модели в AI Manager
+        стоит времени и KV-кэша основной модели — вызывается только по look или раз при сверке.
+        """
+        from PIL import Image
+        import io
+        content = [{"type": "text", "text": question.strip()[:1000] + "\nОтвечай по-русски, кратко (до 120 слов)."}]
+        for sh in [x for x in shots if not x.get("blank")][-3:]:
+            try:
+                with Image.open(sh["path"]) as img:
+                    img = img.convert("RGB")
+                    img.thumbnail((768, 768))
+                    buf = io.BytesIO()
+                    img.save(buf, "PNG")
+            except OSError:
+                continue
+            content.append({"type": "text", "text": f"Скриншот ({sh.get('label', '')}):"})
+            content.append({"type": "image_url", "image_url": {
+                "url": "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()}})
+        if len(content) == 1:
+            return "все скриншоты однотонные — на экране ничего не нарисовано"
+        s.add({"type": "notice", "level": "info", "text": f"Зрение ({config.VISION_MODEL}): смотрю скриншоты."})
+        try:
+            comp = await self.llm.complete([{"role": "user", "content": content}], model=config.VISION_MODEL,
+                                           max_tokens=1500, temperature=0.2,
+                                           chat_template_kwargs={"enable_thinking": False})
+        except (LLMError, OSError) as e:
+            s.add({"type": "notice", "level": "warn", "text": f"Зрение недоступно: {str(e)[:200]}"})
+            return ""
+        text = comp.content.strip()[:1500]
+        if text:
+            s.add({"type": "notice", "level": "info", "text": "Зрение: " + text})
+        return text
+
+    async def _independent(self, s: Session, root: Path, item: str, n: int = 2) -> list[str]:
+        """
+        Ещё n решений задачи в коротком отдельном контексте (условие + места материалов, без истории).
+        Маленькая модель от прогона к прогону ошибается в разных местах: расхождение независимых
+        ответов показывает, где проверять, лучше, чем самопроверка в том же контексте.
+        """
+        m = re.match(r"Задача \S+ из (\S+)", item)
+        ex = await asyncio.to_thread(documents.related_excerpts, root, item, {m.group(1)} if m else set())
+        msgs = [{"role": "system", "content": "Ты решаешь задачу. Рассуждай аккуратно, проверяй каждый шаг на "
+                                              "конкретном примере. Ответ: по каждому подпункту итог и 1-3 строки "
+                                              "обоснования, формулы в Unicode."},
+                {"role": "user", "content": item + ("\n\nИз материалов курса:\n" + "\n\n".join(ex) if ex else "")}]
+        out = []
+        for _ in range(n):
+            try:
+                comp = await self.llm.complete(msgs, max_tokens=min(config.MAX_TOKENS, 12000),
+                                               temperature=0.7, reasoning_effort="medium",
+                                               chat_template_kwargs={"reasoning_effort": "medium"})
+            except (LLMError, OSError) as e:
+                s.add({"type": "notice", "level": "warn", "text": f"Независимое решение не получено: {str(e)[:150]}"})
+                continue
+            if comp.content.strip():
+                out.append(comp.content.strip()[:3000])
+        if out:
+            s.add({"type": "notice", "level": "info", "text": f"Получено независимых решений: {len(out)}."})
+        return out
 
     def _decide(self, s: Session, ctx: ToolContext, args: dict, st: dict) -> ToolResult:
         """Решение по текущему пункту: конкретное правило, на чём строится, что без данных."""
@@ -1207,6 +1497,9 @@ class Agent:
         return ToolResult(f"Решение по пункту {s.focus + 1} принято. Теперь plan и правки по нему.")
 
     def _plan(self, s: Session, args: dict, st: dict) -> ToolResult:
+        """Обновляет и нормализует план действий: принимает список шагов, обновляет статус существующего
+        плана, сохраняет его в сессии и возвращает визуальное представление с подсказкой о текущем шаге.
+        """
         raw = args.get("steps")
         if isinstance(raw, list) and len(raw) == 1 and s.plan:
             # модель часто шлёт только обновлённый шаг, а не весь список: обновляем его статус в плане
@@ -1234,6 +1527,11 @@ class Agent:
 
     # ----------------------------------------------------------------- сжатие
     async def compact(self, s: Session, manual: bool = False) -> None:
+        """Асинхронный метод сжимает контекст сессии, оставляя только ключевые сообщения. Если в сессии менее
+        двух сообщений, ничего не делается (при ручном вызове выводится уведомление). Сжимает, используя
+        LLM, либо формирует резервный резюме. После сжатия обновляет сообщения, метаданные и сохраняет
+        сессию.
+        """
         if len(s.messages) < 2:
             if manual:
                 s.add({"type": "notice", "level": "info", "text": "Нечего сжимать."})
@@ -1281,6 +1579,8 @@ def rewind(s: Session, turn: int) -> list[str]:
             p = resolve(root, rel)
             if text is None:
                 p.unlink(missing_ok=True)
+            elif text.startswith(documents.BINARY_MARK):  # .docx до правки — байты в base64
+                p.write_bytes(base64.b64decode(text[len(documents.BINARY_MARK):]))
             else:
                 p.parent.mkdir(parents=True, exist_ok=True)
                 p.write_bytes(text.encode("utf-8"))

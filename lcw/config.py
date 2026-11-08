@@ -11,6 +11,9 @@ load_dotenv(ROOT / ".env")
 
 
 def _int(name: str, default: int) -> int:
+    """Функция преобразует значение переменной окружения в целое число, возвращая значение по умолчанию при
+    ошибке.
+    """
     try:
         return int(os.getenv(name, default))
     except ValueError:
@@ -27,6 +30,8 @@ AIM_URL = os.getenv("AIM_URL", "http://127.0.0.1:8000").rstrip("/")
 AIM_PASSWORD = os.getenv("AIM_PASSWORD", "")
 MODEL = os.getenv("LCW_MODEL", "gpt-oss-20b")
 # Имя проекта в очереди задач AI Manager (заголовок X-Project: история /api/jobs, статистика)
+# Модель со «зрением» (mmproj): описывает скриншоты GUI-приложений, которые запускает launch
+VISION_MODEL = os.getenv("LCW_VISION_MODEL", "qwen36-35b-a3b")
 AIM_PROJECT = os.getenv("LCW_AIM_PROJECT", "local_code_worker")
 # Размер контекста модели (должен совпадать с "context" в реестре AI Manager)
 CONTEXT = _int("LCW_CONTEXT", 100000)

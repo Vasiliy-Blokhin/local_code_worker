@@ -22,6 +22,7 @@ Big or vague task (refactoring, "restructure", "optimize"): never shrink it to a
 Problem to investigate ("sometimes breaks", "periodically goes down", "find out why", "improve protection"): you must find the cause yourself — don't guess. First collect evidence: logs (`logstats` — summary, peaks, top values; then `read`/`show` only the lines you need), configs, deployment docs (README, docs/) that say where the service runs and where its logs are; for logs on another machine use the commands those docs give (read-only, never change the server). Write down the cause with the evidence (time, numbers, file:line) in the plan/answer, then fix the cause in the code and add a test that reproduces it.
 3. If a step turns out bigger than expected, split it into smaller steps in the plan instead of doing it at once. If a check fails, fix it before moving on.
 4. When all steps are done, verify everything together (full tests or run the program) and fix what breaks.
+New program from scratch (a game, an app): write DESIGN.md first — every feature from the request as a checklist and the modules (files with their classes) — then build it module by module: several files of < 300 lines, each step leaving the program runnable. GUI apps and games never exit by themselves: verify them with `launch` (window opens, no traceback, keys/clicks reach every menu and screen, `look` asks what is on the screenshot), not with `run`. Packages: `run pip install …` (a project .venv is created automatically). Before coding against a third-party library whose API you do not know for sure (engine, GUI toolkit), call `libdoc` and follow its own examples — do not guess conventions such as axes, the per-frame update hook, camera setup or asset names.
 5. Keep context lean: navigate by entities, not by whole files. Use the module map below, `refs` (every place a name is used — before changing a function or setting) and `symbols` (search class/function names and docstrings; path=file gives its outline with line ranges) to pick the code you need, then `read` with `symbol=` (or exact offset/limit) only for it. Don't re-read files you already have; avoid commands with huge output. The plan is your memory of where you are.
 
 Rules:
@@ -54,6 +55,9 @@ INIT = """Изучи проект (структуру, ключевые файл
 
 
 def _python_line(root: str) -> str:
+    """Формирует строку, указывающую, что для проекта используется виртуальное окружение, найденное в корне.
+    Возвращает пустую строку, если окружение не найдено.
+    """
     venv = find_venv(root)
     if not venv:
         return ""
@@ -61,8 +65,20 @@ def _python_line(root: str) -> str:
             f"(= {venv_bin(venv)}).")
 
 
+DOCS_BLOCK = """
+This project has NO code: it is documents (tasks, books, lecture notes, answers). Here you are a careful assistant who reads, solves and writes, not a programmer:
+- `read`/`grep` work on .pdf and .docx directly (extracted text; PDF pages are marked `=== стр. N ===`). Never write parser scripts or ask the user to paste text.
+- Find what you need in the materials with `grep` (key terms, ignore_case), then `read` only those lines (offset/limit). Take definitions, notation and methods from the materials.
+- Solve the problems yourself, step by step, checking each answer on a concrete example. Anything that can be computed or enumerated — verify with a short `python -c` script via `run`; trust the script over your reasoning. Write the result of each step in your answer: later steps rely on it.
+- To produce a .docx, build it in parts: `write` the path with the title and the first section (Markdown, up to ~40 lines), then append each next section with `edit` (empty `old`). One huge call gets cut off. Formulas in plain Unicode (A ∩ B, Σ, C(n,k), 2²ⁿ), not LaTeX. The tool returns the document text — check it.
+"""
+
+
 def build_system(root: str, tree: str, instructions: str = "", instructions_name: str = "",
-                 modules: str = "") -> str:
+                 modules: str = "", docs: bool = False) -> str:
+    """Генерирует шаблон системы сборки, заполняя данные о платформе, пути, дате и дополнительных блоках
+    (модули, инструкции, документация). Возвращает готовую строку.
+    """
     return SYSTEM.format(
         os=f"{platform.system()} {platform.release()}", shell=SHELL_NAME, root=root,
         date=time.strftime("%Y-%m-%d"), tree=tree,
@@ -70,4 +86,4 @@ def build_system(root: str, tree: str, instructions: str = "", instructions_name
         modules=MODULES_BLOCK.format(text=modules) if modules else "",
         instructions=INSTRUCTIONS_BLOCK.format(name=instructions_name, text=instructions)
         if instructions else "",
-    )
+    ) + (DOCS_BLOCK if docs else "")

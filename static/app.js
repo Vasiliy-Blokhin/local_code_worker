@@ -164,6 +164,7 @@ function renderItem(i) {
       }
       if (it.name === "write" && it.status === "approve" && !it.diff) detail.push(`<pre>${esc(it.args.path)}: ${esc(it.args.content)}</pre>`);
       if (it.git) detail.push(gitCardHtml(it.git, esc));
+      if (it.shots) detail.push(`<div class="shots">${it.shots.map(n => `<a href="/api/shots/${encodeURIComponent(n)}" target="_blank"><img src="/api/shots/${encodeURIComponent(n)}" loading="lazy"></a>`).join("")}</div>`);
       if (it.diff) detail.push(diffHtml(it.diff));
       else if (it.output) detail.push(`<pre>${esc(it.output)}</pre>`);
       el.innerHTML = `<div class="head"><span class="name">${esc(it.name)}</span><span class="arg">${esc(toolSummary(it))}</span><span class="st ${it.status}">${ST[it.status] || it.status}</span></div>`

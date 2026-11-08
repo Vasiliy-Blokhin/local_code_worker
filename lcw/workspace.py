@@ -23,11 +23,13 @@ MAX_INDEX = 20000
 
 
 class WorkspaceError(Exception):
+    """Исключение, возникающее при ошибках работы с рабочим пространством."""
     pass
 
 
 # ---------------- реестр проектов ----------------
 def _load() -> list[dict]:
+    """Загружает список проектов из конфигурационного файла; при ошибке возвращает пустой список."""
     try:
         return json.loads(config.PROJECTS_FILE.read_text(encoding="utf-8"))
     except (OSError, ValueError):
@@ -43,6 +45,9 @@ def list_projects() -> list[dict]:
 
 
 def get_project(pid: str) -> dict:
+    """Возвращает словарь проекта по идентификатору, проверяя существование каталога; при отсутствии –
+    генерирует исключение.
+    """
     for p in _load():
         if p["id"] == pid:
             if not Path(p["path"]).is_dir():
@@ -52,6 +57,9 @@ def get_project(pid: str) -> dict:
 
 
 def add_project(path: str = "", git_url: str = "", branch: str = "") -> dict:
+    """Добавляет новый проект, клонируя репозиторий git при необходимости, проверяя путь и обновляя
+    конфигурацию; возвращает словарь проекта.
+    """
     if git_url:
         name = re.sub(r"\.git$", "", git_url.rstrip("/").rsplit("/", 1)[-1]) or "repo"
         target = config.WORKSPACES_DIR / name
@@ -173,6 +181,8 @@ def list_files(root: str | Path) -> list[str]:
 
 
 def is_text_file(path: Path) -> bool:
+    """Определяет, является ли файл текстовым, исключая бинарные расширения и проверяя наличие нулевых байтов.
+    """
     if path.suffix.lower() in BINARY_EXT:
         return False
     try:
@@ -216,9 +226,13 @@ def read_instructions(root: str | Path, max_chars: int = 4000) -> tuple[str, str
 
 
 def git_status(root: str | Path) -> dict:
+    """Возвращает статус git-репозитория: наличие git, текущую ветку и список изменений; при ошибке возвращает
+    минимальный словарь.
+    """
     if not is_git(root):
         return {"git": False}
     def g(*args):
+        """Вспомогательная функция для выполнения git-команд в заданном каталоге и возврата их вывода."""
         p = subprocess.run(["git", *args], cwd=root, capture_output=True, text=True,
                            encoding="utf-8", errors="replace", timeout=20)
         return p.stdout.strip()
@@ -230,6 +244,7 @@ def git_status(root: str | Path) -> dict:
 
 
 def export_zip(root: str | Path) -> bytes:
+    """Создаёт zip‑архив проекта, включая все файлы, и возвращает его содержимое в виде байтов."""
     buf = io.BytesIO()
     root = Path(root)
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
