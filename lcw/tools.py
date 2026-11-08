@@ -116,6 +116,22 @@ TOOLS = [
                  "it becomes a Word document. Big document: write the first section, then append each next "
                  "one with edit (empty old).",
         {"path": S, "content": S}, ["path", "content"]),
+    _fn("delete", "Delete a file of the project (it can be restored by rewind).", {"path": S}, ["path"]),
+    _fn("libdoc", "Real usage of an INSTALLED third-party library, read from its own files: example programs "
+                  "(the library's `__main__` demos), definitions with docstrings matching the query, and its "
+                  "built-in assets (textures, models, fonts). Use it before writing code with a library you are "
+                  "not sure about, and when the app runs but behaves or looks wrong.",
+        {"package": {**S, "description": "import name, e.g. ursina, pygame, arcade"},
+         "query": {**S, "description": "API words, e.g. 'camera look_at update held_keys'"}}, ["package"]),
+    _fn("launch", "Start a GUI/desktop app or game (e.g. `python main.py`), let it run, optionally press keys or "
+                  "click, take screenshots of its window, then stop it. Reports whether a window opened, crashes "
+                  "(traceback) and what is on screen. Use it to verify apps that `run` cannot (they never exit).",
+        {"command": S, "seconds": {**I, "description": "how long to run before stopping, default 6"},
+         "steps": {"type": "array", "items": S, "description": "after the window opens, in order: key names "
+                   "(enter, esc, space, up, down, left, right, a..z, 1..9, f1..f12), 'wait:1.5', 'click:X,Y' "
+                   "(window coords), 'shot' (screenshot now)"},
+         "look": {**S, "description": "question about the screenshots for a vision model, e.g. 'is a menu with "
+                  "buttons visible?'"}}, ["command"]),
     _fn("run", f"Run a shell command ({SHELL_NAME}) in the project root: tests, linters, git, "
                f"installs. Non-interactive only. Timeout {config.COMMAND_TIMEOUT}s.",
         {"command": S, "timeout": {**I, "description": "seconds"}}, ["command"]),
@@ -129,7 +145,7 @@ TOOLS = [
         ["message", "summary", "tests"]),
 ]
 TOOL_NAMES = {t["function"]["name"] for t in TOOLS}
-MUTATING = {"edit", "write"}
+MUTATING = {"edit", "write", "delete"}
 ICONS = {"todo": "[ ]", "doing": "[>]", "done": "[x]", "failed": "[!]"}
 
 
@@ -175,6 +191,7 @@ class ToolResult:
     ok: bool = True
     diff: str = ""                    # для UI
     path: str = ""
+    shots: list = field(default_factory=list)  # скриншоты launch: [{path, label, size, blank}]
 
 
 @dataclass
@@ -1048,6 +1065,12 @@ def preview(ctx: ToolContext, name: str, args: dict) -> ToolResult:
         if name == "edit":
             _, rel, text, after, *_ = _plan_edit(ctx, **args)
             return ToolResult("", diff=_diff(rel, text, after), path=rel)
+        if name == "delete":
+            p = resolve(ctx.root, args["path"])
+            if not p.is_file():
+                raise ToolError(f"{args['path']}: нет такого файла.")
+            rel = relpath(ctx.root, p)
+            return ToolResult("", diff=_diff(rel, _read_text(p)[0] if is_text_file(p) else "", ""), path=rel)
         if name == "write":
             p = resolve(ctx.root, args["path"])
             if p.is_dir():
@@ -1096,6 +1119,9 @@ def syntax_errors(root: Path, rels) -> list[str]:
 _TEST_PATH = re.compile(r"(^|/)(tests?/|test_[^/]*\.py$|[^/]*_test\.py$|conftest\.py$)")
 
 
+_MAIN_GUARD = re.compile(r"""^if\s+__name__\s*==\s*['"]__main__['"]\s*:""", re.M)
+
+
 def unused_modules(root: Path, rels) -> list[str]:
     """Созданные .py-модули, которые не импортирует ни один рабочий (не тестовый) модуль проекта."""
     new = [r for r in rels if r.endswith(".py") and not _TEST_PATH.search(r)
@@ -1113,6 +1139,8 @@ def unused_modules(root: Path, rels) -> list[str]:
     for rel in new:
         p = Path(rel)
         name = p.stem
+        if _MAIN_GUARD.search(sources.get(rel, "")):
+            continue  # скрипт-точка входа: его запускают, а не импортируют
         if p.name == "__init__.py":  # новый пакет проверяем по имени папки
             pkg = p.parent.as_posix() + "/"
             if any(f.startswith(pkg) and f not in new for f in sources):
@@ -1555,7 +1583,7 @@ def import_errors(root: Path, rels, timeout: int = 90) -> list[str]:
             "    try:\n        mod = importlib.import_module(m)\n"
             "    except Exception as e:\n"
             "        tb = traceback.extract_tb(e.__traceback__)[-1]\n"
-            "        print(f'{m}: {type(e).__name__}: {e} ({tb.filename.rsplit(chr(92), 1)[-1]}:{tb.lineno})')\n"
+            "        print(f'@@LCW {m}: {type(e).__name__}: {e} ({tb.filename.rsplit(chr(92), 1)[-1]}:{tb.lineno})')\n"
             "        continue\n"
             "    for name, obj in vars(mod).items():\n"
             "        if not inspect.isclass(obj) or obj.__module__ != m or not inspect.isabstract(obj):\n"
@@ -1563,7 +1591,7 @@ def import_errors(root: Path, rels, timeout: int = 90) -> list[str]:
             "        own = {k for k, v in vars(obj).items() if getattr(v, '__isabstractmethod__', False)}\n"
             "        missing = sorted(set(obj.__abstractmethods__) - own)\n"
             "        if missing:\n"
-            "            print(f'{m}: класс {name} абстрактный — не реализованы {\", \".join(missing)}; '\n"
+            "            print(f'@@LCW {m}: класс {name} абстрактный — не реализованы {\", \".join(missing)}; '\n"
             "                  f'{name}() упадёт с TypeError')\n"
             # реестр, где разные ключи указывают на один объект, — обычно ошибка импорта (алиас не того имени)
             "    for name, obj in vars(mod).items():\n"
@@ -1571,7 +1599,7 @@ def import_errors(root: Path, rels, timeout: int = 90) -> list[str]:
             "            seen = {}\n"
             "            for k, v in obj.items():\n"
             "                if id(v) in seen:\n"
-            "                    print(f'{m}: в {name} ключи {seen[id(v)]!r} и {k!r} указывают на один объект '\n"
+            "                    print(f'@@LCW {m}: в {name} ключи {seen[id(v)]!r} и {k!r} указывают на один объект '\n"
             "                          f'{getattr(v, \"__module__\", \"?\")}.{getattr(v, \"__qualname__\", v)} — '\n"
             "                          f'проверь, что импортирован нужный класс')\n"
             "                seen.setdefault(id(v), k)\n")
@@ -1581,7 +1609,8 @@ def import_errors(root: Path, rels, timeout: int = 90) -> list[str]:
                            env={**os.environ, "PYTHONIOENCODING": "utf-8", "PYTHONPATH": str(root)})
     except (OSError, subprocess.TimeoutExpired):
         return static
-    return static + [l for l in p.stdout.splitlines() if l.strip()][:20]
+    # только строки проверки: библиотеки печатают при импорте свои баннеры (pygame: «pygame-ce 2.5 (SDL…)»)
+    return static + [l[6:] for l in p.stdout.splitlines() if l.startswith("@@LCW ")][:20]
 
 
 def _module_file(root: Path, mod: str) -> Path | None:
@@ -1745,14 +1774,12 @@ async def t_run(ctx: ToolContext, command: str, timeout: int | None = None) -> T
     возвращая результат в виде ToolResult.
     """
     timeout = max(1, min(int(timeout or config.COMMAND_TIMEOUT), 1800))
-    env = {**os.environ, "PYTHONIOENCODING": "utf-8", "PYTHONUTF8": "1", "GIT_PAGER": "cat",
-           "PAGER": "cat", "GIT_TERMINAL_PROMPT": "0", "CI": "1"}
+    note = ""
+    if PIP_INSTALL.search(command) and not find_venv(ctx.root):
+        note = ensure_venv(ctx.root)
+    env = project_env(ctx.root)
     if "pytest" in command:
         env = pytest_env(env)
-    venv = find_venv(ctx.root)
-    if venv:  # python/pytest проекта, а не системные
-        env["VIRTUAL_ENV"] = str(venv)
-        env["PATH"] = str(venv_bin(venv)) + os.pathsep + env.get("PATH", "")
     cmd = command
     if SHELL_NAME == "PowerShell":
         cmd = "[Console]::OutputEncoding=[Text.Encoding]::UTF8; " + command
@@ -1788,8 +1815,389 @@ async def t_run(ctx: ToolContext, command: str, timeout: int | None = None) -> T
         if "\ufffd" in text and sys.platform == "win32":
             text = out.decode("cp866", errors="replace").replace("\r\n", "\n").strip()
     head = f"exit {code}" if not timed_out else f"ТАЙМАУТ {timeout}s, процесс остановлен"
-    return ToolResult(f"[{head}]\n{_trunc(text, 8000)}" if text else f"[{head}] (нет вывода)",
-                      ok=(code == 0))
+    hint = ""
+    if PIP_INSTALL.search(command) and code and WHEEL_BUILD.search(text):
+        hint = (f"\n[Подсказка: у пакета нет готовой сборки (wheel) для Python {project_python_version(ctx.root)}, "
+                "pip пытается собрать его из исходников и падает. Не повторяй установку: возьми другую версию "
+                "или аналог с готовыми сборками (проверка: pip install --only-binary :all: <пакет>; часто у "
+                "популярной библиотеки есть поддерживаемый форк, например с суффиксом -ce).]")
+    if timed_out and not text and re.search(r"\b(python|py)\b", command):
+        hint += ("\n[Подсказка: программа не завершилась сама — если это GUI-приложение или игра, проверяй её "
+                 "инструментом launch: он покажет, открылось ли окно, ошибки и скриншот.]")
+    body = f"[{head}]\n{_trunc(text, 8000)}" if text else f"[{head}] (нет вывода)"
+    return ToolResult(note + body + hint, ok=(code == 0))
+
+
+PIP_INSTALL = re.compile(r"\b(pip3?|python[\d.]*\s+-m\s+pip|uv\s+pip)\s+install\b")
+WHEEL_BUILD = re.compile(r"Failed (to )?build|subprocess-exited-with-error|Getting requirements to build wheel "
+                         r"did not run successfully|error: metadata-generation-failed", re.I)
+
+
+def _base_python() -> str:
+    """Системный Python (тот, на котором создан venv самого LCW), а не python из venv LCW."""
+    return getattr(sys, "_base_executable", "") or sys.executable
+
+
+def project_python_version(root: Path) -> str:
+    """Версия Python проекта (из pyvenv.cfg его venv) — для подсказок об отсутствующих сборках пакетов."""
+    venv = find_venv(root)
+    cfg = venv / "pyvenv.cfg" if venv else None
+    if cfg and cfg.is_file():
+        m = re.search(r"^version\w*\s*=\s*(\d+\.\d+)", cfg.read_text(encoding="utf-8", errors="replace"), re.M)
+        if m:
+            return m.group(1)
+    return f"{sys.version_info.major}.{sys.version_info.minor}"
+
+
+def ensure_venv(root: Path) -> str:
+    """
+    У проекта нет venv, а модель ставит пакеты: создаём .venv в проекте. Иначе pip из PATH
+    сервера ставит зависимости проекта в venv самого LCW (а запуск проекта их потом не видит).
+    """
+    target = root / ".venv"
+    r = subprocess.run([_base_python(), "-m", "venv", str(target)], capture_output=True, text=True, timeout=300)
+    if r.returncode != 0:
+        return f"[не удалось создать .venv проекта: {(r.stderr or r.stdout)[-300:]}]\n"
+    return "[создано виртуальное окружение проекта .venv — пакеты ставятся в него, python/pip в run — из него]\n"
+
+
+def project_env(root: Path) -> dict:
+    """Окружение команд проекта: utf-8, без пейджеров, venv проекта первым в PATH, без venv самого LCW."""
+    env = {**os.environ, "PYTHONIOENCODING": "utf-8", "PYTHONUTF8": "1", "GIT_PAGER": "cat",
+           "PAGER": "cat", "GIT_TERMINAL_PROMPT": "0", "CI": "1"}
+    own = str(config.ROOT.resolve()).lower()
+    if not str(Path(root).resolve()).lower().startswith(own):
+        # сервер запущен из своего venv: его Scripts в PATH подменяют python/pip проекта
+        env["PATH"] = os.pathsep.join(x for x in env.get("PATH", "").split(os.pathsep)
+                                      if not x.lower().startswith(own))
+        if str(env.get("VIRTUAL_ENV", "")).lower().startswith(own):
+            env.pop("VIRTUAL_ENV", None)
+    venv = find_venv(root)
+    if venv:  # python/pytest проекта, а не системные
+        env["VIRTUAL_ENV"] = str(venv)
+        env["PATH"] = str(venv_bin(venv)) + os.pathsep + env.get("PATH", "")
+    return env
+
+
+def t_delete(ctx: ToolContext, path: str) -> ToolResult:
+    """Удаляет файл проекта (снимок для отката сохраняется)."""
+    p = resolve(ctx.root, path)
+    if p.is_dir():
+        raise ToolError(f"{path} — папка; удаляются только файлы.")
+    if not p.is_file():
+        raise ToolError(f"{path}: нет такого файла.")
+    rel = relpath(ctx.root, p)
+    before = ""
+    if is_text_file(p):
+        before, nl = _read_text(p)
+        if ctx.snapshot:
+            ctx.snapshot(rel, before if nl == "\n" else before.replace("\n", nl))
+    p.unlink()
+    _forget(ctx, rel)
+    return ToolResult(f"OK: {rel} удалён.", diff=_diff(rel, before, ""), path=rel)
+
+
+def _site_packages(root: Path) -> list[Path]:
+    """Папки site-packages окружения проекта (или интерпретатора, на котором запускается проект)."""
+    venv = find_venv(root)
+    if venv:
+        found = [venv / "Lib" / "site-packages"] + sorted(venv.glob("lib/python*/site-packages"))
+        return [d for d in found if d.is_dir()]
+    return [Path(p) for p in sys.path if p.endswith("site-packages") and Path(p).is_dir()]
+
+
+def _demo_block(text: str) -> str:
+    """Пример использования из модуля библиотеки: блок `if __name__ == '__main__':`."""
+    m = re.search(r"^if\s+__name__\s*==\s*['\"]__main__['\"]\s*:\s*$", text, re.M)
+    return text[m.end():].strip("\n") if m else ""
+
+
+def t_libdoc(ctx: ToolContext, package: str, query: str = "") -> ToolResult:
+    """Справка по установленной библиотеке из её собственных файлов: примеры (`__main__`-блоки),
+    определения и докстринги по словам запроса, встроенные ресурсы (текстуры, модели, шрифты)."""
+    name = package.strip().split(".")[0]
+    pkg = next((sp / name for sp in _site_packages(ctx.root) if (sp / name).is_dir()), None)
+    if pkg is None:
+        mod = next((sp / f"{name}.py" for sp in _site_packages(ctx.root) if (sp / f"{name}.py").is_file()), None)
+        if mod is None:
+            raise ToolError(f"Пакет {name} не найден в окружении проекта — сначала run pip install {name}.")
+        files = [mod]
+        pkg = mod.parent
+    else:
+        files = [f for f in sorted(pkg.rglob("*.py")) if "__pycache__" not in f.parts and "test" not in f.name]
+    words = [w.lower() for w in re.findall(r"[A-Za-z_][A-Za-z0-9_]{2,}", query)]
+    if "shader" not in query.lower():  # GLSL-тексты шейдеров забивают выдачу словами texture/position
+        files = [f for f in files if not any("shader" in p.lower() for p in f.relative_to(pkg).parts[:-1])]
+    out = []
+    if pkg.is_dir() and (pkg / "__init__.py").exists():
+        assets = {}
+        for f in pkg.rglob("*"):
+            if f.is_file() and f.suffix.lower() in (".png", ".jpg", ".jpeg", ".obj", ".gltf", ".glb", ".bam",
+                                                     ".ursinamesh", ".ttf", ".otf", ".wav", ".ogg", ".mp3"):
+                assets.setdefault(f.parent.relative_to(pkg).as_posix(), []).append(f.stem)
+        if assets:
+            out.append("Встроенные ресурсы пакета (имя без расширения):\n" + "\n".join(
+                f"  {d}/: {', '.join(sorted(set(v))[:40])}" for d, v in sorted(assets.items())[:12]))
+    scored = []
+    for f in files:
+        try:
+            text = f.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        low = text.lower()
+        demo = _demo_block(low)
+        # плотность совпадений (большие файлы не побеждают одним объёмом) + слова, покрытые демо-примером
+        hits = {w: len(re.findall(rf"\b{w}\b", low)) for w in words}  # целые слова: text ≠ texture
+        score = (sum(min(n, 20) for n in hits.values()) / (1 + low.count("\n")) ** 0.5
+                 + sum(1.0 for w in words if re.search(rf"\b{w}\b", demo))
+                 + sum(2.0 for w in words if w == f.stem.lower()))
+        if score or not words:
+            scored.append((score, f, text))
+    scored.sort(key=lambda x: -x[0])
+    budget = 9000
+    for score, f, text in scored[:4]:
+        rel = f.relative_to(pkg.parent).as_posix()
+        parts = []
+        lines = text.splitlines()
+        for i, line in enumerate(lines):  # определения, где встречаются слова запроса, с докстрингом
+            s = line.strip()
+            if s.startswith(("def ", "class ")) and any(w in s.lower() for w in words):
+                parts.append("\n".join(lines[i:i + 8]))
+            if len(parts) >= 4:
+                break
+        demo = _demo_block(text)
+        if demo:
+            parts.append("Пример из библиотеки (__main__):\n" + "\n".join(demo.splitlines()[:45]))
+        if not parts:
+            hits = [i for i, line in enumerate(lines) if any(w in line.lower() for w in words)][:3]
+            parts += ["\n".join(lines[max(0, i - 3):i + 6]) for i in hits]
+        chunk = f"=== {rel}\n" + "\n...\n".join(parts)
+        out.append(chunk[:budget // 3])
+    if not scored:
+        out.append(f"По словам «{query}» в пакете ничего не найдено. Файлы: "
+                   + ", ".join(f.stem for f in files[:60]))
+    return ToolResult("\n\n".join(out)[:budget] or f"{name}: пусто.")
+
+
+GUI_LIBS = re.compile(r"^\s*(?:from|import)\s+(pygame|pyglet|arcade|tkinter|PyQt\d|PySide\d|kivy|ursina|panda3d|"
+                      r"moderngl_window|glfw|wx|dearpygui|customtkinter|raylib|pyray)\b", re.M)
+ENTRY_NAMES = ("main.py", "app.py", "game.py", "run.py", "__main__.py")
+
+
+def _code_files(root: Path) -> list[str]:
+    return [f for f in list_files(root) if f.endswith(".py") and not _TEST_PATH.search(f)]
+
+
+def small_project(root: Path, limit: int = 1500) -> bool:
+    """Новый/маленький проект (меньше limit строк кода): опоры на «существующие сущности» ещё нет."""
+    total = 0
+    for f in list_files(root):
+        if Path(f).suffix.lower() in (".py", ".js", ".ts", ".jsx", ".tsx", ".go", ".rs", ".java", ".cs", ".cpp", ".c"):
+            try:
+                total += (root / f).read_text(encoding="utf-8", errors="replace").count("\n")
+            except OSError:
+                pass
+            if total >= limit:
+                return False
+    return True
+
+
+def gui_entry(root: Path) -> str | None:
+    """
+    Команда запуска GUI-приложения проекта (`python main.py`), если в коде есть GUI/игровая библиотека
+    и найдена точка входа: файл с `if __name__ == "__main__"` — сначала в корне с типовым именем.
+    """
+    files = _code_files(root)
+    texts = {}
+    for f in files:
+        try:
+            texts[f] = (root / f).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            pass
+    if not any(GUI_LIBS.search(x) for x in texts.values()):
+        return None
+    mains = [f for f, x in texts.items() if _MAIN_GUARD.search(x)]
+    if not mains:
+        return None
+    mains.sort(key=lambda f: (f.count("/"), ENTRY_NAMES.index(Path(f).name) if Path(f).name in ENTRY_NAMES else 9, f))
+    best = mains[0]
+    if best.endswith("__main__.py"):
+        return f"python -m {Path(best).parent.as_posix().replace('/', '.')}"
+    return f"python {best}"
+
+
+SHOTS_DIR = config.DATA_DIR / "shots"
+# sitecustomize для запускаемой программы: перед остановкой сохранить стек всех потоков —
+# по нему видно, где программа висит без окна (инициализация звука, input(), бесконечный цикл)
+HANG_HOOK = """import os
+_f = os.environ.get("LCW_HANG_FILE")
+if _f:
+    import faulthandler
+    _h = open(_f, "w", encoding="utf-8")
+    faulthandler.dump_traceback_later(float(os.environ.get("LCW_HANG_DUMP", "5")), exit=False, file=_h)
+"""
+
+
+def _hang_stack(text: str, limit: int = 12) -> str:
+    """Стек главного потока из дампа faulthandler, без строк runpy/importlib."""
+    blocks = re.split(r"\n(?=(?:Current thread|Thread) 0x)", text)
+    main = next((b for b in blocks if "most recent call first" in b and "<module>" in b), blocks[0] if blocks else "")
+    rows = [l.strip() for l in main.splitlines() if l.strip().startswith("File ")
+            and "<frozen" not in l and "runpy" not in l]
+    out = []
+    for row in reversed(rows[:limit]):
+        m = re.match(r'File "(.+)", line (\d+)', row)
+        code = ""
+        if m:
+            try:
+                code = Path(m.group(1)).read_text(encoding="utf-8", errors="replace").splitlines()[int(m.group(2)) - 1]
+            except (OSError, IndexError):
+                pass
+        out.append(row + (f":  {code.strip()}" if code.strip() else ""))
+    return "\n".join(out)
+
+
+TRACEBACK = re.compile(r"Traceback \(most recent call last\)|^\w*(Error|Exception): ", re.M)
+
+
+def t_launch(ctx: ToolContext, command: str, seconds: int = 6, steps: list | None = None,
+             look: str = "") -> ToolResult:
+    """
+    Запуск GUI-приложения: ждём окно, выполняем шаги (клавиши, клики, паузы, скриншоты), снимаем
+    итоговый скриншот и останавливаем процесс. Вывод и traceback — из stdout/stderr.
+    """
+    import threading
+    import time
+    import uuid as _uuid
+    from . import gui
+    seconds = max(2, min(int(seconds or 6), 120))
+    steps = [str(x) for x in (steps or [])][:60]
+    SHOTS_DIR.mkdir(parents=True, exist_ok=True)
+    tag = _uuid.uuid4().hex[:8]
+    hook = SHOTS_DIR / "hook"
+    hook.mkdir(exist_ok=True)
+    (hook / "sitecustomize.py").write_text(HANG_HOOK, encoding="utf-8")
+    hang_file = SHOTS_DIR / f"{tag}_stack.txt"
+    env = {**project_env(ctx.root), "PYTHONUNBUFFERED": "1", "LCW_HANG_FILE": str(hang_file),
+           "LCW_HANG_DUMP": str(max(1.5, seconds - 1.0))}
+    env["PYTHONPATH"] = str(hook) + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
+    kwargs = {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if sys.platform == "win32" else \
+        {"start_new_session": True}
+    proc = subprocess.Popen([*SHELL_CMD, command], cwd=str(ctx.root), env=env, stdin=subprocess.DEVNULL,
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, **kwargs)
+    chunks: list[bytes] = []
+
+    def pump() -> None:
+        for block in iter(lambda: proc.stdout.read1(4096), b""):
+            chunks.append(block)
+
+    reader = threading.Thread(target=pump, daemon=True)
+    reader.start()
+    shots, notes = [], []
+    start = time.monotonic()
+    hwnd, opened_at = None, None
+
+    def alive() -> bool:
+        return proc.poll() is None
+
+    def window():
+        try:
+            wins = gui.find_windows(gui.child_pids(proc.pid))
+        except Exception:
+            return None
+        return wins[0] if wins else None
+
+    def shot(label: str) -> None:
+        nonlocal hwnd
+        hwnd = window() or hwnd
+        if not hwnd or len(shots) >= 6:
+            return
+        path = SHOTS_DIR / f"{tag}_{len(shots) + 1}.png"
+        try:
+            w, h = gui.screenshot(hwnd, str(path))
+            shots.append({"path": str(path), "label": label, "size": f"{w}x{h}", "blank": gui.is_blank(str(path))})
+        except Exception as e:
+            notes.append(f"скриншот не снят ({label}): {e}")
+
+    try:
+        while alive() and time.monotonic() - start < seconds:
+            hwnd = window()
+            if hwnd:
+                opened_at = time.monotonic() - start
+                break
+            time.sleep(0.25)
+        if hwnd:
+            time.sleep(1.0)  # первый кадр
+            shot("после запуска")
+            for n, step in enumerate(steps, 1):
+                if not alive():
+                    notes.append(f"процесс завершился до шага {n} «{step}»")
+                    break
+                low = step.strip().lower()
+                try:
+                    if low.startswith("wait:"):
+                        time.sleep(min(float(low[5:]), 20))
+                    elif low.startswith("click:"):
+                        x, y = (int(float(v)) for v in low[6:].split(","))
+                        gui.click(hwnd, x, y)
+                        time.sleep(0.4)
+                    elif low in ("shot", "screenshot"):
+                        shot(f"после шага {n - 1}")
+                    else:
+                        gui.send_key(hwnd, low)
+                        time.sleep(0.35)
+                except ValueError as e:
+                    notes.append(f"шаг {n} «{step}» пропущен: {e}")
+            rest = seconds - (time.monotonic() - start)
+            while alive() and rest > 0:
+                time.sleep(min(0.25, rest))
+                rest = seconds - (time.monotonic() - start)
+            if alive():
+                shot("в конце")
+    finally:
+        ran = time.monotonic() - start
+        still = alive()
+        if still:
+            _kill_tree(proc.pid)
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            pass
+        reader.join(timeout=3)
+    text = b"".join(chunks).decode("utf-8", errors="replace").replace("\r\n", "\n").strip()
+    crashed = bool(TRACEBACK.search(text))
+    lines = [f"окно открылось через {opened_at:.1f} с" if hwnd and opened_at is not None else "ОКНО НЕ ОТКРЫЛОСЬ"]
+    if still:
+        lines.append(f"приложение работало {ran:.0f} с, остановлено"
+                     + (" (норма для игры/GUI)" if hwnd else " — всё это время БЕЗ ОКНА"))
+    else:
+        lines.append(f"процесс ЗАВЕРШИЛСЯ сам через {ran:.1f} с, код {proc.returncode}"
+                     + (" — окно не создаётся или главный цикл не запущен" if not hwnd else ""))
+    for sh in shots:
+        lines.append(f"скриншот {sh['label']}: {sh['size']}"
+                     + (" — ОДНОТОННЫЙ КАДР: ничего не нарисовано" if sh["blank"] else ""))
+    lines += notes
+    if crashed:
+        lines.append("В ВЫВОДЕ ОШИБКА (traceback) — исправь её")
+    stack = ""
+    if hang_file.is_file():
+        if not hwnd and still:  # окна нет, а процесс жив — где он висит
+            stack = _hang_stack(hang_file.read_text(encoding="utf-8", errors="replace"))
+            if stack:
+                lines.append("программа ЗАВИСЛА до создания окна; стек Python в момент остановки "
+                             "(последняя строка — где висит):\n" + stack)
+                if re.search(r"\binit\w*\(", stack.splitlines()[-1]):
+                    lines.append("[Подсказка: висит общая инициализация библиотеки — обычно одно её устройство "
+                                 "(звук, джойстик, сеть) недоступно на этой машине. Инициализируй только нужные "
+                                 "подсистемы по отдельности (графика, шрифты), а необязательные — в try/except "
+                                 "или не трогай вовсе; повторный запуск того же кода не поможет.]")
+        try:
+            hang_file.unlink()
+        except OSError:
+            pass
+    out = "\n".join(lines) + (f"\nвывод:\n{_trunc(text, 4000)}" if text else "\nвывода нет")
+    ok = bool(hwnd) and not crashed and (still or proc.returncode == 0)
+    return ToolResult(out, ok=ok, shots=shots)
 
 
 def _kill_tree(pid: int) -> None:
@@ -1896,7 +2304,8 @@ def t_git_commit(ctx: ToolContext, **args) -> ToolResult:
 
 
 SYNC = {"git_commit": t_git_commit, "symbols": t_symbols, "refs": t_refs, "test": t_test,
-        "logstats": t_logstats, "read": t_read, "glob": t_glob, "grep": t_grep, "edit": t_edit, "write": t_write}
+        "logstats": t_logstats, "read": t_read, "glob": t_glob, "grep": t_grep, "edit": t_edit, "write": t_write,
+        "delete": t_delete, "libdoc": t_libdoc}
 
 
 async def execute(ctx: ToolContext, name: str, args: dict) -> ToolResult:
@@ -1908,6 +2317,8 @@ async def execute(ctx: ToolContext, name: str, args: dict) -> ToolResult:
     try:
         if name == "run":
             return await t_run(ctx, **args)
+        if name == "launch":
+            return await asyncio.to_thread(t_launch, ctx, **args)
         return await asyncio.to_thread(SYNC[name], ctx, **args)
     except TypeError as e:
         return ToolResult(f"Неверные аргументы {name}: {e}", ok=False)

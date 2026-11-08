@@ -21,6 +21,7 @@ from pathlib import Path
 from . import config, documents, entities, equivalence, prompts
 from .llm import LLM, Completion, LLMError
 from .sessions import Session
+from .tools import (t_launch, gui_entry, small_project)
 from .tools import (MUTATING, TOOLS, ToolContext, ToolError, ToolResult, execute, normalize_plan,
                     GIT_WRITE, git_preview, preview, render_plan, syntax_errors, unused_modules, import_errors,
                     unused_new_imports, new_stubs, project_tests, untested_changes, removed_tests, revert_whitespace_only, tests_pass_on_old_code, find_merges, undefined_names,
@@ -638,7 +639,9 @@ class Agent:
         carried = any(x["status"] in ("todo", "doing") for x in s.plan)
         st = {"planned": carried, "plan_rejects": 0, "plan_item": None, "since_plan": 0, "tools_used": 0,
               "edits": 0, "reqs": await asyncio.to_thread(requirements, task, ctx.root), "decide_rejects": 0,
-              "docs": await asyncio.to_thread(documents.docs_project, ctx.root)}
+              "docs": await asyncio.to_thread(documents.docs_project, ctx.root),
+              "small": await asyncio.to_thread(small_project, ctx.root)}
+        launch_runs, launch_sig = 0, None
         focus_edits, item_pushed = 0, False  # правок к началу текущего пункта; было ли дожатие пункта
         for _ in range(config.MAX_STEPS):
             if _estimate_tokens(s) > config.COMPACT_AT * config.CONTEXT:
@@ -796,6 +799,25 @@ class Agent:
                               "отсекает всё; сохрани прежнее поведение как запасной вариант), исправь код, а "
                               "не тесты, и прогони тесты снова.")})
                         continue
+                # GUI-приложение/игра: harness сам запускает его — модель «проверяет» run, который
+                # висит до таймаута или выходит сразу, и отчитывается о неработающей программе
+                entry = await asyncio.to_thread(gui_entry, ctx.root) if originals else None
+                if entry and launch_runs < 3 and sig != launch_sig:
+                    launch_sig = sig
+                    res = await asyncio.to_thread(t_launch, ctx, entry, 8)
+                    st["shots"] = res.shots or st.get("shots", [])
+                    if not res.ok:
+                        launch_runs += 1
+                        s.add({"type": "notice", "level": "warn",
+                               "text": f"Автопроверка: `{entry}` — приложение не работает:\n{res.output[:1500]}"})
+                        s.messages.append({"role": "user", "content": (
+                            f"Автопроверка: harness запустил приложение (`{entry}`, 8 с):\n{res.output}\n"
+                            "Программа должна открыть окно и работать без ошибок. Исправь причину (смотри traceback; "
+                            "нет окна — не создаётся окно или не запущен главный цикл в точке входа), затем проверь "
+                            f"сам: launch command=\"{entry}\".")})
+                        continue
+                    s.add({"type": "notice", "level": "info",
+                           "text": f"Автопроверка: `{entry}` запускается, окно открывается."})
                 # тесты проекта исчезли (файл переписан целиком) — «тесты проходят», потому что их меньше
                 gone = await asyncio.to_thread(removed_tests, ctx.root, originals)
                 if gone and removed_nudges < 2:
@@ -931,7 +953,7 @@ class Agent:
                         focus_message, ctx.root, reqs, s.focus)})
                     continue
                 if (reviewed and not pushed and st["edits"] == reviewed_at
-                        and UNDONE.search(comp.content)):
+                        and (UNDONE.search(comp.content) or st.get("unseen"))):
                     # сверка показала несделанное, а модель просто отчиталась — один раз отправляем доделывать
                     pushed = True
                     s.add({"type": "notice", "level": "warn",
@@ -943,7 +965,11 @@ class Agent:
                         if rel:
                             hints.append(f"Пункт {n} — связанный код:\n" + "\n".join(rel))
                     s.messages.append({"role": "user", "content": (
-                        "Ты сам отметил несделанное. Начни с первого несделанного пункта: прочитай связанный "
+                        (f"На реальном скриншоте приложения не видно запрошенного: {st['unseen']}. Отчёт «сделано» "
+                         "по коду не считается — найди, почему этого нет на экране (камера, позиция, размер, цвет, "
+                         "не вызывается update/создание; как это принято в библиотеке — смотри libdoc), исправь и проверь через launch с look.\n\n"
+                         if st.get("unseen") else "")
+                        + "Ты сам отметил несделанное. Начни с первого несделанного пункта: прочитай связанный "
                         "код (read с symbol=), составь plan этой части с конкретными файлами и функциями и "
                         "выполни его по шагам с проверкой. Если пункт правда невыполним без решения "
                         "пользователя — объясни, какое решение нужно, и закончи."
@@ -951,9 +977,26 @@ class Agent:
                     continue
                 if reqs and originals and not reviewed:
                     reviewed, reviewed_at = True, st["edits"]
+                    seen_text = ""
+                    if st.get("shots"):  # что на самом деле на экране — модель склонна отчитываться о намерениях
+                        seen_text = await self._look(s, st["shots"][-1:], (
+                            "Это скриншот только что запущенного приложения. Опиши кратко и по фактам, что на "
+                            "экране: какие элементы, надписи, фигуры, цвета. Ничего не додумывай.\n"
+                            "Затем сверь кадр с пунктами запроса пользователя:\n"
+                            + "\n".join(f"{n}. {r[:400]}" for n, r in enumerate(reqs, 1))
+                            + "\nДля каждого видимого объекта или элемента интерфейса, который требуют пункты "
+                              "(персонаж, враги, мир, полоски, меню, надписи), напиши строку «ВИДНО: ...» или "
+                              "«НЕ ВИДНО: ...». То, что нельзя проверить по одному кадру (поведение во времени, "
+                              "звук), пропусти."))
+                        missing = re.findall(r"НЕ\s+ВИДНО:?\s*(.+)", seen_text, re.IGNORECASE)
+                        st["unseen"] = "; ".join(m.strip()[:120] for m in missing[:8])
                     s.add({"type": "notice", "level": "info", "text": "Сверка результата с пунктами запроса."})
                     s.messages.append({"role": "user", "content": (
-                        "Перед завершением сверь сделанное с КАЖДЫМ пунктом запроса:\n"
+                        (f"Так выглядит приложение сейчас (описание скриншота после запуска):\n{seen_text}\n\n"
+                         if seen_text else "")
+                        + (f"ВНИМАНИЕ: на экране нет запрошенного ({st['unseen']}) — такие пункты НЕ сделаны, "
+                           "пока это не появится на скриншоте.\n\n" if st.get("unseen") else "")
+                        + "Перед завершением сверь сделанное с КАЖДЫМ пунктом запроса:\n"
                         + "\n".join(f"{n}. {r}" for n, r in enumerate(reqs, 1))
                         + ("\nЗафиксированные решения (перечисли их и в итоговом ответе — пользователь должен "
                            "их проверить):\n" + "\n".join(
@@ -1130,7 +1173,7 @@ class Agent:
         if name == "decide":
             return await asyncio.to_thread(self._decide, s, ctx, args, st)
         if (name in MUTATING and len(st.get("reqs", [])) >= 2 and str(s.focus) not in s.decisions
-                and not st.get("docs")
+                and not st.get("docs") and not st.get("small")
                 and st.get("decide_rejects", 0) < (4 if INVESTIGATE.search((st.get("reqs") or [""])[min(s.focus, len(st.get("reqs") or [""]) - 1)]) else 2)):
             # проектные пункты маленькая модель решает наугад: сначала — решение, привязанное к коду
             st["decide_rejects"] = st.get("decide_rejects", 0) + 1
@@ -1217,6 +1260,22 @@ class Agent:
                 s.settings.setdefault("always", []).append(name)
             s.set(i, status="running")
         result = await execute(ctx, name, args)
+        if name == "launch" and result.shots:
+            st["shots"] = result.shots
+            import hashlib
+            key = hashlib.md5(b"".join(Path(x["path"]).read_bytes() for x in result.shots
+                                       if Path(x["path"]).is_file())).hexdigest()
+            looks = st.setdefault("looks", {})
+            if str(args.get("look", "")).strip() and key in looks:
+                result.output += f"\nЗрение: кадры те же, что в прошлый раз — {looks[key]}"
+            elif str(args.get("look", "")).strip() and len(looks) >= 1:
+                result.output += ("\n[Зрение: лимит описаний на ход исчерпан (переключение модели дорого). "
+                                  "Проверяй по выводу и по смыслу кода.]")
+            elif str(args.get("look", "")).strip():
+                seen = await self._look(s, result.shots, str(args["look"]))
+                looks[key] = seen
+                if seen:
+                    result.output += f"\nЗрение (описание скриншотов): {seen}"
         if result.ok and (name == "logstats"
                           or name == "run" and EVIDENCE_CMD.search(args.get("command", ""))
                           or name in ("read", "grep") and EVIDENCE_PATH.search(str(args.get("path", "")))):
@@ -1237,8 +1296,44 @@ class Agent:
                                   "следующий doing; делай по одному шагу с проверкой.]")
         out = result.output
         ui_out = out if len(out) <= UI_OUTPUT else out[:UI_OUTPUT] + "\n…"
-        s.set(i, status="ok" if result.ok else "error", output=ui_out, diff=result.diff, path=result.path)
+        s.set(i, status="ok" if result.ok else "error", output=ui_out, diff=result.diff, path=result.path,
+              **({"shots": [Path(x["path"]).name for x in result.shots]} if result.shots else {}))
         return result
+
+    async def _look(self, s: Session, shots: list[dict], question: str) -> str:
+        """
+        Описание скриншотов моделью со зрением (VISION_MODEL). Переключение модели в AI Manager
+        стоит времени и KV-кэша основной модели — вызывается только по look или раз при сверке.
+        """
+        from PIL import Image
+        import io
+        content = [{"type": "text", "text": question.strip()[:1000] + "\nОтвечай по-русски, кратко (до 120 слов)."}]
+        for sh in [x for x in shots if not x.get("blank")][-3:]:
+            try:
+                with Image.open(sh["path"]) as img:
+                    img = img.convert("RGB")
+                    img.thumbnail((768, 768))
+                    buf = io.BytesIO()
+                    img.save(buf, "PNG")
+            except OSError:
+                continue
+            content.append({"type": "text", "text": f"Скриншот ({sh.get('label', '')}):"})
+            content.append({"type": "image_url", "image_url": {
+                "url": "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()}})
+        if len(content) == 1:
+            return "все скриншоты однотонные — на экране ничего не нарисовано"
+        s.add({"type": "notice", "level": "info", "text": f"Зрение ({config.VISION_MODEL}): смотрю скриншоты."})
+        try:
+            comp = await self.llm.complete([{"role": "user", "content": content}], model=config.VISION_MODEL,
+                                           max_tokens=1500, temperature=0.2,
+                                           chat_template_kwargs={"enable_thinking": False})
+        except (LLMError, OSError) as e:
+            s.add({"type": "notice", "level": "warn", "text": f"Зрение недоступно: {str(e)[:200]}"})
+            return ""
+        text = comp.content.strip()[:1500]
+        if text:
+            s.add({"type": "notice", "level": "info", "text": "Зрение: " + text})
+        return text
 
     async def _independent(self, s: Session, root: Path, item: str, n: int = 2) -> list[str]:
         """

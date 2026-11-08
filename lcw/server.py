@@ -180,6 +180,16 @@ async def session_create(project_id: str = Body(..., embed=True), settings: dict
     return {"id": s.id}
 
 
+@app.get("/api/shots/{name}")
+async def shot_file(name: str):
+    """Скриншот окна приложения, снятый launch (data/shots)."""
+    from .tools import SHOTS_DIR
+    p = SHOTS_DIR / name
+    if "/" in name or "\\" in name or not name.endswith(".png") or not p.is_file():
+        raise HTTPException(404, "нет скриншота")
+    return FileResponse(p)
+
+
 @app.get("/api/sessions/{sid}")
 async def session_get(sid: str):
     """Возвращает данные сессии: id, project_id, items, seq, meta и rewind_floor."""
